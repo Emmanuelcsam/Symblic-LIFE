@@ -1,0 +1,38 @@
+{
+ "chatUrl": "https://chatgpt.com/c/<conversation-id-removed>",
+ "part1": {
+  "ok": true,
+  "url": "https://chatgpt.com/c/<conversation-id-removed>",
+  "mode": null,
+  "len": 8,
+  "short": "RECEIVED"
+ },
+ "part2": {
+  "ok": true,
+  "url": "https://chatgpt.com/c/<conversation-id-removed>",
+  "mode": null,
+  "len": 8,
+  "short": "RECEIVED"
+ },
+ "part3": {
+  "ok": true,
+  "url": "https://chatgpt.com/c/<conversation-id-removed>",
+  "mode": null,
+  "len": 8,
+  "short": "RECEIVED"
+ },
+ "part4": {
+  "ok": true,
+  "url": "https://chatgpt.com/c/<conversation-id-removed>",
+  "mode": null,
+  "len": 8,
+  "short": "RECEIVED"
+ },
+ "part5": {
+  "ok": true,
+  "url": "https://chatgpt.com/c/<conversation-id-removed>",
+  "mode": null,
+  "len": 103973,
+  "short": "**U** marks an undefined or ambiguous contract. **D** marks a concrete contradiction, missing implementation, or code defect. The proposed limits, adapters, and replacement mechanisms below are design"
+ }
+}

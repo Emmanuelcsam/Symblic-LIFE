@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "perpetual": false,
+  "until_done": false,
+  "candidates": 1,
+  "regenerate": 2,
+  "depth": 0,
+  "children": 2,
+  "generations": 1,
+  "agents_max": 4,
+  "attempt_seconds": 900,
+  "wall_seconds": 2700,
+  "interval_seconds": 900,
+  "feedback_chars": 2000,
+  "novelty_limit": 2,
+  "saturation": 0,
+  "strategies": ["fresh", "feedback"],
+  "syntax": true,
+  "require_change": true,
+  "self_split": false,
+  "designer": false,
+  "final": [],
+  "hidden": [],
+  "checks": {
+    "0": ["/usr/bin/python3 -B {kit}/bin/life-check.py migration migrations/{migration_id}.sql schema-snapshot.sql {snapshot_sha}"],
+    "1": ["/usr/bin/python3 -B {kit}/bin/life-check.py verify-line database verify.txt migration={migration_id}"]
+  }
+}

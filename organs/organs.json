@@ -1,0 +1,25 @@
+{
+  "version": 2,
+  "organs": {
+    "command":  {"kind": "model", "seed_node": "node-f", "seed_focus": "route every operator command to exactly one organ", "divide_backlog": 12},
+    "learning": {"kind": "model", "seed_node": "node-d", "seed_focus": "research the open questions and record new sources", "divide_backlog": 12},
+    "digest":   {"kind": "model", "seed_node": "node-b", "seed_focus": "turn each new source into one quote-checked claim", "divide_backlog": 12},
+    "codebase": {"kind": "agent", "seed_node": "node-i", "seed_focus": "fix one failing watched test per run", "divide_backlog": 6},
+    "immune":   {"kind": "model", "seed_node": "node-f", "seed_focus": "review every bundled patch and proposal adversarially", "divide_backlog": 6},
+    "selfdev":  {"kind": "agent", "seed_node": "node-a", "seed_focus": "turn one lesson into one checked genome proposal", "divide_backlog": 6},
+    "compute":  {"kind": "model", "seed_node": "node-a", "seed_focus": "propose rank and measure one compute or storage experiment", "divide_backlog": 6},
+    "database": {"kind": "agent", "seed_node": "node-b", "seed_focus": "turn one data request into one additive migration", "divide_backlog": 6}
+  },
+  "ladders": {
+    "classify-command":   ["llama3.2:1b", "qwen3:4b-instruct"],
+    "triage-error":       ["qwen2.5-coder:3b", "qwen3:4b-instruct"],
+    "extract-source":     ["qwen3:4b-instruct"],
+    "distill-lesson":     ["llama3.2:1b", "qwen3:4b-instruct"],
+    "propose-experiment": ["qwen3:4b-instruct"],
+    "rank-experiment":    ["llama3.2:1b", "qwen3:4b-instruct"],
+    "review-patch":       ["qwen2.5-coder:3b", "qwen3:4b-instruct"],
+    "reproduce":          ["llama3.2:1b", "qwen3:4b-instruct"],
+    "assign-item":        ["qwen2.5:0.5b", "llama3.2:1b"],
+    "local-research":     ["qwen3:4b-instruct"]
+  }
+}

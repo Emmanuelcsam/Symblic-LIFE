@@ -1,0 +1,72 @@
+=== part 1 try 1 cont=0 2026-10-11T03:10:50
+rc=0 bytes=40 2026-10-11T03:12:20
+
+--- RESPONSE ---
+RECEIVED
+--- END ---
+
+
+=== part 2 try 1 cont=1 2026-10-11T03:12:20
+rc=0 bytes=40 2026-10-11T03:12:44
+
+--- RESPONSE ---
+RECEIVED
+--- END ---
+
+
+=== part 3 try 1 cont=1 2026-10-11T03:12:44
+rc=0 bytes=40 2026-10-11T03:13:09
+
+--- RESPONSE ---
+RECEIVED
+--- END ---
+
+
+=== part 4 try 1 cont=1 2026-10-11T03:13:09
+rc=0 bytes=40 2026-10-11T03:13:30
+
+--- RESPONSE ---
+RECEIVED
+--- END ---
+
+
+=== part 5 try 1 cont=1 2026-10-11T03:13:30
+rc=0 bytes=40 2026-10-11T03:13:55
+
+--- RESPONSE ---
+RECEIVED
+--- END ---
+
+
+=== part 6 try 1 cont=1 2026-10-11T03:13:55
+rc=0 bytes=40 2026-10-11T03:14:20
+
+--- RESPONSE ---
+RECEIVED
+--- END ---
+
+
+=== part 7 try 1 cont=1 2026-10-11T03:14:20
+rc=0 bytes=40 2026-10-11T03:14:51
+
+--- RESPONSE ---
+RECEIVED
+--- END ---
+
+
+=== part 8 try 1 cont=1 2026-10-11T03:14:51
+rc=1 bytes=0 2026-10-11T03:41:01
+
+=== part 8 try 2 cont=1 2026-10-11T03:43:01
+rc=1 bytes=0 2026-10-11T03:46:26
+
+=== part 8 try 3 cont=1 2026-10-11T03:48:26
+rc=0 bytes=124608 2026-10-11T04:40:58
+
+--- RESPONSE ---
+**D** identifies an explicit defect or contradiction. **U** identifies an undefined or ambiguous contract. Findings concerning life-tick.py and life-ctl.py address their specified behavior, since those implementations are omitted from the packet.
+
+## Requirements and admission
+
+1. 
+DONE

@@ -1,0 +1,384 @@
+                '1': [LC + ' verify-line selfdev verify.txt lesson={lesson_id} program={program}']},
+    'database': {'0': [LC + ' migration migrations/{migration_id}.sql schema-snapshot.sql {snapshot_sha}'],
+                 '1': [LC + ' verify-line database verify.txt migration={migration_id}']},
+}
+
+
+def agent_policy_problems(policy, organ=None, raw_checks=None):
+    """Every LIFE agent run uses exactly the fixed bounded policy; its checks are exactly the organ's
+    AGENT_CHECKS (compared on the raw template when raw_checks is given)."""
+    out = []
+    if not isinstance(policy, dict) or set(policy) != set(AGENT_POLICY_FIXED) | {'checks'}:
+        return ['keys must be exactly the fixed agent policy keys plus checks']
+    for key, value in AGENT_POLICY_FIXED.items():
+        if policy.get(key) != value or type(policy.get(key)) is not type(value):
+            out.append(f'{key} must be {value!r}')
+    checks = policy.get('checks')
+    if not isinstance(checks, dict) or set(checks) != {'0', '1'} or not all(
+            isinstance(v, list) and v and all(isinstance(c, str) and c for c in v) for v in checks.values()):
+        out.append('checks must have exactly statement indexes "0" and "1", each a nonempty list of commands')
+    if organ is not None and raw_checks is not None and raw_checks != AGENT_CHECKS[organ]:
+        out.append(f'checks must be exactly life_common.AGENT_CHECKS[{organ!r}]')
+    return out
+
+
+def render_run(release_dir, organ, values):
+    """(lines, policy, sha256) for one agent run, rendered from the release: exactly two statements, each naming
+    the workspace, at most STATEMENT_MAX characters and linting with ZERO findings; the policy equal to the fixed
+    policy with the organ's exact checks, accepted by symblic_autogen.normalize."""
+    import sys
+    if REPO not in sys.path:
+        sys.path.insert(0, REPO)
+    import symblic_autogen as A
+    with open(os.path.join(release_dir, 'organs', f'{organ}.lines.txt'), encoding='utf-8') as handle:
+        lines = A.statements(render(handle.read(), organ, values))
+    if len(lines) != 2 or any(values['ws'] not in line for line in lines):
+        raise ValueError('a LIFE agent run has exactly two statements, each naming the workspace ' + values['ws'])
+    if any(len(line) > STATEMENT_MAX for line in lines):
+        raise ValueError(f'a rendered statement is longer than {STATEMENT_MAX} characters')
+    findings = A.lint(lines, values['ws'])
+    if findings:
+        raise ValueError('lint: ' + '; '.join(f'{lv} line {n}: {m}' for lv, n, m in findings)[:300])
+    with open(os.path.join(release_dir, 'policies', f'{organ}.json'), encoding='utf-8') as handle:
+        raw = handle.read()
+    raw_policy = json.loads(raw, object_pairs_hook=_no_dup_keys)
+    policy = json.loads(render(raw, organ, values), object_pairs_hook=_no_dup_keys)
+    problems = agent_policy_problems(policy, organ, raw_policy.get('checks') if isinstance(raw_policy, dict) else None)
+    if problems:
+        raise ValueError('policy: ' + '; '.join(problems))
+    normalized = A.normalize(policy)
+    return lines, policy, normalized['sha256']
+
+
+def policy_flags(policy):
+    """The bin/symblic-task start flags for a LIFE agent policy. Fields with a flag are emitted explicitly; the
+    DEFAULT_FIELDS have no flag and equal the server defaults (pinned by contract_problems). The tick then compares
+    the run's server-side policy sha256 with symblic_autogen.normalize(policy)['sha256'] (VALIDATE proves the round
+    trip through bin/symblic-task's own parser statically)."""
+    problems = agent_policy_problems(policy)
+    if problems:
+        raise ValueError('; '.join(problems))
+    f = AGENT_POLICY_FIXED
+    flags = ['--candidates', str(f['candidates']), '--regenerate', str(f['regenerate']), '--decompose', str(f['depth']),
+             '--children', str(f['children']), '--handoff', str(f['generations']), '--agents-max', str(f['agents_max']),
+             '--attempt-seconds', str(f['attempt_seconds']), '--wall-seconds', str(f['wall_seconds']),
+             '--novelty-limit', str(f['novelty_limit']), '--saturation', str(f['saturation']),
+             '--strategies', ','.join(f['strategies']), '--no-self-split']
+    for index in ('0', '1'):
+        for command in policy['checks'][index]:
+            flags += ['--check', f'{index}:{command}']
+    return flags
+
+
+def autogen_run_id(request_id):
+    """symblicos/autogen.py submit: run_id = 'autogen-' + sha256(client_request_id)[:24]."""
+    return 'autogen-' + hashlib.sha256(request_id.encode()).hexdigest()[:24]
+
+
+# ------------------------------------------------------------------------------------------- code-owned classifiers
+
+# Paths no LIFE patch may touch: acceptance machinery (the gate must never run a judge the patch changed), every
+# platform file LIFE relies on (each CONTRACT file; VALIDATE checks), agent instructions other agents read, private
+# data, service and nav registration, the kit itself. Checked at the gate AND again by life-ctl apply.
+GATE_DENY_RX = re.compile(
+    r'^(bin/|scripts/|rules/|symblicos/|\.agents/|\.claude/|\.githooks/|\.github/|\.backups/|(.*/)?secrets_data/|'
+    r'docs/life/|docs/agents/|docs/fleet-power\.md$|docs/symblic/AUTOGEN\.md$|docs/symblic/RECURSION\.md$|'
+    r'(.*/)?AGENTS\.md$|(.*/)?CLAUDE\.md$|tests/__init__\.py$|(.*/)?conftest\.py$|tests/(.*/)?__init__\.py$|'
+    r'sgconfig\.yml$|pyproject\.toml$|ruff\.toml$|\.ruff\.toml$|setup\.cfg$|tox\.ini$|pytest\.ini$|'
+    r'requirements-devtest\.(in|lock)$|\.pre-commit-config\.yaml$|(.*/)?\.gitignore$|(.*/)?\.gitattributes$|'
+    r'(.*/)?\.env[^/]*$|easy_config\.json$|security_gate\.py$|register\.py$|server\.py$|'
+    r'host_routes\.py$|host_bridge\.py$|sw\.js$|index2\.html$|restart-dashboard\.sh$|landlock_sandbox\.py$|'
+    r'symblic_autogen\.py$|symblic_run\.py$|symblic_apply\.py$|fleet_runner\.py$|local_research\.py$|deep_research\.py$|'
+    r'cluster_engine\.py$|cluster_highpower\.py$|agent_hub\.py$|symblicos_engine\.py$|'
+    r'.*\.(service|timer|slice|socket)$|.*(^|/)\.[^/]*rc$)')
+DOC_RX = re.compile(r'^docs/(?:[^/]+/)*[^/]+\.md$')
+RESTART_GATED_RX = re.compile(r'\.py$|(^|/)bin/|\.(service|timer|sh)$')
+LIVE_STATIC_RX = re.compile(r'\.(html|js|mjs|css|json|svg|png|webp|ico|txt|webmanifest)$')
+TEST_RX = re.compile(r'^tests/')
+CONTROL_NAMES = ('verify.txt', 'HANDOFF.md', 'AUTOGEN-CHECKPOINT.json', 'AUTOGEN-SPLIT.txt', 'AUTOGEN-TESTS.sh',
+                 'AUTOGEN-INDEX.jsonl')       # verify.txt plus symblic_autogen.CONTROL_FILES, root level only
+
+
+def path_class(files):
+    """Code decides how a patch reaches the operator, from the paths alone (the model's class never overrides):
+    tests (tests/...), docs (docs/**/*.md), restart_gated (.py, bin/, .service/.timer/.sh), live_static
+    (LIVE_STATIC_RX), other (anything else), or mixed when more than one class appears."""
+    classes = set()
+    for f in files:
+        if TEST_RX.match(f):
+            classes.add('tests')
+        elif DOC_RX.match(f):
+            classes.add('docs')
+        elif RESTART_GATED_RX.search(f):
+            classes.add('restart_gated')
+        elif LIVE_STATIC_RX.search(f):
+            classes.add('live_static')
+        else:
+            classes.add('other')
+    return classes.pop() if len(classes) == 1 else 'mixed'
+
+
+def resolve_test_module(root, test_id):
+    """The repository-relative file a test id names, WITHOUT importing anything: the longest dotted prefix that is
+    <path>.py or <path>/__init__.py, a regular file inside root with no symlink on the way; '' when none. The same
+    rule checks/devcheck-gate.sh step 1 applies."""
+    root = os.path.realpath(root)
+    parts = test_id.split('.')
+    for n in range(len(parts), 0, -1):
+        for rel in ('/'.join(parts[:n]) + '.py', '/'.join(parts[:n]) + '/__init__.py'):
+            path = os.path.join(root, rel)
+            walk = [os.path.join(root, *rel.split('/')[:k]) for k in range(1, len(rel.split('/')) + 1)]
+            if os.path.isfile(path) and not any(os.path.islink(p) for p in walk) and \
+                    os.path.realpath(path).startswith(root + os.sep):
+                return rel
+    return ''
+
+
+WEAKEN_RX = re.compile(r'skip(?:If|Unless)?\s*\(|skipTest\s*\(|expectedFailure|@unittest\.skip|pytest\.mark\.skip')
+ASSERT_RX = re.compile(r'\bassert\w*\b')
+
+
+def patch_problems(files, change_class, diff, allowed_files=()):
+    """The gate's path and content rules for one codebase diff (LIFE.md section 7.4). files are repository-relative
+    paths from `git diff --name-only --no-renames`. allowed_files: local_fix = the traceback's files; test_only = the
+    ONE module file the test id resolves to."""
+    out = []
+    if not files or not diff.strip():
+        return ['the run left no diff']
+    if len(diff.encode('utf-8')) > DIFF_MAX_BYTES:
+        out.append(f'the diff is larger than {DIFF_MAX_BYTES} bytes')
+    if re.search(r'^(GIT binary patch|Binary files )', diff, re.M):
+        out.append('the diff contains a binary file')
+    if re.search(r'^(?:old mode|new mode) ', diff, re.M):
+        out.append('the diff changes a file mode')
+    if re.search(r'^(?:new file mode|deleted file mode) (?!100644$|100755$)', diff, re.M):
+        out.append('the diff adds or deletes something other than a regular file (a symlink or submodule)')
+    denied = [f for f in files if GATE_DENY_RX.match(f)]
+    if denied:
+        out.append('protected paths: ' + ', '.join(denied[:5]))
+    if change_class == 'test_only':
+        if not allowed_files or any(f not in allowed_files for f in files):
+            out.append('a test_only patch may change only the module file its test id names: ' + (', '.join(allowed_files) or 'none'))
+        removed = sum(len(ASSERT_RX.findall(ln)) for ln in diff.splitlines() if ln.startswith('-') and not ln.startswith('---'))
+        added = sum(len(ASSERT_RX.findall(ln)) for ln in diff.splitlines() if ln.startswith('+') and not ln.startswith('+++'))
+        if added < removed:
+            out.append('a test_only patch removed assertions')
+        if any(WEAKEN_RX.search(ln) for ln in diff.splitlines() if ln.startswith('+') and not ln.startswith('+++')):
+            out.append('a test_only patch added a skip or an expected failure')
+    elif any(TEST_RX.match(f) for f in files):
+        out.append('a non-test patch changed files under tests/ (the judging test must stay fixed)')
+    if change_class == 'comment_or_doc' and any(not DOC_RX.match(f) for f in files):
+        out.append('a comment_or_doc patch changed files other than docs/**/*.md')
+    if change_class == 'local_fix':
+        outside = [f for f in files if f not in allowed_files]
+        if not allowed_files or outside:
+            out.append('a local_fix patch may change only the files the failure names: ' + (', '.join(outside[:5]) or 'none named'))
+    if has_secret_code(diff):
+        out.append('the diff contains a credential-shaped literal')
+    return out
+
+
+def _def_nodes(tree):
+    """[(identity, node)] of every function definition in source (pre-)order, at every nesting level: identity =
+    the qualified name (classes and enclosing functions joined by .), plus #N when it is the N-th definition of that
+    name in the module (N >= 2: a property setter, a redefinition). Inner definitions follow their outer one."""
+    out, seen = [], {}
+
+    def visit(node, prefix):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                name = prefix + child.name
+                seen[name] = seen.get(name, 0) + 1
+                out.append((name + (f'#{seen[name]}' if seen[name] > 1 else ''), child))
+                visit(child, name + '.')
+            elif isinstance(child, ast.ClassDef):
+                visit(child, prefix + child.name + '.')
+            else:
+                visit(child, prefix)
+    visit(tree, '')
+    return out
+
+
+def _def_dumps(tree):
+    """{identity: (header dump, own dump)}: the header is the definition with its body replaced by pass (name,
+    arguments and defaults, decorators, return annotation, type parameters); own is the definition with every NESTED
+    function's body blanked. Headers are compared at every level independently, so a nested signature change is seen
+    even when only the outer body may change."""
+    import copy
+    out = {}
+    for ident, node in _def_nodes(tree):
+        head = copy.deepcopy(node)
+        head.body = [ast.Pass()]
+        own = copy.deepcopy(node)
+        for sub in ast.walk(own):
+            if sub is not own and isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                sub.body = [ast.Pass()]
+        out[ident] = (ast.dump(head), ast.dump(own))
+    return out
+
+
+def local_fix_problems(old_text, new_text, allowed_functions):
+    """A local_fix changes only function BODIES: with every function body blanked, the old and new module are the same
+    syntax tree (no import, class or module-level change); every definition keeps its identity (qualified name and
+    occurrence) and its header (signature, defaults, decorators, annotations) at every nesting level; at most
+    LOCAL_FIX_FUNCTIONS_MAX bodies change, and each changed identity is one the traceback named, resolved against the
+    base file by line number (allowed_functions; traceback_functions)."""
+    try:
+        old_tree, new_tree = ast.parse(old_text), ast.parse(new_text)
+    except SyntaxError as exc:
+        return [f'the file does not parse: {exc.msg} (line {exc.lineno})']
+
+    def skeleton(tree):
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                node.body = [ast.Pass()]
+        return ast.dump(tree)
+    old_f, new_f = _def_dumps(old_tree), _def_dumps(new_tree)
+    if skeleton(old_tree) != skeleton(new_tree) or list(old_f) != list(new_f):
+        return ['a local_fix changed code outside function bodies (a definition, decorator, import, class or module line)']
+    heads = sorted(n for n in old_f if old_f[n][0] != new_f[n][0])
+    if heads:
+        return ['a local_fix changed a signature, default, decorator or annotation: ' + ', '.join(heads[:5])]
+    changed = sorted(n for n in old_f if old_f[n][1] != new_f[n][1])
+    out = []
+    if not changed:
+        out.append('a local_fix changed no function body')
+    if len(changed) > LOCAL_FIX_FUNCTIONS_MAX:
+        out.append(f'a local_fix may change at most {LOCAL_FIX_FUNCTIONS_MAX} function bodies, it changed {len(changed)}')
+    stray = [n for n in changed if n not in allowed_functions]
+    if stray:
+        out.append('a local_fix may change only the functions the traceback names: ' + ', '.join(stray[:5]))
+    return out
+
+
+def function_at(text, lineno):
+    """The identity (_def_nodes) of the innermost function whose lines include `lineno` in this module text, or ''."""
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError):
+        return ''
+    best = ''
+    for ident, node in _def_nodes(tree):
+        if node.lineno <= lineno <= (node.end_lineno or node.lineno):
+            best = ident
+    return best
+
+
+TRACE_RX = re.compile(r'File "([^"\n]+\.py)", line (\d+), in ([A-Za-z_][A-Za-z0-9_]*|<module>)')
+
+
+def _trace_rel(path, root):
+    rel = os.path.normpath(os.path.relpath(path, root)) if os.path.isabs(path) else path
+    parts = rel.split('/')
+    if (rel.startswith('/') or any(p in ('', '.', '..') for p in parts) or TEST_RX.match(rel) or GATE_DENY_RX.match(rel)
+            or not re.fullmatch(PATH_TOKEN, rel)):
+        return ''
+    return rel
+
+
+def traceback_files(text, root):
+    """Repository-relative .py paths a unittest traceback names (File "<root>/<path>.py"), tests/ and protected paths
+    and every path with an empty, . or .. component excluded, in order of appearance, at most LOCAL_FIX_FILES_MAX."""
+    out = []
+    for m in re.finditer(r'File "([^"\n]+\.py)"', text or ''):
+        rel = _trace_rel(m.group(1), root)
+        if rel and rel not in out:
+            out.append(rel)
+    return out[:LOCAL_FIX_FILES_MAX]
+
+
+def traceback_functions(text, root):
+    """{file: [function identities]} for each file traceback_files returns: every frame (file, line N, in NAME) is
+    resolved against the file as it is in `root` (the clone at the base commit, read without following a link) to the
+    identity of the innermost definition holding line N, kept only when its last name part is NAME (<module> frames
+    and unresolvable frames are dropped). So `run` in one class never authorizes another class's `run`."""
+    files = traceback_files(text, root)
+    out = {f: [] for f in files}
+    sources = {}
+    for m in TRACE_RX.finditer(text or ''):
+        rel = _trace_rel(m.group(1), root)
+        if rel not in out or m.group(3) == '<module>':
+            continue
+        if rel not in sources:
+            try:
+                sources[rel] = read_in(root, rel, 4 << 20).decode('utf-8')
+            except (OSError, UnicodeDecodeError):
+                sources[rel] = ''
+        ident = function_at(sources[rel], int(m.group(2)))
+        if (ident and len(ident.split('#')[0]) <= QUALNAME_MAX and ident.split('#')[0].rsplit('.', 1)[-1] == m.group(3)
+                and ident not in out[rel]):
+            out[rel].append(ident)
+    return out
+
+
+def last_exception_line(text):
+    """The LAST line of a unittest output that reads "Name: message" or "Name" with Name ending in Error, Exception,
+    Failure or Exit (or AssertionError), or None."""
+    found = None
+    for ln in (text or '').splitlines():
+        m = re.match(r'^([A-Za-z_][\w.]*(?:Error|Exception|Failure|Exit))(?::\s*(.*))?$', ln.strip())
+        if m:
+            found = m
+    return found
+
+
+def env_error(rc, tail, root):
+    """A watched-test run that failed for its ENVIRONMENT, never for its code (then it is never a finding): rc 125
+    (the sandbox refused) or 127; or the LAST exception line (last_exception_line) is ModuleNotFoundError naming a
+    module whose top-level name is neither <name>.py nor a <name>/ package at the clone root (a missing third-party
+    package); or it is PermissionError, ConnectionRefusedError or OSError with errno 13, 11 or 111 whose message does
+    not name a path inside the clone. A test name or an assertion that merely mentions sandbox, Landlock or ImportError
+    is a finding like any other."""
+    if rc in (125, 127):
+        return True
+    m = last_exception_line(tail)
+    if not m:
+        return False
+    cls, msg = m.group(1).rsplit('.', 1)[-1], m.group(2) or ''
+    mod = re.match(r"No module named '([A-Za-z0-9_.]+)'", msg)
+    if cls == 'ModuleNotFoundError' and mod:
+        top = mod.group(1).split('.')[0]
+        return not (os.path.isfile(os.path.join(root, top + '.py')) or os.path.isdir(os.path.join(root, top)))
+    if cls in ('PermissionError', 'ConnectionRefusedError', 'OSError') and re.search(r'Errno (1[13]|111)\b', msg):
+        return root not in msg
+    return False
+
+
+def failure_fingerprint(text):
+    """(exception class, normalized message) of the LAST exception line of a unittest failure (last_exception_line);
+    digits, hex runs and quoted strings in the message normalized away; None when no such line exists (the run is
+    then an error)."""
+    found = last_exception_line(text)
+    if not found:
+        return None
+    msg = re.sub(r"'[^']*'|\"[^\"]*\"", "''", found.group(2) or '')
+    msg = re.sub(r'0x[0-9a-fA-F]+|\b[0-9a-f]{8,}\b|\d+', '#', msg)
+    return found.group(1).rsplit('.', 1)[-1], norm_text(msg)[:160]
+
+
+# ------------------------------------------------------------------------------------------- migrations
+
+IDENT = r'[a-z][a-z0-9_]{0,39}'                    # a column name; never sqlite_... (refused separately)
+TABLE = r'org_[a-z0-9_]{1,40}'                     # a table or index name
+LITERAL = r"(?:-?[0-9]{1,18}(?:\.[0-9]{1,18})?|'(?:[^']|'')*'|NULL)"
+COLUMN_RX = re.compile(r'(' + IDENT + r') (TEXT|INTEGER|REAL|BLOB|NUMERIC)((?: NOT NULL| UNIQUE| PRIMARY KEY| DEFAULT '
+                       + LITERAL + r'| REFERENCES ' + TABLE + r' ?\(' + IDENT + r'\))*)')
+TABLE_CONSTRAINT_RX = re.compile(r'(?:PRIMARY KEY|UNIQUE) ?\((' + IDENT + r'(?:, ?' + IDENT + r')*)\)')
+MIGRATION_RX = re.compile(
+    r'(CREATE TABLE IF NOT EXISTS (' + TABLE + r') \((.+)\)|'
+    r'CREATE (UNIQUE )?INDEX IF NOT EXISTS (' + TABLE + r') ON (' + TABLE + r') ?\((' + IDENT + r'(?:, ?' + IDENT + r')*)\)|'
+    r'ALTER TABLE (' + TABLE + r') ADD COLUMN (.+))', re.S)
+DENY_WORDS = r'DROP|DELETE|UPDATE|INSERT|REPLACE|ATTACH|DETACH|PRAGMA|VACUUM|TRIGGER|VIEW|REINDEX|ANALYZE'
+MIGRATION_HEAD_DENY_RX = re.compile(r'(?i)^\s*(?:\w+\s+){0,2}(' + DENY_WORDS + r')\b')
+FUNCTION_DENY_RX = re.compile(r'(?i)\b(load_extension|readfile|writefile|fts\d?|zipfile|edit|sqlar_\w+)\s*\(')
+WORD_DENY_RX = re.compile(r'(?i)\b(AUTOINCREMENT|WITHOUT\s+ROWID|STRICT|CHECK|GENERATED|COLLATE|CONFLICT|CASCADE|'
+                          r'RESTRICT|DEFERRABLE)\b')
+REFERENCES_RX = re.compile(r'(?i)\bREFERENCES\b')
+REFERENCE_NAME_RX = re.compile(r'\bREFERENCES (org_[a-z0-9_]{1,40}) ?\(([a-z][a-z0-9_]{0,39})\)')
+
+
+# The grammar the gate enforces, as the database agent reads it: written as MIGRATION-RULES.txt into every database
+# workspace next to schema-snapshot.sql (committed with it), and named by organs/database.lines.txt.
+
+
+[This is part 22 of 26. Do not critique yet. Reply only with the word RECEIVED.]

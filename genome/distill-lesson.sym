@@ -1,0 +1,24 @@
+program LIFE lesson distiller.
+use profile=verified, context=none, determine=false, solve=false.
+note Worker of a digest cell, distill stage. One verified claim in, at most one lesson out. A lesson is web-derived data (taint web): code may quote it to a later worker as data, never as a statement, check, policy or command. Target none asks nothing more and code writes no lesson for it. The program choice lists only the programs selfdev may change (review-patch is protected and never offered). Worst case 3 + 3 + 2 = 8 calls (target none: 3).
+given claim: Text.
+given quote: Text.
+define Target as one of {
+  genome: "the claim suggests a better way to ask a small language model a typed question, extract a quote, classify, or review",
+  compute: "the claim suggests a faster or cheaper way to compute, compress, store or index data that could be measured",
+  database: "the claim suggests a kind of data worth keeping in its own table",
+  none: "the claim gives the organism nothing to change or measure"}.
+ask target: Target "What could this claim change in a small self-improving computing system? Claim: {claim}" from claim, quote with effort=low, retries=2
+if target = "none" then
+  let lesson = "no lesson from this claim".
+else
+  ask lesson: Text up to 30 words "State the lesson as one plain sentence a maintainer could act on." from claim, target with effort=low, retries=2
+  ensure len(lesson) >= 10 and len(lesson) <= 300 else retry because "a lesson is between ten and three hundred characters".
+end.
+if target = "genome" then
+  ask program: one of {classify-command, triage-error, extract-source, distill-lesson, propose-experiment, rank-experiment, reproduce, assign-item} "Which one of these genome programs should change its instructions to apply the lesson? Lesson: {lesson}" from lesson with effort=low, retries=1
+  let distilled = {target: target, lesson: lesson, program: program}.
+else
+  let distilled = {target: target, lesson: lesson, program: ""}.
+end.
+return distilled.

@@ -1,0 +1,316 @@
+[LIFE round-4 critique packet, part 10 of 21]
+
+#   3. /usr/bin/python3 -s -B -m unittest TEST_ID -v (GATE_TEST_TIMEOUT 240 s): exit 0 AND "Ran N tests" with N >= 1,
+#      an OK line, and fewer skipped tests than tests run                                                  else exit 5
+# Exit 0 only when all three pass; 2 = bad arguments; 125 = the sandbox is unavailable (from step 2 or 3). Calls no
+# model and no agent. Never restarts, commits or pushes.
+set -uo pipefail
+KIT="/home/operator/host-checkout/docs/life"
+checkout="${1:-}"
+test_id="${2:-}"
+base="${3:-}"
+[[ "$checkout" =~ ^/home/operator/symblicos/projects/life-codebase-(0|[1-9]|10)-[0-9a-f]{8}$ ]] || { echo "devcheck-gate: not a LIFE codebase clone: $checkout" >&2; exit 2; }
+[[ "$test_id" =~ ^tests\.[A-Za-z0-9_]{1,64}(\.[A-Za-z0-9_]{1,64}){0,4}$ ]] && [ "${#test_id}" -le 160 ] || { echo "devcheck-gate: bad test id: $test_id" >&2; exit 2; }
+[[ "$base" =~ ^[0-9a-f]{40}$ ]] || { echo "devcheck-gate: bad base commit: $base" >&2; exit 2; }
+[ -d "$checkout/.git" ] && [ ! -L "$checkout" ] || { echo "devcheck-gate: $checkout is not a git checkout" >&2; exit 2; }
+cd "$checkout" || exit 2
+/usr/bin/python3 -I -B - "$checkout" "$test_id" <<'PY' || exit 3
+import os, sys
+root, parts = os.path.realpath(sys.argv[1]), sys.argv[2].split('.')
+for n in range(len(parts), 0, -1):
+    for rel in ('/'.join(parts[:n]) + '.py', '/'.join(parts[:n]) + '/__init__.py'):
+        path = os.path.join(root, rel)
+        walk = [os.path.join(root, *rel.split('/')[:k]) for k in range(1, len(rel.split('/')) + 1)]
+        if os.path.isfile(path) and not any(os.path.islink(p) for p in walk) and os.path.realpath(path).startswith(root + os.sep):
+            print(f'devcheck-gate: {".".join(parts[:n])} -> {rel}')
+            sys.exit(0)
+print(f'devcheck-gate: {sys.argv[2]} does not resolve to a file inside the clone', file=sys.stderr)
+sys.exit(1)
+PY
+out="$(/usr/bin/python3 -B "$KIT/bin/life-check.py" sandboxed --timeout 600 ./bin/devcheck --changed "$base" 2>&1)"
+rc=$?
+printf '%s\n' "$out"
+[ "$rc" = 125 ] && exit 125
+[ "$rc" = 0 ] || exit 4
+printf '%s\n' "$out" | grep -Eq '^devcheck: .*: [1-9][0-9]* file\(s\)' || { echo "devcheck-gate: devcheck checked no file" >&2; exit 4; }
+out="$(/usr/bin/python3 -B "$KIT/bin/life-check.py" sandboxed --timeout 240 /usr/bin/python3 -s -B -m unittest "$test_id" -v 2>&1)"
+rc=$?
+printf '%s\n' "$out"
+[ "$rc" = 125 ] && exit 125
+[ "$rc" = 0 ] || exit 5
+ran="$(printf '%s\n' "$out" | sed -n 's/^Ran \([0-9][0-9]*\) tests\{0,1\} in .*/\1/p' | tail -1)"
+skipped="$(printf '%s\n' "$out" | sed -n 's/.*skipped=\([0-9][0-9]*\).*/\1/p' | tail -1)"
+[ -n "$ran" ] && [ "$ran" -ge 1 ] && printf '%s\n' "$out" | grep -Eq '^OK( |$)' && [ "${skipped:-0}" -lt "$ran" ] || { echo "devcheck-gate: the focused test ran no test or skipped every test" >&2; exit 5; }
+echo "devcheck-gate: PASS $test_id in $checkout"
+
+===== FILE: spawn/PROTOCOL.md =====
+# LIFE division protocol (reproduction, admitted and executed by code)
+
+A cell divides only through a **division transaction** in the registry (`divisions` table of
+`/home/operator/.local/state/life/life.sqlite3`). There is no spawn-record file queue: no model,
+agent or worker can write a birth request, and nothing a worker writes is ever read as one. The
+coordinator `bin/life-tick.py` is the only writer of the registry; the reproducer (the cell's second
+agent) only names foci and sorts items, through two genome programs with kernel checks.
+
+## 1. Eligibility (code; checked by `Tick.division_start` every armed working tick)
+
+A cell may start a division only when ALL hold:
+
+| # | rule | value |
+|---|------|-------|
+| 1 | cell state | `active` |
+| 2 | failures_in_a_row (terminal failed items in a row) | `0` |
+| 3 | depth | `< 10` (life_common.MAX_DEPTH); a child is born at parent depth + 1, so at most 10 |
+| 4 | backlog_ticks | `>= 3` consecutive armed WORKING ticks (any observe-only tick resets it to 0) with **workable** queued items `>= divide_backlog` (organs.json: 12 for model organs, 6 for agent organs). Not workable: selfdev items while SELFDEV_ARMED is off or aimed at a protected program; web- or model-derived agent items without a current operator approval; codebase agent items while CODEBASE_HISTORY_OK is missing; database agent items while the database organ holds; compute propose/rank items without a valid benchmarks.json |
+| 5 | live cells of the organ (active, dividing, quarantined) | `+1 <= 3` (a division adds one net cell) |
+| 6 | live cells of the organism | `+1 <= 16` (the parent retires in the same transaction) |
+| 7 | births today (UTC) | `+2 <= 8` |
+| 8 | open divisions fleet-wide (stage foci, assign or workspaces) | `0` (code checks; the unique index `divisions_one_open` enforces it) |
+| 9 | last `divide_aborted` event of this cell | at least 21600 s ago |
+| 10 | organ efficiency over the two complete UTC days before today | `(items_done + items_abstained) / (program_runs + 3 x agent_runs) >= 0.2` (program_runs include reproduction calls), or fewer than 20 cost units |
+| 11 | a second node exists | a LIFE node other than the parent's, available this tick (online, not hot, not held, not resting, not benchmarking), with `< 4` live cells, and (agent organs) agy ready |
+| 12 | the tick may start work | governor `work`, no hold reason, admitted (ARMED for this boot, kit, platform files and DECISIONS.md unchanged, not FROZEN, STOP absent), before TICK_DEADLINE |
+| 13 | the cell's workspace is not busy | no run in submitting/live/submit_unknown and no item queued or running at gate, apply or confirm (`Tick.workspace_busy`) |
+
+Order: the organ whose last committed division is oldest (never divided = oldest) goes first, then
+the lowest `cell_id`; the first eligible cell starts. The division records the active release; the
+parent's state becomes `dividing`; new items for its organ stop going to it (dispatch gives items only to
+`active` cells).
+
+## 2. Stages
+
+1. **foci** (the parent node's slot; at most every 2nd armed tick) — `genome/reproduce.sym` at the parent's
+   reproduce rung plus the division's foci retries, with `organ`, `parent_focus` and `sample_items` = the labels
+   of the first 12 snapshot items still queued (snapshot order = priority, then oldest `updated_at`, then item
+   id), each cut to 120 characters, joined by ` | `, cut to 1600 characters. Code re-checks both foci: 8..120
+   characters, different from each other AND from the parent after `norm_text`, no credential-shaped text. A
+   `failed` answer retries ONCE at the next rung in a later slot (`foci_retries`), then the division aborts;
+   `infra` retries at a later tick. Both reproducer programs tune the parent's rung window like any program.
+2. **assign** (the parent node's slot; at most every 2nd armed tick) — `genome/assign-item.sym` for at most the
+   first 16 snapshot items still queued, at most 4 per slot (life_common.ASSIGN_PER_SLOT), each bounded to 225 s.
+   A `failed` assignment is recorded at once as the parity side (below) and never asked again; an `infra` one is
+   retried at a later tick.
+3. **workspaces** (agent organs only; code, `lifecycle`, no model) — when nothing is left to assign, the stage
+   becomes `workspaces`. Each armed working tick creates at most ONE missing child workspace (CLONE_TIMEOUT 600 s
+   for the whole clone, in its own scope), admitted by `can_start(CLONE_TIMEOUT)`; a failed clone aborts the
+   division and removes any child workspace it created that no cell owns. The child ids and paths follow from
+   the lineage (section 3), so a crash between ticks leaves nothing ownerless: an abort removes them.
+4. **commit** (code, `lifecycle`, no model; model organs commit straight after assign) — code re-checks rules 5-7,
+   12 and 13, that the parent is still `dividing`, picks child b's node again (rule 11), and, for agent organs,
+   that both workspaces exist; any failure aborts (except missing workspaces: the workspaces stage continues).
+   Every item still queued under the parent, except items at gate, apply or confirm, goes to child **a** or **b**:
+   its recorded side if it has one, else `a` when `int(sha256(item_id), 16)` is even and `b` when odd. If either
+   side is empty the division aborts. Then, in ONE registry transaction: both children are inserted, the items
+   move, the parent becomes `retired` with `end_reason='divided'`, the day's `births` grows by 2, and
+   `cell_events` records `born` twice and `divided` once. Items the parent is still running (a benchmark job) and
+   items at gate or apply keep the parent's id; they are served in the parent's workspace, which is kept until
+   they end; any other item re-queued later loses its cell and is dispatched again.
+
+A division aborts when it has been counted in more than 12 armed working ticks (DIVISION_MAX_TICKS, counted in
+`divisions.ticks` by `lifecycle`), when the active release changes under it, or, checked at every tick even while
+held, when it is older than 86400 s (DIVISION_MAX_SECONDS, the wall backstop).
+
+## 3. Child identity
+
+- `hex8 = sha256(parent_cell_id + "\n" + letter + "\n" + focus)[:8]`, `letter` = `a` or `b`.
+- `cell_id = <organ>.<depth>.<hex8>` with `depth = parent depth + 1`, depth spelled without leading
+  zeros (life_common.CELL_RX; the registry CHECK rebuilds the id from organ, depth and hex8, and a trigger
+  requires the parent's organ and depth parent + 1).
+- Child **a** stays on the parent's node; child **b** goes to the node rule 11 picks (fewest cells
+  of this organ, then fewest cells, then the order node-a, node-b, node-d, node-f, node-i).
+- A `cell_id` that already exists aborts the division (`lineage key ... already exists`): the same
+  parent with the same focus is never born twice, however the text around it varies.
+- Each child copies the parent's ladder rungs (`cell_programs`, with their rung_up_at) with an empty window.
+- Agent children get their own workspace `/home/operator/symblicos/projects/life-<organ>-<depth>-<hex8>`
+  (unique per cell: index `cells_one_workspace`). codebase: a single-branch clone of host-checkout's
+  committed history with `.backups/` outside the sparse checkout; selfdev and database: a clone of the
+  parent workspace's COMMITS (never its uncommitted files). A child whose workspace later goes missing
+  gets it re-created by the lifecycle sweep.
+
+## 4. Endings
+
+| ending | trigger (code) | effect |
+|--------|----------------|--------|
+| apoptosis | empty and idle (nothing queued or running) for 86400 s (`idle_since`) AND another active cell of the organ exists AND its workspace is not busy | `retired`, `end_reason='idle'`; never the organ's last active cell |
+| quarantine | `failures_in_a_row >= 8` (terminal failed items only) | `quarantined`; a notice. Queued items of a quarantined or retired cell (not at gate or apply) lose their cell at the next dispatch and wait unassigned while the organ has no active cell. `life-ctl.py release-cell` returns it. The organ's ONLY live cell is released automatically 86400 s after its quarantine, at the top model rung of every program, at most once per cell in any rolling 7 days (counted from its last automatic release; an operator release does not reset that) |
+| operator | `life-ctl.py retire CELL` | its open division aborts first; `retired`, `end_reason='owner'`; refused for the organ's last active cell or a cell with a live run without `--force` (which requests the run's cancel; the run's row stays live until a tick sees it end) |
+| workspace | its workspace could not be re-created 3 times since it was last made or released | `retired`, `end_reason='workspace'`, its gate/apply items fail and its other queued items return to the organ; the organ's LAST live cell is quarantined instead (release-cell lets the sweep try again) |
+| revive (a birth) | `life-ctl.py revive ORGAN NODE` for an organ with no live cell | a new depth-0 cell with the seed focus |
+| moved (not an ending) | its node was reported offline (online 0 from a readable status list) in every sample of the last 21600 s, with at least 6 such samples, the registry holding samples of that node reaching back the whole 21600 s, and its workspace not busy | the cell moves to the node rule 11 picks (`moved` event and notice); `life-ctl.py move CELL NODE` does it by hand when that node is online in the latest sample |
+
+Retired and quarantined cells never divide. Cell and event rows are never deleted. A retired codebase
+cell's clone is deleted once its workspace is not busy and it has no unfinished item
+(`STATE/retired/<cell>.json` records its last commit); selfdev and database workspaces are kept.
+
+## 5. Worked example
+
+`example/division.json` walks one division of the seed learning cell through its stages with
+the registry rows it produces.
+
+===== FILE: spawn/example/division.json =====
+{
+  "note": "One division of the seed learning cell as the registry records it. Values are illustrative; ids follow spawn/PROTOCOL.md section 3. Learning is a model organ, so there is no workspaces stage and the commit follows the assign stage at once.",
+  "parent": {
+    "cell_id": "learning.0.00000000",
+    "organ": "learning",
+    "depth": 0,
+    "node": "node-d",
+    "focus": "research the open questions and record new sources",
+    "state": "dividing",
+    "failures_in_a_row": 0,
+    "backlog_ticks": 3,
+    "queued": 14
+  },
+  "division": {
+    "division_id": "3f1c0b6a9d2e4475",
+    "stage": "foci",
+    "release": 1,
+    "ticks": 0,
+    "foci_retries": 0,
+    "last_step_tick": 0,
+    "snapshot": [
+      "learning:<16hex of question 1>",
+      "learning:<16hex of question 2>",
+      "... 14 ids: priority, then oldest updated_at, then item id"
+    ]
+  },
+  "foci_call": {
+    "program": "reproduce",
+    "applicator": "ollama:llama3.2:1b@node-d",
+    "inputs": {
+      "organ": "learning",
+      "parent_focus": "research the open questions and record new sources",
+      "sample_items": "ceramic foam porosity measurement methods | polymer fibre tensile tests | ..."
+    },
+    "returned": {
+      "focus_a": "research porous ceramic structure questions",
+      "focus_b": "research polymer fibre mechanics questions"
+    },
+    "code_check": "8..120 characters each; focus_a, focus_b and the parent focus all different after norm_text"
+  },
+  "assign_calls": {
+    "program": "assign-item",
+    "applicator": "ollama:qwen2.5:0.5b@node-d",
+    "per_tick": 4,
+    "max_items": 16,
+    "returned": {
+      "learning:<16hex of question 1>": "a",
+      "learning:<16hex of question 2>": "b"
+    },
+    "failed_rule": "a failed assign-item answer is recorded at once as the parity side and never asked again"
+  },
+  "commit": {
+    "rule": "assign-item answer, else the parity of sha256(item_id)",
+    "child_a": {
+      "cell_id": "learning.1.<first 8 hex of sha256('learning.0.00000000\\na\\nresearch porous ceramic structure questions')>",
+      "node": "node-d",
+      "items": 8
+    },
+    "child_b": {
+      "cell_id": "learning.1.<first 8 hex of sha256('learning.0.00000000\\nb\\nresearch polymer fibre mechanics questions')>",
+      "node": "node-i",
+      "items": 6
+    },
+    "parent_after": {
+      "state": "retired",
+      "end_reason": "divided"
+    },
+    "budget_births": 2,
+    "events": [
+      "born",
+      "born",
+      "divided"
+    ],
+    "rechecked": [
+      "parent still dividing",
+      "the active release is still the division's",
+      "organ live cells + 1 <= 3",
+      "organism live cells + 1 <= 16",
+      "births today + 2 <= 8",
+      "control switches and hashes",
+      "the parent's workspace is not busy",
+      "child b node available"
+    ],
+    "where": "lifecycle, at the first armed working tick after the last assignment (no model, no node slot)"
+  }
+}
+
+===== FILE: db/life.sql =====
+-- LIFE v2.2 registry (schema 4): /home/operator/.local/state/life/life.sqlite3
+-- The ONE authoritative store for control, identity, lineage, work items, runs, knowledge and metrics.
+-- Exactly one writer at a time: bin/life-tick.py, or bin/life-ctl.py for operator operations, under STATE/tick.lock.
+-- Lanes, models and agents never open this file. Applying this file twice is a no-op.
+-- Times are integer UTC Unix seconds written by Python int(time.time()). Ids are text and never NULL. Every count,
+-- depth, priority and budget is an INTEGER by type (typeof), not only by range.
+-- No credential, .env value or private-store value is ever written here.
+
+CREATE TABLE IF NOT EXISTS meta (
+  key   TEXT NOT NULL PRIMARY KEY,               -- one of life_common.META_KEYS (code refuses any other)
+  value TEXT NOT NULL
+);
+
+-- releases: immutable copies of genome/, organs/, policies/ under STATE/release/<n>/. Exactly one is active (the
+-- index forbids two; the tick and life-ctl refuse zero).
+CREATE TABLE IF NOT EXISTS releases (
+  release   INTEGER PRIMARY KEY CHECK (release >= 1),
+  at        INTEGER NOT NULL,
+  source    TEXT NOT NULL CHECK (source IN ('kit', 'adopt')),
+  manifest  TEXT NOT NULL,                       -- JSON {relative path: sha256}
+  active    INTEGER NOT NULL DEFAULT 0 CHECK (active IN (0, 1)),
+  note      TEXT NOT NULL DEFAULT ''
+);
+CREATE UNIQUE INDEX IF NOT EXISTS releases_one_active ON releases (active) WHERE active = 1;
+
+-- cells: one row per cell ever born. Birth facts (id, organ, kind, parent, depth, born_at) never change (trigger);
+-- state columns do (guarded by the tick). A child has its parent's organ and depth parent + 1 (trigger).
+CREATE TABLE IF NOT EXISTS cells (
+  cell_id           TEXT NOT NULL PRIMARY KEY,
+  organ             TEXT NOT NULL CHECK (organ IN ('command', 'learning', 'digest', 'codebase', 'immune',
+                                                   'selfdev', 'compute', 'database')),
+  kind              TEXT NOT NULL CHECK (kind = CASE WHEN organ IN ('codebase', 'selfdev', 'database') THEN 'agent' ELSE 'model' END),
+  parent_id         TEXT REFERENCES cells (cell_id),
+  depth             INTEGER NOT NULL CHECK (typeof(depth) = 'integer' AND depth BETWEEN 0 AND 10),
+  focus             TEXT NOT NULL CHECK (length(focus) BETWEEN 8 AND 120),
+  node              TEXT NOT NULL CHECK (node IN ('node-a', 'node-b', 'node-d', 'node-f', 'node-i')),
+  workspace         TEXT,                        -- agent cells only: /home/operator/symblicos/projects/life-<organ>-<depth>-<8hex>
+  state             TEXT NOT NULL CHECK (state IN ('active', 'dividing', 'quarantined', 'retired')),
+  failures_in_a_row INTEGER NOT NULL DEFAULT 0 CHECK (typeof(failures_in_a_row) = 'integer' AND failures_in_a_row >= 0),
+  items_done        INTEGER NOT NULL DEFAULT 0 CHECK (typeof(items_done) = 'integer' AND items_done >= 0),
+  idle_since        INTEGER,                     -- when the cell last became empty and idle; NULL while it has work
+  backlog_ticks     INTEGER NOT NULL DEFAULT 0 CHECK (typeof(backlog_ticks) = 'integer' AND backlog_ticks >= 0),
+  recent            TEXT NOT NULL DEFAULT '' CHECK (length(recent) <= 20),   -- last endings: d a f o
+  last_served_at    INTEGER NOT NULL DEFAULT 0,
+  born_at           INTEGER NOT NULL,
+  ended_at          INTEGER,
+  end_reason        TEXT CHECK (end_reason IS NULL OR end_reason IN ('divided', 'idle', 'owner', 'workspace')),
+  release           INTEGER NOT NULL REFERENCES releases (release),
+  CHECK (cell_id = organ || '.' || depth || '.' || substr(cell_id, -8) AND substr(cell_id, -8) NOT GLOB '*[^0-9a-f]*'
+         AND length(substr(cell_id, -8)) = 8),
+  CHECK ((parent_id IS NULL) = (depth = 0)),
+  CHECK ((state = 'retired') = (ended_at IS NOT NULL)),
+  CHECK ((workspace IS NOT NULL) = (kind = 'agent'))
+);
+CREATE INDEX IF NOT EXISTS cells_organ_state ON cells (organ, state);
+CREATE INDEX IF NOT EXISTS cells_node_state ON cells (node, state);
+CREATE UNIQUE INDEX IF NOT EXISTS cells_one_workspace ON cells (workspace) WHERE workspace IS NOT NULL;
+CREATE TRIGGER IF NOT EXISTS cells_lineage BEFORE INSERT ON cells
+WHEN NEW.parent_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM cells p WHERE p.cell_id = NEW.parent_id
+                                               AND p.organ = NEW.organ AND p.depth + 1 = NEW.depth)
+BEGIN SELECT RAISE(ABORT, 'a child has its parent''s organ and depth parent + 1'); END;
+CREATE TRIGGER IF NOT EXISTS cells_birth_facts BEFORE UPDATE OF cell_id, organ, kind, parent_id, depth, born_at ON cells
+BEGIN SELECT RAISE(ABORT, 'birth facts never change'); END;
+
+-- cell_events: append-only lifecycle log.
+CREATE TABLE IF NOT EXISTS cell_events (
+  seq      INTEGER PRIMARY KEY AUTOINCREMENT,
+  cell_id  TEXT NOT NULL REFERENCES cells (cell_id),
+  at       INTEGER NOT NULL,
+  event    TEXT NOT NULL CHECK (event IN ('born', 'divide_started', 'divided', 'divide_aborted', 'quarantined',
+                                          'released', 'retired', 'rung_up', 'rung_down', 'moved', 'workspace_made',
+                                          'workspace_failed', 'workspace_removed', 'revived')),
+  detail   TEXT NOT NULL DEFAULT '' CHECK (length(detail) <= 400)
+);
+
+
+
+[This is part 10 of 21. Reply only with the word RECEIVED.]

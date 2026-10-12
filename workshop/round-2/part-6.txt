@@ -1,0 +1,418 @@
+[LIFE round-2 critique packet, part 6 of 8]
+
+      "cmd": "python3 -c 'import sqlite3,tempfile,time,os,statistics,sys; m=sys.argv[1]; ts=[]\nfor _ in range(5):\n d=tempfile.mkdtemp(); c=sqlite3.connect(os.path.join(d,\"t.db\")); c.execute(\"PRAGMA journal_mode=\"+m); c.execute(\"CREATE TABLE t(a,b)\"); s=time.time(); c.executemany(\"INSERT INTO t VALUES(?,?)\",((i,str(i)) for i in range(200000))); c.commit(); ts.append(time.time()-s); c.close(); [os.remove(os.path.join(d,f)) for f in os.listdir(d)]; os.rmdir(d)\nprint(\"LIFE_RESULT %.4f s\" % statistics.median(ts))' {{item}}",
+      "param_rx": "^(DELETE|WAL|MEMORY|TRUNCATE)$",
+      "baseline": "DELETE",
+      "unit": "s",
+      "timeout": 600
+    }
+  ]
+}
+
+
+===== FILE: VALIDATE.sh =====
+#!/usr/bin/env bash
+# LIFE kit validator: STATIC checks only. No model, no agent, no network, no task start, no file written
+# outside a private temporary folder (Python runs with -B, so no bytecode cache is written either).
+#   1 inventory   every required file exists; entry points are executable
+#   2 genome      bin/symblic check on each of the nine programs (exit 0 and "ok")
+#   3 organs      organs/organs.json passes life_common.organs_problems (closed schema)
+#   4 templates   each raw agent template (organs/<organ>.lines.txt, placeholders unfilled) lints with ZERO
+#                 findings and no root; each renders with organs/fixtures.json, lints with ZERO findings
+#                 (symblic_autogen.lint), and its policy passes symblic_autogen.normalize and equals the
+#                 fixed LIFE agent policy (life_common.agent_policy_problems); policy_flags() emits it whole
+#   5 syntax      bash -n on every shell file; ast.parse on every Python file
+#   6 databases   db/life.sql and db/organism.sql applied twice in memory; required tables; CHECK
+#                 constraints refuse a depth-11 cell, an unknown organ and a second active release
+#   7 canaries    every canary line names an existing program or script
+#   8 benchmarks  benchmarks/benchmarks.example.json passes the tick's benchmark rules
+#   9 embedding   every "### <path>" block in LIFE.md equals that file byte for byte
+#  10 contract    life_common.contract_problems() is empty (the platform facts LIFE relies on hold)
+# It prints PASS/FAIL per check and ends with STATIC PASS or SOME FAILED. Exit 0 only on STATIC PASS.
+# STATIC PASS is not an admission test: the coordinator's behaviour under concurrency, crashes and STOP is
+# not exercised here (LIFE.md section 16, GAP 8).
+set -u
+shopt -s nullglob
+KIT="/home/operator/host-checkout/docs/life"
+REPO="/home/operator/host-checkout"
+PY="/usr/bin/python3 -B -I"
+fail=0
+pass() { printf 'PASS  %-10s %s\n' "$1" "$2"; }
+bad()  { printf 'FAIL  %-10s %s\n' "$1" "$2"; fail=1; }
+
+echo "== 1 inventory =="
+required=(BRIEF.md README.md LIFE.md VALIDATE.sh
+  bin/life_common.py bin/life-tick.py bin/life-ctl.py bin/life-status.py bin/life-check.py bin/life-seed.sh
+  checks/devcheck-gate.sh checks/canaries.txt db/life.sql db/organism.sql
+  organs/organs.json organs/fixtures.json organs/codebase.lines.txt organs/selfdev.lines.txt organs/database.lines.txt
+  policies/codebase.json policies/selfdev.json policies/database.json
+  spawn/PROTOCOL.md spawn/example/division.json units/life-tick.service units/life-tick.timer
+  benchmarks/benchmarks.example.json)
+for p in classify-command triage-error extract-source distill-lesson propose-experiment rank-experiment review-patch reproduce assign-item; do
+  required+=("genome/$p.sym"); done
+for f in "${required[@]}"; do
+  if [ -f "$KIT/$f" ] && [ ! -L "$KIT/$f" ]; then :; else bad inventory "$f missing"; fi; done
+for f in VALIDATE.sh bin/life-tick.py bin/life-ctl.py bin/life-status.py bin/life-check.py bin/life-seed.sh checks/devcheck-gate.sh; do
+  [ -x "$KIT/$f" ] || bad inventory "$f is not executable"; done
+[ "$fail" = 0 ] && pass inventory "${#required[@]} files"
+
+echo "== 2 genome (bin/symblic check, no model) =="
+for f in "$KIT"/genome/*.sym; do
+  out="$("$REPO/bin/symblic" check "$f" 2>&1)"; rc=$?
+  if [ "$rc" = 0 ] && printf '%s' "$out" | tail -1 | grep -q ': ok'; then pass check "$(basename "$f")"; else bad check "$(basename "$f")"; fi
+done
+
+echo "== 3-4 organs and templates (lint zero findings, normalize, fixed policy) =="
+if $PY - <<'PYEOF'
+import json, sys
+sys.path.insert(0, '/home/operator/host-checkout'); sys.path.insert(0, '/home/operator/host-checkout/docs/life/bin')
+import life_common as L
+ok = True
+problems = L.organs_problems(json.load(open(L.KIT + '/organs/organs.json', encoding='utf-8'), object_pairs_hook=L._no_dup_keys))
+print(('PASS  organs     ' if not problems else 'FAIL  organs     ') + ('organs.json' if not problems else '; '.join(problems)))
+ok &= not problems
+fixtures = json.load(open(L.KIT + '/organs/fixtures.json', encoding='utf-8'))
+import symblic_autogen as A
+for organ in L.AGENT_ORGANS:
+    raw = A.statements(open(f'{L.KIT}/organs/{organ}.lines.txt', encoding='utf-8').read())
+    raw_findings = A.lint(raw)                  # the raw template, no root: it must name its absolute folder itself
+    print(('PASS  raw lint   ' if not raw_findings else 'FAIL  raw lint   ') + f'{organ}: ' +
+          ('0 lint findings without a root' if not raw_findings else '; '.join(f'{lv} line {n}: {m}' for lv, n, m in raw_findings)))
+    ok &= not raw_findings
+    try:
+        lines, policy, sha = L.render_run(L.KIT, organ, fixtures[organ])
+        flags = L.policy_flags(policy)
+        print(f'PASS  template   {organ}: {len(lines)} statements, 0 lint findings, policy sha256 {sha[:12]}, {len(flags)} flags')
+    except Exception as exc:
+        print(f'FAIL  template   {organ}: {exc}'); ok = False
+sys.exit(0 if ok else 1)
+PYEOF
+then :; else fail=1; fi
+
+echo "== 5 syntax =="
+for f in "$KIT"/bin/*.sh "$KIT"/checks/*.sh "$KIT/VALIDATE.sh"; do
+  if bash -n "$f" 2>/dev/null; then pass "bash -n" "${f#$KIT/}"; else bad "bash -n" "${f#$KIT/}"; fi; done
+for f in "$KIT"/bin/*.py; do
+  if $PY -c 'import ast,sys; ast.parse(open(sys.argv[1],encoding="utf-8").read(), sys.argv[1])' "$f" 2>/dev/null; then
+    pass ast "${f#$KIT/}"; else bad ast "${f#$KIT/}"; fi; done
+for f in "$KIT"/organs/*.json "$KIT"/policies/*.json "$KIT"/spawn/example/*.json "$KIT"/benchmarks/*.json; do
+  if $PY -c 'import json,sys; json.load(open(sys.argv[1],encoding="utf-8"))' "$f" 2>/dev/null; then :; else bad json "${f#$KIT/}"; fi; done
+
+echo "== 6 databases (in memory, applied twice) =="
+if $PY - "$KIT" <<'PYEOF'
+import sqlite3, sys
+kit = sys.argv[1]
+c = sqlite3.connect(':memory:'); c.execute('PRAGMA foreign_keys=ON')
+for _ in (1, 2):
+    c.executescript(open(kit + '/db/life.sql', encoding='utf-8').read())
+need = {'meta','releases','cells','cell_events','cell_programs','items','calls','runs','divisions','commands','sources',
+        'knowledge','patches','proposals','experiments','results','migrations','samples','governor','node_holds','budget',
+        'metrics','notices'}
+have = {r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+assert need <= have, need - have
+c.execute("INSERT INTO releases (release, at, source, manifest, active) VALUES (1, 0, 'kit', '{}', 1)")
+def refused(sql):
+    try:
+        c.execute(sql); return False
+    except sqlite3.IntegrityError:
+        return True
+assert refused("INSERT INTO releases (release, at, source, manifest, active) VALUES (2, 0, 'kit', '{}', 1)")
+assert refused("INSERT INTO cells (cell_id, organ, kind, parent_id, depth, focus, node, state, born_at, release) VALUES ('learning.11.00000000', 'learning', 'model', NULL, 11, 'research something', 'node-d', 'active', 0, 1)")
+assert refused("INSERT INTO cells (cell_id, organ, kind, parent_id, depth, focus, node, state, born_at, release) VALUES ('brain.0.00000000xx', 'brain', 'model', NULL, 0, 'think about things', 'node-d', 'active', 0, 1)")
+c.execute("INSERT INTO cells (cell_id, organ, kind, parent_id, depth, focus, node, state, born_at, release) VALUES ('learning.0.00000000', 'learning', 'model', NULL, 0, 'research the open questions', 'node-d', 'active', 0, 1)")
+o = sqlite3.connect(':memory:')
+for _ in (1, 2):
+    o.executescript(open(kit + '/db/organism.sql', encoding='utf-8').read())
+assert {r[0] for r in o.execute("SELECT name FROM sqlite_master WHERE type='table'")} == {'schema_migrations'}
+PYEOF
+then pass sqlite "life.sql, organism.sql"; else bad sqlite "life.sql or organism.sql"; fi
+
+echo "== 7 canaries =="
+while IFS= read -r line; do
+  case "$line" in ''|'#'*) continue ;; esac
+  target="$(printf '%s' "$line" | awk '{print $NF}' | sed "s#{release_dir}#$KIT#; s#{kit}#$KIT#")"
+  case "$line" in *"life-check.py registry"*) target="$KIT/bin/life-check.py" ;; esac
+  [ -f "$target" ] || bad canary "$line"
+done < "$KIT/checks/canaries.txt"
+pass canaries "checks/canaries.txt"
+
+echo "== 8 benchmarks example =="
+if $PY - "$KIT/benchmarks/benchmarks.example.json" <<'PYEOF'
+import json, re, sys
+d = json.load(open(sys.argv[1], encoding='utf-8'))
+assert d['version'] == 1 and d['benchmarks']
+for b in d['benchmarks']:
+    assert set(b) == {'id', 'description', 'cmd', 'param_rx', 'baseline', 'unit', 'timeout'}, b.get('id')
+    assert re.fullmatch(r'[a-z0-9-]{2,40}', b['id']) and '{{item}}' in b['cmd'] and len(b['cmd']) <= 2000
+    assert re.fullmatch(b['param_rx'], b['baseline']) and re.fullmatch(r'[A-Za-z/%]{1,12}', b['unit'])
+    assert type(b['timeout']) is int and 30 <= b['timeout'] <= 900
+PYEOF
+then pass bench "benchmarks.example.json"; else bad bench "benchmarks.example.json"; fi
+
+echo "== 9 LIFE.md embeds every file verbatim =="
+if $PY - "$KIT" <<'PYEOF'
+import os, re, sys
+kit = sys.argv[1]
+text = open(kit + '/LIFE.md', encoding='utf-8').read()
+blocks = re.findall(r'^### (\S+)\n\n(`{3,4})[a-z]*\n(.*?)\n\2$', text, re.M | re.S)
+seen, bad = set(), []
+for path, _fence, body in blocks:
+    seen.add(path)
+    try:
+        if open(os.path.join(kit, path), encoding='utf-8').read() != body + '\n':
+            bad.append(path + ' differs')
+    except OSError:
+        bad.append(path + ' missing')
+want = set()
+for root, _d, files in os.walk(kit):
+    if '/workshop' in root or '__pycache__' in root:
+        continue
+    for f in files:
+        rel = os.path.relpath(os.path.join(root, f), kit)
+        if rel not in ('LIFE.md', 'BRIEF.md'):
+            want.add(rel)
+bad += [p + ' not embedded' for p in sorted(want - seen)]
+print('\n'.join(bad))
+sys.exit(1 if bad else 0)
+PYEOF
+then pass embed "LIFE.md appendices"; else bad embed "LIFE.md appendices"; fi
+
+echo "== 10 platform contract =="
+if out="$($PY -c 'import sys; sys.path.insert(0, "/home/operator/host-checkout/docs/life/bin"); import life_common as L; p = L.contract_problems(); print("; ".join(p)); sys.exit(1 if p else 0)')"; then
+  pass contract "platform facts hold"; else bad contract "$out"; fi
+
+echo
+if [ "$fail" = 0 ]; then echo "STATIC PASS"; else echo "SOME FAILED"; fi
+exit "$fail"
+
+
+===== FILE: bin/life-seed.sh =====
+#!/usr/bin/env bash
+# LIFE seed (the operator runs this ONCE, on the host). It asks for START, then runs life-ctl.py seed, which:
+# runs VALIDATE.sh, creates /home/operator/.local/state/life (mode 0700) with the registry, the organism
+# database and release 1, creates the three agent workspaces under /home/operator/symblicos/projects
+# (life-codebase-00000000 = a clone of host-checkout's committed history; life-selfdev-00000000 and
+# life-database-00000000 = symblic-task workspaces), and registers the 8 seed cells. It starts NO run and
+# calls NO model: nothing happens until the operator installs the timer and runs life-ctl.py arm.
+# Seeding an already seeded organism changes nothing and is never a recovery step.
+set -euo pipefail
+KIT="/home/operator/host-checkout/docs/life"
+echo "LIFE seed: creates /home/operator/.local/state/life and three workspaces; starts nothing."
+read -r -p "Type START to continue: " answer
+[ "$answer" = "START" ] || { echo "aborted"; exit 1; }
+exec /usr/bin/python3 -B "$KIT/bin/life-ctl.py" seed --confirm START
+
+
+===== FILE: bin/life-check.py =====
+#!/usr/bin/env python3
+"""LIFE acceptance checks that autogen runs as policy checks (and the canaries run), all code, no model.
+
+    life-check.py verify-line ORGAN FILE EXPECTED_WORDS...   verify.txt holds exactly the expected line
+    life-check.py migration FILE SNAPSHOT                    an additive org_ migration (life_common rules)
+    life-check.py genome-protected FILE                      only ask instructions/notes differ from HEAD:FILE
+    life-check.py registry                                   PRAGMA integrity_check and quick_check of the registry
+
+Exit 0 pass, 1 fail (the reason on stderr), 2 usage. Autogen runs these in its staging checkout on the host
+(cwd = the checkout), with CHECK_TIMEOUT 120 s (symblicos/autogen.py). Nothing here writes a file.
+"""
+import os
+import subprocess
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import life_common as L  # noqa: E402
+
+
+def fail(msg):
+    print(f'life-check: {msg}', file=sys.stderr)
+    return 1
+
+
+def read(path, limit=65536):
+    if os.path.islink(path) or not os.path.isfile(path):
+        raise OSError(f'{path} is missing or not a regular file')
+    with open(path, encoding='utf-8') as handle:
+        text = handle.read(limit + 1)
+    if len(text) > limit:
+        raise OSError(f'{path} is larger than {limit} characters')
+    return text
+
+
+def main(argv):
+    if not argv:
+        print(__doc__)
+        return 2
+    cmd, args = argv[0], argv[1:]
+    try:
+        if cmd == 'verify-line' and len(args) >= 3 and args[0] in L.VERIFY_LINES:
+            problems = L.verify_line_problems(args[0], read(args[1], 400), ' '.join(args[2:]))
+        elif cmd == 'migration' and len(args) == 2:
+            snapshot = read(args[1], 262144) if os.path.exists(args[1]) else ''
+            problems = L.migration_problems(read(args[0], 16384), snapshot)
+        elif cmd == 'genome-protected' and len(args) == 1:
+            if not args[0].startswith('genome/') or '..' in args[0]:
+                return fail('the file must be genome/<program>.sym')
+            old = subprocess.run(['git', 'show', f'HEAD:{args[0]}'], capture_output=True, text=True, timeout=30)
+            if old.returncode != 0:
+                return fail(f'git show HEAD:{args[0]} failed')
+            problems = L.genome_protected_problems(old.stdout, read(args[0]))
+        elif cmd == 'registry' and not args:
+            conn = L.connect(readonly=True)
+            rows = [r[0] for r in conn.execute('PRAGMA integrity_check')]
+            problems = [] if rows == ['ok'] else ['integrity_check: ' + '; '.join(rows)[:300]]
+        else:
+            print(__doc__)
+            return 2
+    except (OSError, ValueError, UnicodeDecodeError, subprocess.SubprocessError) as exc:
+        return fail(str(exc)[:300])
+    except Exception as exc:  # noqa: BLE001 - any other fault is a failed check, never a pass
+        return fail(f'{type(exc).__name__}: {str(exc)[:300]}')
+    if problems:
+        return fail('; '.join(problems)[:600])
+    print('life-check: pass')
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))
+
+
+===== FILE: bin/life-status.py =====
+#!/usr/bin/env python3
+"""LIFE status for the operator. Read-only: opens the registry with mode=ro, writes nothing, calls nothing.
+
+    life-status.py           control, governor, budgets, live cells, live runs, open notices
+    life-status.py --json    the same as one JSON object
+
+Exit 0 when the registry was read; 1 UNKNOWN (not seeded or unreadable: the state cannot be established).
+Every string from the registry is printed through life_common.one_line (control characters removed).
+"""
+import json
+import os
+import sqlite3
+import sys
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import life_common as L  # noqa: E402
+
+
+def age(t):
+    if not t:
+        return 'never'
+    s = max(0, L.now() - int(t))
+    return f'{s}s ago' if s < 120 else f'{s // 60}m ago' if s < 7200 else f'{s // 3600}h ago'
+
+
+def main(argv):
+    try:
+        conn = L.connect(readonly=True)
+        gov = conn.execute('SELECT * FROM governor WHERE id=1').fetchone()
+        rel = conn.execute('SELECT release FROM releases WHERE active=1').fetchone()
+        budget = conn.execute('SELECT * FROM budget WHERE day=?', (L.utc_day(),)).fetchone()
+        cells = conn.execute("SELECT * FROM cells WHERE state != 'retired' ORDER BY organ, cell_id").fetchall()
+        queued = {r[0]: r[1] for r in conn.execute("SELECT cell_id, COUNT(*) FROM items WHERE state='queued' GROUP BY cell_id")}
+        runs = conn.execute("SELECT * FROM runs WHERE state IN ('submitting','live','unknown') ORDER BY submitted_at").fetchall()
+        notes = conn.execute("SELECT * FROM notices WHERE state='open' ORDER BY at").fetchall()
+        unassigned = conn.execute("SELECT COUNT(*) FROM items WHERE state='queued' AND cell_id IS NULL").fetchone()[0]
+        last_tick = conn.execute("SELECT value FROM meta WHERE key='tick_no'").fetchone()
+    except (sqlite3.Error, OSError) as exc:
+        print(f'LIFE status UNKNOWN: {L.one_line(str(exc), 200)}')
+        return 1
+    ctl = L.control_state()
+    data = {'at': L.now(), 'control': ctl, 'release': rel[0] if rel else None, 'tick_no': last_tick[0] if last_tick else None,
+            'governor': dict(gov) if gov else None, 'budget': dict(budget) if budget else None,
+            'cells': [dict(c, queued=queued.get(c['cell_id'], 0)) for c in cells], 'unassigned': unassigned,
+            'runs': [dict(r) for r in runs], 'notices': [dict(n) for n in notices_safe(notes)]}
+    if '--json' in argv:
+        print(json.dumps(data, indent=1, sort_keys=True, default=str))
+        return 0
+    stopped = 'STOP' if ctl['stop'] else 'frozen' if ctl['freeze'] else 'armed' if ctl['armed'] else 'disarmed (observe only)'
+    print(f'LIFE {time.strftime("%Y-%m-%d %H:%M:%S")}  release {data["release"]}  tick {data["tick_no"]}  {stopped}'
+          f'  selfdev {"armed" if ctl["selfdev"] else "off"}')
+    if gov:
+        print(f'  governor {gov["state"]} (sampled {age(gov["at"])}): {gov["continuous_seconds"]}s loaded, '
+              f'{gov["quiet_seconds"]}s quiet, hot {L.one_line(gov["hot"], 80)}, reasons {L.one_line(gov["reasons"], 200)}')
+    if budget:
+        print(f'  today: program runs {budget["program_runs"]}/{L.PROGRAM_RUNS_PER_DAY}, model calls {budget["model_calls"]}, '
+              f'agent runs {budget["agent_runs"]}/{L.AGENT_RUNS_PER_DAY}, bench jobs {budget["bench_jobs"]}/{L.BENCH_JOBS_PER_DAY}, '
+              f'births {budget["births"]}/{L.BIRTHS_PER_DAY}')
+    print(f'  cells ({len(cells)} live, {unassigned} unassigned item(s)):')
+    for c in data['cells']:
+        print(f'    {c["cell_id"]:24} {c["state"]:11} {c["node"]:7} queued {c["queued"]:4} done {c["items_done"]:5} '
+              f'fail-run {c["failures_in_a_row"]}  {L.one_line(c["focus"], 60)}')
+    for r in data['runs']:
+        print(f'  run {r["run_id"]} {r["state"]} {r["organ"]} on {r["node"]} submitted {age(r["submitted_at"])}')
+    for n in data['notices']:
+        print(f'  notice {n["notice_id"]} {n["kind"]}: {n["subject"]}: {n["text"]}')
+    return 0
+
+
+def notices_safe(rows):
+    for r in rows:
+        yield {'notice_id': r['notice_id'], 'kind': L.one_line(r['kind'], 40), 'subject': L.one_line(r['subject'], 120),
+               'text': L.one_line(r['text'], 300), 'at': r['at']}
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))
+
+
+===== FILE: bin/life_common.py =====
+"""LIFE v2 shared contract: paths, limits, identities, validators and the loopback adapter.
+
+Imported by bin/life-tick.py, bin/life-ctl.py, bin/life-status.py and bin/life-check.py. Inert on import:
+importing this module reads nothing, writes nothing and starts nothing. Every number here is the single
+definition LIFE.md section 13 tabulates; change it here and in LIFE.md together (VALIDATE.sh compares
+the embedded copy). Paths are fixed: LIFE v1/v2 supports only these canonical locations, and no environment
+variable can move them (a relocated kit would split control between two roots).
+"""
+import hashlib
+import json
+import os
+import re
+import sqlite3
+import subprocess
+import time
+import unicodedata
+import urllib.error
+import urllib.request
+
+# ------------------------------------------------------------------------------------------- paths
+REPO = '/home/operator/host-checkout'
+KIT = REPO + '/docs/life'
+STATE = '/home/operator/.local/state/life'
+PROJECTS = '/home/operator/symblicos/projects'
+TASK = REPO + '/bin/symblic-task'
+SYMBLIC = REPO + '/bin/symblic'
+RESEARCH = REPO + '/bin/local-research'
+REPO_PY = REPO + '/.venv/bin/python'          # has bs4/pypdf for local_research.read_page
+SYS_PY = '/usr/bin/python3'
+DASH = 'http://127.0.0.1:8080'                  # loopback only; never a worker node tunnel
+
+REGISTRY = STATE + '/life.sqlite3'
+ORGANISM = STATE + '/organism.sqlite3'
+CONTROL = STATE + '/control'
+STOP_FILE = CONTROL + '/STOP'
+FREEZE_FILE = CONTROL + '/FREEZE'
+ARMED_FILE = CONTROL + '/ARMED'
+SELFDEV_FILE = CONTROL + '/SELFDEV_ARMED'
+WATCH_FILE = CONTROL + '/watch.txt'
+BENCH_FILE = CONTROL + '/benchmarks.json'
+INBOX = STATE + '/inbox'
+INBOX_DONE = STATE + '/inbox-done'
+INBOX_REFUSED = STATE + '/inbox-refused'
+RELEASES = STATE + '/release'
+CALLS = STATE + '/calls'
+BUNDLES = STATE + '/bundles'
+TEXTS = STATE + '/text'
+RUNS_DIR = STATE + '/runs'
+LOGS = STATE + '/logs'
+BACKUPS = STATE + '/backups'
+APPLIED = STATE + '/applied'
+OWNER = STATE + '/operator'
+LOCK_FILE = STATE + '/tick.lock'
+STATE_DIRS = (STATE, CONTROL, INBOX, INBOX_DONE, INBOX_REFUSED, RELEASES, CALLS, BUNDLES, BUNDLES + '/patches',
+
+
+[This is part 6 of 8. Reply only with the word RECEIVED.]

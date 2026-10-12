@@ -1,0 +1,12 @@
+{
+  "codebase": {"ws": "/home/operator/symblicos/projects/life-codebase-0-00000000", "kit": "/home/operator/host-checkout/docs/life",
+               "test_id": "tests.test_symblic_autogen", "finding_id": "0123456789abcdef",
+               "finding_text": "AssertionError: 3 != 4 in test_normalize_limits (tests.test_symblic_autogen.PolicyTests) File tests/test_symblic_autogen.py line 170",
+               "scope": "the file tests/test_symblic_autogen.py", "review_note": "none"},
+  "selfdev":  {"ws": "/home/operator/symblicos/projects/life-selfdev-0-00000000", "kit": "/home/operator/host-checkout/docs/life",
+               "lesson_id": "fedcba9876543210", "program": "extract-source",
+               "lesson": "Tell small models to copy the quote word for word from a single sentence and never to join two sentences."},
+  "database": {"ws": "/home/operator/symblicos/projects/life-database-0-00000000", "kit": "/home/operator/host-checkout/docs/life",
+               "migration_id": "0001_org_reading_list", "request": "Keep a reading list of papers with title, DOI, the question it answers and whether it was read.",
+               "snapshot_sha": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"}
+}

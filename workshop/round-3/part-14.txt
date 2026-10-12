@@ -1,0 +1,70 @@
+[LIFE round-3 critique packet, part 14 of 14]
+
+    ('bin/symblic-task', r"def cmd_autogen_get", 'autogen get'),
+    ('bin/symblic-task', r"def cmd_autogen_control\(action, o, args\):", 'autogen cancel'),
+    ('bin/symblic-task', r"raise ApiError\(f'HTTP \{e\.code\}", 'an HTTP error from start exits REFUSED (1)'),
+    ('bin/symblic-task', r"Where a statement names the folder \{cwd\}, use the same relative path inside your checkout",
+     'remote agents map the host workspace path into their own checkout'),
+    ('bin/symblic', r"p\.add_argument\('--max-calls'", 'symblic run --max-calls'),
+    ('bin/symblic', r"p\.add_argument\('--ollama-limits'", 'symblic run --ollama-limits'),
+    ('symblic_run.py', r"by = self\._opt\(s, 'by', env\)\n\s+if by is None:\n\s+by = self\.defaults\.get\('applicator'\) or self\.opts\.get\('by'\)",
+     'ask-level by wins over --by'),
+    ('symblic_run.py', r"signal\.signal\(signal\.SIGTERM, on_signal\)", 'symblic run stops its calls on SIGTERM'),
+    ('symblic_apply.py', r"THERMAL_HOT, THERMAL_COOL, THERMAL_TTL = 85\.0, 75\.0", 'thermal thresholds'),
+    ('symblic_apply.py', r"cancelled = ba\.cancel\(\{'id': row\['id'\]\}\)", 'a stopped call cancels its fleet-runner run'),
+    ('fleet_runner.py', r"def _check_capacity\(run: dict, kind: str, node_id: str, account: str, cfg: dict\)",
+     'one model process per node'),
+    ('fleet_runner.py', r"^def cancel\(run: dict\) -> bool:", 'the fleet runner run cancel'),
+    ('local_research.py', r'def read_page\(url: str, chars: int = PAGE_CHARS\) -> str:', 'read_page'),
+    ('local_research.py', r"\+ \('\\n\[…page continues…\]' if len\(text\) > chars else ''\)", 'read_page continuation marker'),
+    ('local_research.py', r"'timeout': STEP_TIMEOUT, 'role': run_label", 'research generations read STEP_TIMEOUT at call time'),
+    ('local_research.py', r"row = ba\.launch\(req\)", 'research generations go through fleet_runner.launch'),
+    ('local_research.py', r"^def research\(question: str, model: str = DEFAULT_MODEL, node: str = DEFAULT_NODE, max_tools: int = MAX_TOOLS,",
+     'research signature'),
+    ('bin/local-research', r"p\.add_argument\('--list'", 'local-research --list (model inventory)'),
+    ('deep_research.py', r"def safe_fetch\(url: str, max_hops: int = 5, binary: bool = False,", 'safe_fetch: at most 5 hops'),
+    ('deep_research.py', r"raise RuntimeError\(f'that file is larger than the \{max_bytes // 1048576\}MB cap'\)", 'safe_fetch: a byte cap'),
+    ('deep_research.py', r"raise RuntimeError\('too many redirects'\)", 'safe_fetch: refuses past its redirect limit'),
+    ('landlock_sandbox.py', r"if a in \('--ro', '--rx', '--rw', '--cwd'\) and i \+ 1 < len\(argv\):", 'sandbox path flags'),
+    ('landlock_sandbox.py', r"if a in \('--require', '--no-unix', '--net-bind-ephemeral'\):", 'sandbox --require/--no-unix'),
+    ('landlock_sandbox.py', r"if a == '--net-connect' and i \+ 1 < len\(argv\):", 'sandbox --net-connect'),
+    ('bin/devcheck', r"bin/devcheck --changed BASE", 'devcheck --changed BASE'),
+    ('cluster_engine.py', r"if route == 'map':", 'cluster map route'),
+    ('cluster_engine.py', r"shlex\.quote\(cmd\.replace\('\{\{item\}\}', '\"\$1\"'\) \+ ' 2>&1'\)", 'map passes {{item}} as "$1"'),
+    ('cluster_engine.py', r"_fanout_job\('map', targets, make, meta, timeout, heavy=True\)", 'map is a job'),
+    ('cluster_engine.py', r"limit = _int\(handler\.get_query_param\('limit'\), 40, 1, 200\)", 'jobs listing pages of 200'),
+    ('cluster_engine.py', r"'ts': int\(time\.time\(\)\)\}\)", 'status ts is the answer time'),
+    ('cluster_engine.py', r"TENANT_STACKS = \{'node-h': \('protected service stack'", 'node-h hosts the protected service stack'),
+    ('host_routes.py', r"route in \('job/cancel', 'jobs/cancel'\)", 'job cancel route'),
+    ('cluster_highpower.py', r"route=='state'", 'highpower state route'),
+    ('cluster_highpower.py', r"'restUntil':rest_until\(s\),'cool':cool", 'highpower view: restUntil and cool'),
+    ('agent_hub.py', r"'node': str\(r\['id'\]\)\.startswith\('node'\), 'ready': ready, 'notes': notes,", 'catalog ready per engine'),
+    ('agent_hub.py', r"REMOTE_ENGINES = \([^)]*'agy'", 'agy runs remotely'),
+    ('restart-host.sh', r"\S", 'the operator restart script life-ctl apply names exists'),
+)
+
+
+def contract_problems():
+    """The platform facts LIFE relies on, checked from the source text (no import with side effects). Any problem
+    holds all new work and opens a `contract` notice. Recovery: read the platform change; if LIFE's assumption still
+    holds, update the matching CONTRACT row here and LIFE.md section 17 together, run VALIDATE.sh (must end STATIC
+    PASS), re-arm (the kit hash changed), and run life-ctl.py contract (must print 'contract holds'); the hold clears
+    at the next tick. If the fact changed by accident, revert the platform change instead."""
+    out = []
+    for rel, pattern, what in CONTRACT:
+        path = os.path.join(REPO, rel)
+        try:
+            with open(path, encoding='utf-8') as handle:
+                text = handle.read()
+        except OSError as exc:
+            out.append(f'{what}: cannot read {rel}: {exc.strerror}')
+            continue
+        if not re.search(pattern, text, re.M):
+            out.append(f'{what}: pattern not found in {rel}')
+    return out
+
+===== OMITTED: bin/life-tick.py (168,696 bytes) and bin/life-ctl.py (34,151 bytes); their behaviour is specified in LIFE.md sections 4-15 =====
+
+
+
+[This is part 14 of 14, the last part. You now have the full packet. Now write the full critique at maximum depth, following the critic brief in part 1 exactly: think as long as you need, numbered findings with severity, location, the exact ambiguity or defect, and the atomic fix with replacement text; end with FINDINGS_TOTAL=<n>, UNDEFINED_DETAILS=<n> on their own lines and a final line VERDICT=<CONVERGED|CHANGES NEEDED>.]

@@ -1,0 +1,33 @@
+[LIFE round-4 critique packet, part 21 of 21]
+
+        if not m:
+            raise ValueError(f'a limits line without a meaning: {line[:80]}')
+        shown = []
+        for name in m.group(1).split(', '):
+            value = globals()[name]
+            if isinstance(value, dict):
+                shown.append(', '.join(f'{k} {v}' for k, v in value.items()))
+            elif isinstance(value, re.Pattern):
+                shown.append(value.pattern)
+            else:
+                shown.append(str(value))
+        rows.append((m.group(1), ' / '.join(shown), m.group(3).strip()))
+    return rows
+
+
+def limits_table():
+    return '\n'.join(['| name | value | meaning |', '|------|-------|---------|']
+                     + [f'| {n} | {v.replace("|", "&#124;")} | {m.replace("|", "&#124;")} |' for n, v, m in limits_rows()])
+
+
+def contract_table():
+    return '\n'.join(['| file | fact |', '|------|------|'] + [f'| `{f}` | {what} |' for f, _rx, what in CONTRACT])
+
+
+def notices_table():
+    return '\n'.join(['| kind | subject |', '|------|---------|'] + [f'| {k} | {s} |' for k, s in NOTICE_KINDS.items()])
+
+===== OMITTED: bin/life-tick.py (232,387 bytes) and bin/life-ctl.py (54,675 bytes); their behaviour is specified in LIFE.md sections 4-15 =====
+
+
+[This is part 21 of 21, the last part. You now have the full packet. Now write the full critique at maximum depth, following the critic brief in part 1 exactly: think as long as you need, numbered findings with severity, location, the exact ambiguity or defect, and the atomic fix with replacement text; end with FINDINGS_TOTAL=<n>, UNDEFINED_DETAILS=<n> on their own lines and a final line VERDICT=<CONVERGED|CHANGES NEEDED>.]

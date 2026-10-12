@@ -1,0 +1,401 @@
+    if data is not None:
+        req.add_header('Content-Type', 'application/json')
+    try:
+        with opener.open(req, timeout=timeout) as res:
+            if box is not None:
+                box['res'] = res
+            raw = res.read(HTTP_MAX_BYTES + 1)
+        if len(raw) > HTTP_MAX_BYTES:
+            raise Telemetry(f'{path}: answer larger than {HTTP_MAX_BYTES} bytes')
+        value = strict_json(raw.decode('utf-8'))
+    except urllib.error.HTTPError as exc:
+        raise Telemetry(f'{path}: HTTP {exc.code}', exc.code) from None
+    except (urllib.error.URLError, OSError, ValueError, TimeoutError) as exc:
+        raise Telemetry(f'{path}: {type(exc).__name__}: {str(exc)[:200]}') from None
+    if not isinstance(value, dict):
+        raise Telemetry(f'{path}: answer is not a JSON object')
+    return value
+
+
+_HTTP_OPEN = [0]
+_HTTP_LOCK = threading.Lock()
+
+
+def http_json(path, body=None, timeout=HTTP_TIMEOUT):
+    """GET (body None) or POST JSON to the loopback dashboard with bin/symblic-task's header shape: no proxy,
+    no redirect, Host 127.0.0.1:8080. ONE deadline of `timeout` seconds covers connecting, the headers, the body and
+    decoding: the exchange runs in a helper thread and a caller never waits longer. At the deadline the caller closes
+    the response (which ends a blocked read) and raises; an exchange that still has not ended counts as outstanding,
+    and at HTTP_OUTSTANDING_MAX outstanding exchanges a new one is refused (Telemetry). A timed-out POST is an
+    unresolved intent: callers reconcile it (a start by its run id, a job by its label), never by repeating blindly.
+    Any HTTP error (status kept), oversize answer (> HTTP_MAX_BYTES), strict_json refusal, non-object answer or the
+    deadline raises Telemetry."""
+    with _HTTP_LOCK:
+        if _HTTP_OPEN[0] >= HTTP_OUTSTANDING_MAX:
+            raise Telemetry(f'{path}: {_HTTP_OPEN[0]} earlier loopback exchanges are still open; refused')
+        _HTTP_OPEN[0] += 1
+    box = {}
+
+    def work():
+        try:
+            box['value'] = _http_once(path, body, timeout, box)
+        except Telemetry as exc:
+            box['error'] = exc
+        except Exception as exc:  # noqa: BLE001 - any other failure is a Telemetry failure
+            box['error'] = Telemetry(f'{path}: {type(exc).__name__}: {str(exc)[:200]}')
+        finally:
+            with _HTTP_LOCK:
+                _HTTP_OPEN[0] -= 1
+    t = threading.Thread(target=work, daemon=True)
+    t.start()
+    t.join(timeout)
+    if t.is_alive():
+        res = box.get('res')
+        if res is not None:
+            try:
+                res.close()
+            except Exception:  # noqa: BLE001 - closing is best effort; the exchange stays counted until it ends
+                pass
+        raise Telemetry(f'{path}: no complete answer within {timeout} s')
+    if 'error' in box:
+        raise box['error']
+    return box['value']
+
+
+# ------------------------------------------------------------------------------------------- processes
+
+
+class Procs:
+    """Every subprocess LIFE starts, so STOP (or a timeout) ends them the same way: SIGTERM to the process group,
+    then SIGKILL to the whole group KILL_GRACE seconds later, whether or not the leader already exited. Output goes to
+    temporary files (memory stays bounded); a process that writes more than OUTPUT_KILL_BYTES is ended and returns
+    OUTPUT_LIMIT_RC (checked while it runs AND after it exits). A process is registered in `live` the instant it
+    exists, so STOP always sees it. `tracked=False` is for the cancel calls STOP itself makes and the agent start
+    (which must not be killed half-way); `admit` is the final admission callable checked immediately before the
+    process is created (launch_allowed for new work)."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.live = {}
+        self.stopped = set()                    # pids kill_all ended for STOP (their run returns STOPPED_RC)
+
+    def run(self, argv, timeout, cwd=None, env=None, tracked=True, admit=None):
+        """Returns (rc, stdout, stderr): rc None = timeout, OUTPUT_LIMIT_RC = output limit, STOPPED_RC = STOP ended it,
+        NOT_ADMITTED_RC = no process was created (STOP present, admission refused, or no time left in the stage),
+        127 = the program could not start, negative = signal. ONE monotonic deadline is computed before launch and each
+        wait uses at most the time left, so a process never completes successfully past its deadline. Any exception
+        while waiting ends the process group before it is unregistered."""
+        if tracked and stop_present():
+            return NOT_ADMITTED_RC, '', 'STOP present: not started'
+        if admit is not None and not admit():
+            return NOT_ADMITTED_RC, '', 'not admitted: STOP, FREEZE, disarm, a kit/platform/decisions change or the host load'
+        if timeout <= 0:
+            return NOT_ADMITTED_RC, '', 'no time left in this stage'
+        with tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
+            end = time.monotonic() + timeout
+            with self.lock:
+                try:
+                    proc = subprocess.Popen(argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=out, stderr=err,
+                                            start_new_session=True, close_fds=True)
+                except (OSError, ValueError) as exc:
+                    return 127, '', f'could not start {argv[0] if argv else "?"}: {type(exc).__name__}: {exc}'
+                if tracked:
+                    self.live[proc.pid] = proc
+            rc = None
+
+            def size():
+                return os.fstat(out.fileno()).st_size + os.fstat(err.fileno()).st_size
+            try:
+                while True:
+                    try:
+                        rc = proc.wait(timeout=max(0.05, min(1.0, end - time.monotonic())))
+                        break
+                    except subprocess.TimeoutExpired:
+                        pass
+                    if size() > OUTPUT_KILL_BYTES:
+                        self.end([proc])
+                        rc = OUTPUT_LIMIT_RC
+                        break
+                    if time.monotonic() >= end:
+                        self.end([proc])
+                        rc = None
+                        break
+                if rc not in (None, OUTPUT_LIMIT_RC):
+                    self.end([proc], leader_done=True)     # descendants still in the group end too
+                    if size() > OUTPUT_KILL_BYTES:
+                        rc = OUTPUT_LIMIT_RC
+            finally:
+                if proc.poll() is None:
+                    self.end([proc])
+                if tracked:
+                    with self.lock:
+                        self.live.pop(proc.pid, None)
+                        if proc.pid in self.stopped:
+                            self.stopped.discard(proc.pid)
+                            rc = STOPPED_RC
+            out.seek(0)
+            err.seek(0)
+            return rc, out.read(OUTPUT_KEEP_BYTES).decode('utf-8', 'replace'), err.read(ERR_KEEP_BYTES).decode('utf-8', 'replace')
+
+    @staticmethod
+    def end(procs, leader_done=False):
+        """SIGTERM every group, wait up to KILL_GRACE for the leaders, then SIGKILL every group (a group whose members
+        are all gone answers ESRCH, which is ignored), reap the leaders for at most 5 s. leader_done: the leader
+        already exited normally; only a SIGKILL to its group follows (no grace: nothing should remain). Returns the
+        number of leaders still not reaped (unresolved)."""
+        if not leader_done:
+            for proc in procs:
+                try:
+                    os.killpg(proc.pid, signal.SIGTERM)
+                except OSError:
+                    pass
+            deadline = time.monotonic() + KILL_GRACE
+            for proc in procs:
+                try:
+                    proc.wait(timeout=max(0.1, deadline - time.monotonic()))
+                except subprocess.TimeoutExpired:
+                    pass
+        unresolved = 0
+        for proc in procs:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except OSError:
+                pass
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                unresolved += 1
+        return unresolved
+
+    def kill_all(self, reason='stop'):
+        """End every live process group (reason 'stop': their runs return STOPPED_RC; 'cleanup': the end of a phase).
+        Returns (targeted, unresolved): how many groups were signalled and how many leaders were still not reaped."""
+        with self.lock:
+            procs = list(self.live.values())
+            if reason == 'stop':
+                self.stopped.update(p.pid for p in procs)
+        unresolved = self.end(procs) if procs else 0
+        return len(procs), unresolved
+
+
+_RUNNER = Procs()
+
+
+def run_bounded(argv, *, timeout, cwd=None, env=None, tracked=True):
+    """One process through the shared runner (life-ctl, life-check and the cancel calls)."""
+    return _RUNNER.run(argv, timeout, cwd=cwd, env=env, tracked=tracked)
+
+
+PROTECTED_ENV = re.compile(r'^(PATH|HOME|LANG|LC_\w+|PYTHON\w*|DASH_URL|SYMBLIC_\w*|LD_\w+|DASHBOARD_DIR|GIT_\w+)$')
+
+
+def child_env(extra=None):
+    """The environment every trusted LIFE subprocess gets: nothing inherited, fixed PATH, thermal guard on (it only
+    refuses on a hot node: a call named @NODE is never re-placed, symblic_apply pins it), git's system and global
+    configuration off (GIT_CONFIG_NOSYSTEM, GIT_CONFIG_GLOBAL=/dev/null), replacement refs and system attributes
+    ignored (GIT_NO_REPLACE_OBJECTS, GIT_ATTR_NOSYSTEM). `extra` may add only keys outside
+    PROTECTED_ENV. Candidate (agent-written) code never runs with this environment: it runs under sandbox_argv() with
+    an empty temporary HOME."""
+    env = {'PATH': '/usr/local/bin:/usr/bin:/bin', 'HOME': '/home/operator', 'LANG': 'C.UTF-8',
+           'PYTHONDONTWRITEBYTECODE': '1', 'DASH_URL': DASH, 'SYMBLIC_THERMAL': '1',
+           'SYMBLIC_CALL_WALL_S': str(CALL_TIMEOUT), 'GIT_CONFIG_NOSYSTEM': '1', 'GIT_CONFIG_GLOBAL': '/dev/null',
+           'GIT_TERMINAL_PROMPT': '0', 'GIT_NO_REPLACE_OBJECTS': '1', 'GIT_ATTR_NOSYSTEM': '1'}
+    for key, value in (extra or {}).items():
+        if PROTECTED_ENV.match(key):
+            raise ValueError(f'child_env: {key} is protected')
+        env[key] = str(value)
+    return env
+
+
+# Every git command LIFE runs in a workspace that candidate code could have written. GIT_SAFE disables hooks,
+# fsmonitor, external diff, pagers, proxies, ssh commands, credential helpers and askpass, and child_env() turns off
+# system/global configuration, system attributes and replacement objects. Filters, includes, aliases and every other
+# config-driven command are NOT neutralised key by key: git_admin_problems() (an allowlist of the whole .git/config,
+# no commondir, no alternates) runs before every trusted git command, and git_meta_sha256() is compared around every
+# sandboxed run (a sandboxed run that a crash interrupted is distrusted at the next tick: workspace_guard rows).
+GIT_SAFE = ('-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', '-c', 'core.sshCommand=/bin/false',
+            '-c', 'diff.external=', '-c', 'protocol.ext.allow=never', '-c', 'core.pager=cat',
+            '-c', 'core.attributesFile=/dev/null', '-c', 'core.gitProxy=', '-c', 'core.alternateRefsCommand=',
+            '-c', 'credential.helper=', '-c', 'core.askPass=')
+GIT_META = ('config', 'config.worktree', 'info', 'hooks', 'objects/info', 'HEAD', 'packed-refs', 'refs', 'worktrees',
+            'shallow', 'commondir', 'modules', 'gitdir')
+# The only configuration a LIFE workspace may hold (what clone, sparse-checkout and symblic-task workspace write):
+# {section or (section, subsection): keys}; '*' = any subsection. Anything else (include, filter, diff, alias, url,
+# credential, core.* keys outside the list, a continuation line) is a workspace problem.
+GIT_CONFIG_ALLOWED = {
+    'core': {'repositoryformatversion', 'filemode', 'bare', 'logallrefupdates', 'sparsecheckout', 'sparsecheckoutcone',
+             'ignorecase', 'precomposeunicode'},
+    ('remote', 'origin'): {'url', 'fetch', 'tagopt'},
+    ('branch', '*'): {'remote', 'merge'},
+    'extensions': {'worktreeconfig'},
+}
+
+
+def _sha_nofollow(path):
+    """sha256 of a regular file opened with O_NOFOLLOW | O_NONBLOCK (a FIFO never blocks), checked on the descriptor."""
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise ValueError(f'{path} is not a regular file')
+        h = hashlib.sha256()
+        while True:
+            block = os.read(fd, 1 << 16)
+            if not block:
+                return h.hexdigest()
+            h.update(block)
+    finally:
+        os.close(fd)
+
+
+def git_meta_sha256(ws):
+    """sha256 over the administrative parts of ws/.git that change what git reads or runs: GIT_META (configuration,
+    info/ with attributes and grafts, hooks, objects/info with alternates, HEAD, packed-refs, refs (replace refs
+    included), worktrees, shallow, commondir, modules, gitdir) by content, plus the names and sizes of every loose
+    object (objects/??/*; packs are immutable). Visited with lstat; a symlink, FIFO, socket or device anywhere, more
+    than GIT_META_MAX_ENTRIES entries, more than GIT_META_MAX_BYTES of content, or more than GIT_TIMEOUT seconds raises
+    ValueError (the caller treats the workspace as broken). Taken before candidate code runs in ws and compared after."""
+    base = os.path.join(ws, '.git')
+    if not stat.S_ISDIR(os.lstat(base).st_mode):
+        raise ValueError('.git is not a real directory')
+    h = hashlib.sha256()
+    state = {'n': 0, 'bytes': 0, 'end': time.monotonic() + GIT_TIMEOUT}
+
+    def visit(rel):
+        state['n'] += 1
+        if state['n'] > GIT_META_MAX_ENTRIES or time.monotonic() > state['end']:
+            raise ValueError('the .git administrative tree is too large to inspect')
+        path = os.path.join(base, rel)
+        st = os.lstat(path)
+        if stat.S_ISREG(st.st_mode):
+            state['bytes'] += st.st_size
+            if state['bytes'] > GIT_META_MAX_BYTES:
+                raise ValueError('the .git administrative files are too large to inspect')
+            h.update(rel.encode() + b'\0f\0' + _sha_nofollow(path).encode() + b'\n')
+        elif stat.S_ISDIR(st.st_mode):
+            h.update(rel.encode() + b'\0d\n')
+            for name in sorted(os.listdir(path)):
+                visit(rel + '/' + name)
+        else:
+            raise ValueError(f'.git/{rel} is not a regular file or directory')
+    for rel in GIT_META:
+        if os.path.lexists(os.path.join(base, rel)):
+            visit(rel)
+        else:
+            h.update(rel.encode() + b'\0absent\n')
+    objects = os.path.join(base, 'objects')
+    for d in sorted(os.listdir(objects)) if os.path.isdir(objects) else []:
+        if re.fullmatch(r'[0-9a-f]{2}', d):
+            dpath = os.path.join(objects, d)
+            if not stat.S_ISDIR(os.lstat(dpath).st_mode):
+                raise ValueError(f'.git/objects/{d} is not a directory')
+            for name in sorted(os.listdir(dpath)):
+                state['n'] += 1
+                if state['n'] > GIT_META_MAX_ENTRIES:
+                    raise ValueError('too many loose objects to inspect')
+                st = os.lstat(os.path.join(dpath, name))
+                if not stat.S_ISREG(st.st_mode):
+                    raise ValueError(f'.git/objects/{d}/{name} is not a regular file')
+                h.update(f'objects/{d}/{name}\0{st.st_size}\n'.encode())
+    return h.hexdigest()
+
+
+def git_config_problems(ws):
+    """Every line of ws/.git/config and config.worktree must be a comment, a section header [name] or [name "sub"],
+    or a key = value line whose (section, key) GIT_CONFIG_ALLOWED lists; each file a regular file of at most 64 KiB."""
+    out = []
+    for name in ('config', 'config.worktree'):
+        path = os.path.join(ws, '.git', name)
+        try:
+            st = os.lstat(path)
+        except FileNotFoundError:
+            continue
+        if not stat.S_ISREG(st.st_mode) or st.st_size > 65536:
+            out.append(f'.git/{name} is not a regular file of at most 64 KiB')
+            continue
+        section = None
+        for raw in read_in(os.path.join(ws, '.git'), name, 65536).decode('utf-8', 'replace').splitlines():
+            ln = raw.strip()
+            if not ln or ln[0] in '#;':
+                continue
+            m = re.fullmatch(r'\[([A-Za-z][A-Za-z0-9-]*)(?:\s+"([^"\\]*)")?\]', ln)
+            if m:
+                section = (m.group(1).lower(), m.group(2))
+                continue
+            m = re.fullmatch(r'([A-Za-z][A-Za-z0-9-]*)\s*(?:=\s*([^\\]*))?', ln)
+            if not m or section is None:
+                out.append(f'.git/{name}: a line git_config_problems cannot read: {ln[:60]}')
+                continue
+            key = m.group(1).lower()
+            sect, sub = section
+            allowed = (GIT_CONFIG_ALLOWED.get(sect) if sub is None else
+                       GIT_CONFIG_ALLOWED.get((sect, sub)) or GIT_CONFIG_ALLOWED.get((sect, '*')))
+            if not allowed or key not in allowed:
+                out.append(f'.git/{name}: {sect}{"." + sub if sub else ""}.{key} is not an allowed setting')
+    return out
+
+
+def git_admin_problems(ws):
+    """Checked before EVERY trusted git command in a LIFE workspace (Tick.git, life-ctl git): ws/.git is a real
+    directory (not a file, not a symlink: never a pointer to other storage); no commondir, gitdir or
+    objects/info/alternates file; the configuration passes git_config_problems. A problem means git never runs there:
+    the workspace is deleted and re-created from a trusted source."""
+    base = os.path.join(ws, '.git')
+    try:
+        if not stat.S_ISDIR(os.lstat(base).st_mode):
+            return ['.git is not a real directory']
+    except OSError as exc:
+        return [f'.git: {exc.strerror}']
+    out = [f'.git/{rel} exists' for rel in ('commondir', 'gitdir', 'objects/info/alternates')
+           if os.path.lexists(os.path.join(base, rel))]
+    try:
+        out += git_config_problems(ws)
+    except OSError as exc:
+        out.append(f'.git/config: {exc}')
+    return out
+
+
+TOOL_ROOT_RX = re.compile(r'(/home/operator/agent-upgrades/envs/[A-Za-z0-9._-]+|/home/operator/\.local/share/uv/tools/'
+                          r'[A-Za-z0-9._-]+)/bin/[A-Za-z0-9._-]+')
+
+
+def devcheck_tools():
+    """(env additions, read-exec dirs, refused) so bin/devcheck finds ruff and ast-grep inside the sandbox: the same
+    candidate paths scripts/devcheck.py:find_ruff/find_ast_grep use, resolved through symlinks. A tool is granted ONLY
+    when its real path matches TOOL_ROOT_RX (an isolated tool environment: agent-upgrades/envs/<name> or
+    .local/share/uv/tools/<name>), and the grant is that environment's root, never a parent of STATE; a tool that
+    exists but resolves elsewhere is listed in `refused` (life-check sandboxed then exits 125). RAYON_NUM_THREADS=4
+    bounds both Rust tools' threads (SCOPE_TASKS_MAX)."""
+    env, dirs, refused = {'RAYON_NUM_THREADS': '4'}, [], []
+    for var, candidates in (('DEVCHECK_RUFF', ('/home/operator/agent-upgrades/envs/ruff/bin/ruff', '/home/operator/.local/bin/ruff')),
+                            ('DEVCHECK_AST_GREP', ('/home/operator/.local/bin/ast-grep',
+                                                   '/home/operator/.local/share/uv/tools/ast-grep-cli/bin/ast-grep'))):
+        for path in candidates:
+            if os.path.isfile(path) and os.access(path, os.X_OK):
+                real = os.path.realpath(path)
+                m = TOOL_ROOT_RX.fullmatch(real)
+                if m:
+                    env[var] = real
+                    dirs.append(m.group(1))
+                else:
+                    refused.append(real)
+                break
+    return env, sorted(set(dirs)), refused
+
+
+def sandbox_argv(cwd, home, command, rx=(), env_extra=None):
+    """Candidate code (a watched test, check 0 of a codebase run, the gate) runs ONLY like this: the repository's
+    Landlock launcher with --require (a kernel without Landlock network rules, ABI 4, refuses with exit 125, never an
+    unsandboxed run), the system read-only, `cwd` and the empty temporary `home` the only writable places besides the
+    launcher's SYSTEM_RW devices (/dev/shm among them: GAP 17), the rest of /home/operator (STATE, ~/.ssh, ~/.config,
+    the live checkout, .env) absent, NO TCP connect and no TCP bind (--net-connect with an empty port list), no unix
+    sockets (--no-unix: a seccomp filter, abstract ones included), signals only inside the sandbox (Landlock scoping,
+    ABI 6; the host has 8; the probe checks it), only stdin/stdout/stderr inherited (close_fds), and an environment
+    built from nothing. NOT blocked: UDP (the launcher has no UDP rule: GAP 15) and metadata changes such as chmod on
+    paths it cannot read (Landlock does not cover them: GAP 16; STOP and FREEZE then read as present)."""
+    env = ['PATH=/usr/local/bin:/usr/bin:/bin', 'HOME=' + home, 'LANG=C.UTF-8', 'TMPDIR=' + home,
+           'PYTHONDONTWRITEBYTECODE=1']
+    for key, value in (env_extra or {}).items():
+        env.append(f'{key}={value}')
+
+
+[This is part 24 of 26. Do not critique yet. Reply only with the word RECEIVED.]

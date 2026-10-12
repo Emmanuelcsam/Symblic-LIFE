@@ -1,0 +1,229 @@
+[LIFE round-4 critique packet, part 2 of 21]
+
+start: no new the host stage, agent start, division step or slot action begins after `TICK_DEADLINE` 1200 s; a
+stage starts only when `elapsed + its budget + KILL_GRACE + START_MARGIN <= TICK_HARD` 2700 s, and every
+process inside a stage gets its own timeout clipped to what is left of that budget (the stage budgets are in
+section 13); systemd's limit is 3000 s. Heavy local work (watched tests, the gate, clones, fetches) runs in its
+own `life-<purpose>-<8hex>.scope` in work.slice with MemoryMax, CPUQuota 200 %, TasksMax 64 and
+RuntimeMaxSec = its budget + 30 s. One tick, in this exact order:
+
+1. **lock** — `flock(STATE/tick.lock, LOCK_EX|LOCK_NB)`; held: print and exit 0.
+   From here to the end, a watcher thread checks `control/STOP` every 1 s and, when it exists, ends every
+   LIFE process group (SIGTERM, SIGKILL to the whole group 30 s later, whether or not its leader exited) and
+   stops every `life-*.scope`. A SIGTERM to the tick itself (systemd stop or `TimeoutStartSec`) does the same and
+   exits 1.
+2. **stop** — `control/STOP` exists: `stop_everything` (section 5; it needs only the registry, never the release,
+   not even the schema check) and exit 3. Then the registry schema must be 4 (else exit 5).
+3. **recover** — model-stage items a killed tick left `running` return to their queue and their cell's node is
+   held `ORPHAN_HOLD_SECONDS` (a SIGKILLed `bin/symblic run` can leave its fleet-runner run going until its own
+   RuntimeMaxSec); a run whose terminal status was copied but not collected (a crash in between) is collected now.
+4. **integrity** — every STATE directory is a real 0700 directory owned by the operator; the active release loads
+   and its folder holds exactly genome/, organs/ and policies/ with exactly its manifest's regular files and
+   hashes; when armed, the kit code, the pinned platform files (`PLATFORM_PINS`) and DECISIONS.md still have the
+   hashes recorded at arm; the platform contract (section 17) holds and, when armed, the running server's autogen
+   defaults equal LIFE's; the last canary round passed; no fault hold. Any failure: a notice and a hold.
+5. **metabolism** — sample `/api/cluster/status` and `/api/cluster/highpower/state`, the host's load, io and
+   memory pressure and MemAvailable, and LIFE's own per-node load ledger; update the governor and per-node rests
+   (section 10); compute the nodes available for new work.
+6. **canaries** — a round when one is due (hourly), at every tick while no round has ever passed, and at every
+   tick after a failed round, when `can_start(CANARY_ROUND_SECONDS)`.
+7. **runs** — poll every LIFE autogen run (`GET /api/symblicos/autogen/get?id=RUN_ID`): confirm each new run's
+   identity (section 7.9); re-send the identical start of a run the server does not know; request a cancel of runs
+   live 4500 s after submission; collect ended runs, each in one transaction. Poll benchmark jobs through the paged
+   `GET /api/cluster/jobs?kind=map&limit=200&offset=N` (until the listing's `total`, at most 5 pages), by job id or
+   by `meta.label`; score ended ones; release node holds of jobs that ended.
+8. **reconcile** — a division open longer than `DIVISION_MAX_SECONDS` aborts (even while held); the organism's
+   `schema_migrations` and the registry's `migrations` are compared (section 7.8).
+9. **upkeep** — the storage walk (ticks 1, 13, 25, ...; free space on both filesystems every tick); unless storage
+   holds, the inbox (at most 50 files, oldest name first, section 6); the daily retention and backup at the first
+   tick of each UTC day (the backup skipped under a storage hold or without room); command reports (skipped under
+   a storage hold).
+10. **gate** — STOP appeared meanwhile: `stop_everything` and exit 3. Not admitted (not ARMED for this boot, a
+    changed kit, platform-file or DECISIONS hash, FROZEN), no release, or any hold: every cell's `backlog_ticks`
+    resets to 0, hold notices, status, exit (0, or 5 for an integrity or contract hold). **Observe-only ends here**:
+    it never runs agenda entries, watched tests, fetches, gates, applies, models, agents or benchmarks.
+11. **agenda** — the operator's recurring commands (section 6).
+12. **findings** — one due watched test, sandboxed, in a codebase clone (section 7.4).
+13. **dispatch** — free items stranded on retired or quarantined cells; give each unassigned queued item
+    to the best-matching active cell of its organ (section 9).
+14. **the host stages** — fetch up to 4 source texts; at most one operator-finding confirmation, one codebase
+    gate, one selfdev gate and one database apply; then start agent runs (section 7.9). Every one first
+    re-reads STOP, ARMED, the hashes and FREEZE, and the process itself is admitted again by
+    `launch_allowed` immediately before it is created.
+15. **lifecycle** — workable-backlog and idle counters; quarantine and its automatic release; apoptosis; the
+    open division's code steps (its tick count, a changed release, the workspaces stage, the commit); one missing
+    workspace re-created; one retired codebase clone removed; cells on long-offline nodes moved; the store adapter;
+    derived questions; a division start (section 9).
+16. **dispatch** again.
+17. **node slots** — the installed-model inventory is re-read once a day (`bin/local-research --list`, no
+    model); when the last governor sample is older than 120 s every governor input is read again; each available
+    LIFE worker node plans ONE action (a division step, a benchmark start, or one program run), its budget is charged,
+    and all program runs start in parallel threads (one per worker node; the threads touch no registry connection);
+    when a node's action ends, its result is recorded in the main thread and the node plans its next action, at
+    most `SLOT_ACTIONS_MAX` 4 actions per node per tick, each admitted again (section 8).
+18. **status** — `STATE/operator/status.json`, written on every exit after step 2 (also faults).
+
+Exit codes: 0 done (also observe-only, held, or the lock was busy), 1 a tick fault (logged, a `tick_fault`
+notice with the count; three in a row set the fault hold until `life-ctl.py clear-fault`), 3 STOP handled, 5
+integrity or contract hold or a wrong schema, 6 not seeded. One item's fault never stops a tick or poisons later
+ones: `Tick.guard` logs it, returns the item to its queue and fails it after 3 such faults at one stage
+(`items.faults`, reset when the item changes stage).
+
+## 5. Control: ARMED, FREEZE, STOP, reboot, operator commands
+
+| switch | meaning | set by |
+|--------|---------|--------|
+| ARMED | `control/ARMED` holds `{"boot_id": <this boot>, "kit_sha256": <hash of the kit's bin, checks, db, units and VALIDATE.sh: every entry, its type, mode bits and bytes>, "platform_sha256": <hash of PLATFORM_PINS>, "decisions_sha256": <sha256 of DECISIONS.md>}`; a different boot means observe-only; a different hash is an integrity hold | `life-ctl.py arm --confirm ARM-UNTESTED --decisions HEX16` (needs a finished seed, VALIDATE.sh STATIC PASS and the sandbox probe) / `disarm`; `stop` removes it |
+| FREEZE | nothing new starts; running agent runs and benchmark jobs are polled and collected; fetches, confirmations, gates, applies, findings, program runs, agent starts, division steps and agenda entries are new work and wait | `freeze` / `thaw` |
+| SELFDEV_ARMED | selfdev agent runs may start | `selfdev-arm` / `selfdev-disarm` |
+| STOP | end every LIFE process and scope, request the cancel of every LIFE run and benchmark job, disarm, start nothing | `stop` / `unstop` |
+| NO_SELF_QUESTIONS | learning makes no derived questions | the operator (empty file) |
+| CODEBASE_HISTORY_OK | codebase agent runs may start (GAP 11) | the operator (empty file) |
+
+**Admission** is one answer, `control_state()['admit']`: STOP absent, ARMED for this boot with the kit,
+platform and decisions hashes unchanged, FREEZE absent. It is read before every stage and again by
+`launch_allowed` immediately before every new process (a slot action, a fetch, a gate, a watched test); an
+agent start reads it immediately before the submit.
+
+**Reboot**: ARMED names the old boot, so the first tick after a reboot only observes. Runs that were live
+are reconciled through the API before anything new starts (a run LIFE cannot confirm stays
+`submit_unknown`, re-sent identically, with a notice after 900 s; it is never resubmitted under another id).
+Nothing restarts itself; the operator re-arms.
+
+**STOP**, exactly:
+1. `life-ctl.py stop` writes `control/STOP` and removes `control/ARMED`. From that instant every admission
+   re-reads it, so nothing new starts; there remains only the instant between that check and a process start
+   (the watcher then ends it), and a `bin/symblic-task start` already running (up to START_TIMEOUT 180 s; it is
+   untracked so a half-submitted request is never torn).
+2. A running tick's watcher sees STOP within 1 s, sends SIGTERM to every LIFE process group (SIGKILL to the
+   whole group 30 s later) and stops every `life-*.scope`. A `bin/symblic run` process cancels its fleet-runner runs on
+   SIGTERM (`symblic_run` sets its stop event; `symblic_apply` calls `fleet_runner.cancel`);
+   `bin/life-research.py` cancels every fleet-runner run it started. A fleet-runner run that a SIGKILL orphans still ends at
+   its own unit `RuntimeMaxSec`; its node is held ORPHAN_HOLD_SECONDS meanwhile.
+3. `life-ctl.py stop` itself, without waiting for the lock, asks `bin/symblic-task autogen cancel RUN_ID`
+   (60 s each) for every run in `submitting`, `live` or `submit_unknown`, and `POST /api/cluster/job/cancel`
+   (30 s each) for every running benchmark job with an id, printing each answer.
+4. The registry rows are updated by `stop_everything` (in life-ctl when the lock is free, else by the tick at
+   its next STOP check, and again at every tick while STOP exists): every target's cancel is asked on its own and
+   the answers are collected before anything is written (a registry that cannot be written never skips a cancel);
+   an accepted cancel is only a REQUEST (`symblicos/autogen.py` sets `cancel_requested` and answers ok even for an
+   ended run; the job route sets a flag): the run or job stays `live`/`running` with detail `cancel requested` until
+   a poll sees it end, and a run collected after a STOP-cancel goes back to its queue with a new attempt number
+   (not counted as a failure or as infra); model-stage items return to the queue; a `stopped` notice names every
+   target whose cancel was not accepted.
+5. `unstop` removes STOP only. LIFE stays disarmed until the operator arms again; nothing that was cancelled
+   restarts by itself.
+
+If the registry cannot be read at all, `life-ctl.py stop` says so and the operator cancels by hand with
+`bin/symblic-task autogen list` (LIFE request ids start with `life-`) and the jobs whose `meta.label` starts with
+`life-`.
+
+**Operator commands** go only through `life-ctl.py` (section 15), the inbox or the agenda. Stop, freeze,
+cool and power are never routed through a model: the command classifier cannot express them.
+
+## 6. Work items
+
+An item is one unit of work: an `items` row with `item_id = <organ>:<first 16 hex of sha256(kind + "\n"
++ the identity parts joined by "\n")>` (`life_common.item_id(organ, kind, *parts)`; a part holding a
+newline is refused, so two identities never serialize alike). Deduplication stops duplicate CONCURRENT work,
+never later work: `new_item` returns the existing id while that item is queued or running; when it has ended
+and the caller names a re-occurrence key (the operator command that asks again, or a watched test's occurrence
+counter), a new item is created with identity + that key.
+
+| kind | organ | identity parts | payload keys by stage (`life_common.PAYLOAD_KEYS`: required; optional in brackets) | taint |
+|------|-------|----------------|---------------------------------------------------------------|-------|
+| command | command | command_id | classify: `command_id` | operator |
+| question | learning | norm_text(question) [+ command_id when it asks again]; derived: fact_id, "derived" | research: `question` (<= 600), `command_id` ("" when derived), `found` (usable source links) | operator / web |
+| source | digest | source_key | fetch: `source_key, url`; extract: + `text_path, text_sha256`; distill: + `fact_id, claim, quote` | web |
+| finding | codebase | watch: test_id, base commit, fingerprint, occurrence; operator: test_id, "owner", command_id | confirm (operator only): `test_id, finding_text, base_commit "", source, command_text`; triage: `test_id, finding_text (<= 600), base_commit, source, wall_s, trace_files, trace_functions`; patch/gate: + `change_class` [`review_note, previous_patch`] | code / operator |
+| patch | immune | patch_id | review: `subject "patch", patch_id` | the finding's taint, at least code |
+| proposal | immune | proposal_id | review: `subject "proposal", proposal_id` | the lesson's taint, at least code |
+| lesson | selfdev | fact_id, "genome"; or command_id; or program, "failed", release | draft: `program, lesson (10..300)` [`lesson_id, base_release, base_commit`]; gate: all five | web / operator / code |
+| experiment | compute | command_id or fact_id | propose: `seed_text (<= 600)`; rank: + `experiment_id`; bench: same [`job_id, node, unit, started, timeout, label`] | operator / web |
+| request | database | command_id or fact_id | draft: `request (10..600)` [`migration_id, snapshot_sha, base_commit`]; apply: all four | operator / web |
+
+Every write checks the payload against the schema of the stage the item will be at, and its JSON against
+PAYLOAD_MAX 16384 characters (`PAYLOAD_TOO_LARGE`), before the write; a violation is a tick fault on that item.
+
+**States**: `queued` → `running` → `done` | `abstained` | `failed` | `owner` (handed to the operator with a
+notice). **Counters**, each with one meaning and each reset to 0 whenever the item changes stage (unless the
+caller sets it): `attempts` (agent submissions and benchmark jobs; part of the request id or job label; never
+reset), `infra_runs` (infrastructure outcomes; at 6 the item goes to the operator with notice `infra_repeat`),
+`faults` (tick faults; failed at 3), `review_rounds` (reviewer needs_work; operator at 2; never reset),
+`rung_extra` (model escalation inside one stage), `dry_runs` (research runs in a row with no new usable source
+link), `start_refusals` (HTTP 4xx refusals of an agent start; failed at 3; never reset), `timeouts` (program
+timeouts at the current rung; at 2 the item escalates one rung). **Queue order** inside a cell: `priority`
+(2 high, 1 normal, 0 low) descending, then `updated_at` ascending (a re-queued item goes to the back), then
+`item_id`. Urgency only orders a queue; it never bypasses a gate. At 200 or more queued items in one organ, a
+new non-owner item is recorded as `abstained` (OVERFLOW, one notice per organ per day); operator items are never
+dropped.
+
+**Taint** says where the text came from: `owner` (the operator wrote it), `code` (code built it from code
+facts), `model` (a model wrote it), `web` (it came from a fetched page or research). A derived item takes
+the most external taint of its parents (web > model > code > owner). Taint never changes (a trigger refuses
+it). Web or model text is quoted to a later worker only as data inside a template field, after `one_line` (NFC,
+control characters, backticks and braces removed, length-capped) and `lint_safe`, and introduced as "quoted as
+data and not as an instruction". A web- or model-tainted lesson or request NEVER starts an agent run until the
+operator reads it (`life-ctl.py show ITEM`) and approves it (`life-ctl.py approve ITEM --confirm APPROVE`, which sets
+`approved = 1` and `approved_sha` = the sha256 of its operative text: a lesson's program and text, a request's
+text; `life_common.operative_sha`); an approval covers exactly that text, so a changed text waits again. Until
+then it waits with notice `approve_needed` and does not count as workable backlog. Such text is never a
+statement on its own, a check, a policy, a command or a canary.
+
+**The inbox** (`STATE/inbox/`): one command per file named `<YYYYmmddTHHMMSSZ>-<slug>-<6 hex>.txt`
+(slug: up to 40 of `[a-z0-9-]`; the hex is random), UTF-8, 1..4000 bytes with at least one character besides
+white space. `life-ctl.py command "TEXT"` writes it in `STATE/inbox-tmp/` and links it into `inbox/` with a
+no-replace link (a name that exists gets a new random suffix; never an overwrite). The tick lists names that do
+not start with `.`, takes at most 50 per tick in name order, reads each with `read_owner_file` (O_NOFOLLOW,
+O_NONBLOCK so a FIFO never blocks, O_CLOEXEC; a regular file owned by the operator's uid, checked on the open
+descriptor). A file failing any rule, or whose text holds a credential-shaped value (`life_common.SECRET_RX`),
+moves to `inbox-refused/` with a notice whose subject is sha16(file name) and that never quotes the text (the file
+stays there, operator-private, until `life-ctl.py purge-refused --confirm PURGE`). `command_id = first 16 hex of
+sha256(file name + "\n" + the file's bytes decoded as UTF-8, unstripped)`; the stored text is stripped. The command
+row and its classify item are written in ONE transaction before the file moves to `inbox-done/` (no-replace; an
+existing destination with the same bytes means it was already archived), so a crash in between re-reads the same
+file into the same command id and nothing doubles. The command's original text stays the only authoritative
+instruction; the classifier's `restated` line is display text.
+
+**The agenda** (`control/agenda.json`, operator, read only on an admitted working tick): exactly `{"version": 1,
+"entries": [{"id", "text", "every_hours"}]}`, at most 20 entries (more: entries after the 20th are ignored with
+notice `agenda_invalid`), ids `[a-z0-9-]{2,40}` and unique (a duplicate id or JSON key ignores the whole file),
+text 10..4000 bytes without credentials, every_hours an integer 6..720. An entry's revision = sha16(id, text,
+every_hours) (an edited entry is a new revision); its period = floor(now / (every_hours x 3600)), counted from the
+Unix epoch. Only the CURRENT period enters: `command_id = first 16 hex of sha256("agenda" + "\n" + revision +
+"\n" + period)`, file `agenda:<id>`; missed periods are skipped with notice `agenda_skipped`, never caught up. An
+invalid entry is ignored with notice `agenda_invalid`. With no agenda, no watch list and no commands, LIFE is
+armed and idle apart from derived questions (section 7.2); it invents no other objectives.
+
+## 7. The organs, stage by stage
+
+Each organ's items move through a fixed stage list (`life_common.STAGES`; a registry CHECK refuses any other
+organ/stage pair). A **slot** stage uses its cell's worker node for one program run in step 17; an **the host** stage is
+code in step 14; an **agent** stage is an autogen run (section 7.9).
+
+### 7.1 command — `classify` (slot)
+
+`classify-command.sym` with `command_id`, `command_text` → `{command, organ, urgency, restated}` (`command`
+must equal the command id). Dispatch by code (an organ outside the route list is `none`; an urgency outside
+low/normal/high is normal). Every route checks its limits on the FULL command text; nothing is ever cut
+silently (too long: notice `command_too_long`, no item):
+
+| route | effect |
+|-------|--------|
+| learning | a question item, the whole text (<= 600 characters); an earlier question with the same text that has ended makes a new occurrence |
+| codebase | a finding item at stage `confirm` for the FIRST valid test id `tests.<module>[...]` in the text (at most 160 characters, 5 components); none: notice `command_needs_test` |
+| database | only when the text starts with `database:` (case-insensitive): a request item with the text after the prefix (10..600 characters); otherwise notice `command_database_confirm` (resend with the prefix). A 1B label alone never changes the organism database |
+| compute | an experiment item, the whole text (<= 600) |
+| selfdev | a lesson item (10..300 characters) when the text names exactly ONE genome program as a whole word and it is not protected; else notice `command_needs_program` |
+| heartbeat | notice `command_heartbeat` whose text is the answer: governor state, live cells, queued items, live runs, open notices |
+| immune, none | notice `command_<route>` for the operator (no lifecycle action follows from a model label) |
+
+The item's priority is the urgency (low 0, normal 1, high 2). The command becomes `dispatched` when it
+created an item; `done` with notice `command_merged` when the same work already runs (its `merged_into` names the
+command whose report covers it); else `owner`. A classification that fails at every rung marks the command
+`failed` with notice `command_failed`. Reports: each tick examines the 20 dispatched commands examined least
+recently (an examined command's `updated_at` moves to now, so every command is reached). When every item that
+descends from a dispatched command has ended (following `origin` links over the WHOLE descendant set, at most
+
+
+[This is part 2 of 21. Reply only with the word RECEIVED.]

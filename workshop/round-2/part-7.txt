@@ -1,0 +1,467 @@
+[LIFE round-2 critique packet, part 7 of 8]
+
+              BUNDLES + '/proposals', BUNDLES + '/migrations', TEXTS, RUNS_DIR, LOGS, BACKUPS, APPLIED, OWNER)
+
+# ------------------------------------------------------------------------------------------- organism
+ORGANS = ('command', 'learning', 'digest', 'codebase', 'immune', 'selfdev', 'compute', 'database')
+AGENT_ORGANS = ('codebase', 'selfdev', 'database')
+MODEL_ORGANS = tuple(o for o in ORGANS if o not in AGENT_ORGANS)
+NODES = ('node-a', 'node-b', 'node-d', 'node-f', 'node-i')   # node-c/e unlisted in BRIEF; node-h = protected service stack
+PROGRAMS = ('classify-command', 'triage-error', 'extract-source', 'distill-lesson', 'propose-experiment',
+            'rank-experiment', 'review-patch', 'reproduce', 'assign-item')
+ROUTES = ('learning', 'codebase', 'database', 'compute', 'selfdev', 'immune', 'heartbeat', 'none')
+STAGES = {                                       # each organ's item stage machine (LIFE.md section 7)
+    'command': ('classify',),
+    'learning': ('research',),
+    'digest': ('fetch', 'extract', 'distill'),
+    'codebase': ('triage', 'patch', 'gate'),
+    'immune': ('review',),
+    'selfdev': ('draft', 'gate'),
+    'compute': ('propose', 'rank', 'bench'),
+    'database': ('draft', 'apply'),
+}
+MODEL_MIB = {'qwen2.5:0.5b': 400, 'llama3.2:1b': 1300, 'gemma3:1b': 900, 'qwen2.5-coder:3b': 1900,
+             'qwen3:4b-instruct': 2600}
+ENGINE = 'agy'                                   # the only CLI engine LIFE v2 starts (strategies fresh,feedback)
+
+# ------------------------------------------------------------------------------------------- limits
+TICK_SECONDS = 300            # timer: OnUnitInactiveSec=300 (from the end of the previous tick)
+TICK_DEADLINE = 1200          # a tick stops starting work after this many seconds; systemd kills at 1500
+CALL_TIMEOUT = 900            # one bin/symblic run or bin/local-research process, seconds (process group killed)
+CALL_MAX_MODEL_CALLS = 12     # --max-calls for every genome program run
+OLLAMA_LIMITS = {'num_predict': 1024, 'timeout_seconds': 600}
+ASSIGN_PER_SLOT = 4           # assign-item.sym runs one division may make in one node slot
+LIFE_MAX_CELLS = 16           # cells in state active, dividing or quarantined, all organs
+ORGAN_CELL_CAP = 3            # such cells per organ
+NODE_CELL_CAP = 4             # such cells per node
+MAX_DEPTH = 10                # a child's depth is at most 10; a parent may divide only at depth < 10
+DIVIDE_SUSTAIN = 3            # consecutive ticks with backlog >= the organ's divide_backlog
+DIVISION_COOLDOWN = 21600     # seconds after an aborted division before that parent may try again
+DIVISIONS_OPEN_MAX = 1        # division transactions open at once, fleet-wide
+APOPTOSIS_IDLE_TICKS = 288    # consecutive ticks with an empty queue (about a day at 300 s)
+QUARANTINE_FAILURES = 8       # consecutive failed items
+NODE_HOLD_SECONDS = 300       # a node that answered an infra failure is skipped this long
+AGENT_RUNS_LIVE_MAX = 2       # LIFE autogen runs queued or active at once, fleet-wide (1 per cell)
+AGENT_RUN_KILL_SECONDS = 4500 # the tick cancels a LIFE run still live this long after submission
+PROGRAM_RUNS_PER_DAY = 1200   # UTC day budgets; a spent budget holds that class of work until 00:00 UTC
+AGENT_RUNS_PER_DAY = 12
+BENCH_JOBS_PER_DAY = 12
+BIRTHS_PER_DAY = 8
+QUESTION_DRY_LIMIT = 3        # research runs in a row with zero new sources before a question is exhausted
+QUESTION_SOURCE_LIMIT = 9     # new sources per question before it is done
+NEW_SOURCES_PER_RUN = 3       # at most this many new sources are recorded from one research run
+RESEARCH_TOOLS = 8            # bin/local-research --tools (searches plus page reads per run)
+SOURCE_TEXT_CHARS = 6000      # text kept per source (local_research.read_page chars)
+SOURCE_TEXT_MIN = 200         # shorter text is EMPTY (abstained)
+DIFF_REVIEW_CHARS = 6000      # a patch diff longer than this is not model-reviewed: it goes to the operator
+EFFICIENCY_FLOOR = 0.2        # an organ below this over two complete UTC days may not divide
+EFFICIENCY_MIN_RUNS = 20
+STATE_MAX_BYTES = 10 * 1024 ** 3
+DISK_FREE_MIN = 5 * 1024 ** 3
+LOG_ROTATE_BYTES = 5 * 1024 ** 2
+CANARY_EVERY_TICKS = 12
+FINDINGS_EVERY_SECONDS = 6 * 3600
+BACKUP_KEEP = 7
+# metabolism (LIFE.md section 10)
+SAMPLE_MAX_AGE = 180          # /api/cluster/status `ts` older than this is stale telemetry -> hold
+LOADED_CPU = 50.0             # vitals.cpu (% busy) at or above: the node is loaded in this sample
+FLEET_LOADED_NODES = 3        # at least this many online LIFE nodes loaded: the fleet is loaded
+WORK_WINDOW = 3000            # loaded seconds before the fleet must rest
+REST_SECONDS = 600            # consecutive quiet seconds that end a rest and reset the window
+HOT_C, COOL_C = 85.0, 75.0    # same thresholds as symblic_apply.THERMAL_HOT/THERMAL_COOL
+MEM_RESERVE_MIB = 2048        # a node needs memAvailMiB >= reserve + the model's size for a new call
+HOST_LOAD_FRACTION = 0.75  # the host load1 must stay below this x nproc
+HOST_IO_FULL_AVG60 = 10.0  # the host /proc/pressure/io full avg60 must stay below this
+
+# ------------------------------------------------------------------------------------------- small helpers
+
+
+def now():
+    return int(time.time())
+
+
+def utc_day(t=None):
+    return time.strftime('%Y-%m-%d', time.gmtime(now() if t is None else t))
+
+
+def sha(*parts):
+    return hashlib.sha256('\n'.join(str(p) for p in parts).encode('utf-8')).hexdigest()
+
+
+def sha16(*parts):
+    return sha(*parts)[:16]
+
+
+def file_sha(path):
+    h = hashlib.sha256()
+    with open(path, 'rb') as handle:
+        for block in iter(lambda: handle.read(1 << 16), b''):
+            h.update(block)
+    return h.hexdigest()
+
+
+def item_id(organ, *identity):
+    return f'{organ}:{sha16(*identity)}'
+
+
+def cell_id(organ, depth, hex8):
+    return f'{organ}.{depth}.{hex8}'
+
+
+CELL_RX = re.compile(r'^(command|learning|digest|codebase|immune|selfdev|compute|database)\.(\d{1,2})\.([0-9a-f]{8})$')
+
+
+def parse_cell(cid):
+    m = CELL_RX.match(cid or '')
+    if not m or int(m.group(2)) > MAX_DEPTH:
+        raise ValueError(f'not a cell id: {cid!r}')
+    return m.group(1), int(m.group(2)), m.group(3)
+
+
+SECRET_RX = re.compile(r'(?i)(api[_-]?key|access[_-]?token|secret[_-]?key|password|passwd|bearer\s+[a-z0-9._-]{16,}|'
+                       r'BEGIN [A-Z ]*PRIVATE KEY|sk-[A-Za-z0-9]{20,}|ghp_[A-Za-z0-9]{20,}|xox[abp]-[A-Za-z0-9-]{10,}|'
+                       r'AKIA[0-9A-Z]{16})')
+
+
+def has_secret(text):
+    return bool(SECRET_RX.search(text or ''))
+
+
+def one_line(text, limit):
+    """NFC, every control character and newline as one space, whitespace collapsed, backticks and
+    braces removed (they would break a statement or a template), cut to `limit` characters."""
+    text = unicodedata.normalize('NFC', str(text or ''))
+    text = ''.join(' ' if unicodedata.category(c).startswith('C') else c for c in text)
+    text = re.sub(r'[`{}]', '', text)
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text[:limit].rstrip()
+
+
+def norm_text(text):
+    """The identity form of free text: NFC, lower case, whitespace collapsed."""
+    return re.sub(r'\s+', ' ', unicodedata.normalize('NFC', str(text or '')).lower()).strip()
+
+
+def boot_id():
+    with open('/proc/sys/kernel/random/boot_id', encoding='ascii') as handle:
+        return handle.read().strip()
+
+
+def ensure_dirs():
+    for path in STATE_DIRS:
+        os.makedirs(path, mode=0o700, exist_ok=True)
+
+
+def write_atomic(path, data, mode=0o600):
+    tmp = f'{path}.tmp-{os.getpid()}'
+    with open(tmp, 'w', encoding='utf-8', opener=lambda p, f: os.open(p, f, mode)) as handle:
+        handle.write(data)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp, path)
+
+
+def log(message):
+    os.makedirs(LOGS, mode=0o700, exist_ok=True)
+    path = LOGS + '/tick.log'
+    try:
+        if os.path.getsize(path) > LOG_ROTATE_BYTES:
+            for n in (2, 1):
+                if os.path.exists(f'{path}.{n}'):
+                    os.replace(f'{path}.{n}', f'{path}.{n + 1}')
+            os.replace(path, path + '.1')
+    except OSError:
+        pass
+    line = f'{time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())} {one_line(message, 600)}'
+    with open(path, 'a', encoding='utf-8', opener=lambda p, f: os.open(p, f, 0o600)) as handle:
+        handle.write(line + '\n')
+    print(line, flush=True)
+
+
+# ------------------------------------------------------------------------------------------- control
+
+
+def control_state():
+    """The operator's switches. ARMED counts only when its content equals this boot's id, so a reboot
+    always comes back disarmed (the operator re-arms with life-ctl arm)."""
+    armed = False
+    try:
+        with open(ARMED_FILE, encoding='ascii') as handle:
+            armed = handle.read().strip() == boot_id()
+    except OSError:
+        armed = False
+    return {'stop': os.path.lexists(STOP_FILE), 'freeze': os.path.lexists(FREEZE_FILE), 'armed': armed,
+            'selfdev': os.path.lexists(SELFDEV_FILE)}
+
+
+# ------------------------------------------------------------------------------------------- registry
+
+
+def connect(path=REGISTRY, readonly=False):
+    if readonly:
+        conn = sqlite3.connect(f'file:{path}?mode=ro', uri=True, timeout=5)
+    else:
+        conn = sqlite3.connect(path, timeout=5, isolation_level=None)
+        conn.execute('PRAGMA journal_mode=WAL')
+        conn.execute('PRAGMA synchronous=FULL')
+    conn.execute('PRAGMA busy_timeout=5000')
+    conn.execute('PRAGMA foreign_keys=ON')
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def apply_schema(conn, sql_path):
+    with open(sql_path, encoding='utf-8') as handle:
+        conn.executescript(handle.read())
+
+
+class Tx:
+    """BEGIN IMMEDIATE ... COMMIT, or ROLLBACK on any exception."""
+
+    def __init__(self, conn):
+        self.conn = conn
+
+    def __enter__(self):
+        self.conn.execute('BEGIN IMMEDIATE')
+        return self.conn
+
+    def __exit__(self, kind, value, tb):
+        self.conn.execute('COMMIT' if kind is None else 'ROLLBACK')
+        return False
+
+
+def notice(conn, kind, subject, text):
+    """Open an operator notice unless one with this kind and subject is already open."""
+    subject, text = one_line(subject, 120), one_line(text, 600)
+    if conn.execute("SELECT 1 FROM notices WHERE kind=? AND subject=? AND state='open'", (kind, subject)).fetchone():
+        return
+    conn.execute("INSERT INTO notices (notice_id, kind, subject, text, state, at) VALUES (?, ?, ?, ?, 'open', ?)",
+                 (sha(kind, subject, now(), os.getpid())[:12], kind, subject, text, now()))
+
+
+def budget_row(conn, day=None):
+    day = day or utc_day()
+    conn.execute('INSERT OR IGNORE INTO budget (day) VALUES (?)', (day,))
+    return conn.execute('SELECT * FROM budget WHERE day=?', (day,)).fetchone()
+
+
+def budget_add(conn, column, n=1):
+    assert column in ('program_runs', 'model_calls', 'agent_runs', 'bench_jobs', 'births')
+    budget_row(conn)
+    conn.execute(f'UPDATE budget SET {column}={column}+? WHERE day=?', (n, utc_day()))
+
+
+def metric_add(conn, organ, column, n=1):
+    assert column in ('items_done', 'items_failed', 'items_abstained', 'program_runs', 'agent_runs')
+    conn.execute('INSERT OR IGNORE INTO metrics (organ, day) VALUES (?, ?)', (organ, utc_day()))
+    conn.execute(f'UPDATE metrics SET {column}={column}+? WHERE organ=? AND day=?', (n, organ, utc_day()))
+
+
+def live_cells(conn, organ=None, node=None):
+    sql = "SELECT * FROM cells WHERE state IN ('active','dividing','quarantined')"
+    args = []
+    if organ:
+        sql += ' AND organ=?'
+        args.append(organ)
+    if node:
+        sql += ' AND node=?'
+        args.append(node)
+    return conn.execute(sql + ' ORDER BY cell_id', args).fetchall()
+
+
+def active_release(conn):
+    row = conn.execute('SELECT * FROM releases WHERE active=1').fetchone()
+    if not row:
+        raise RuntimeError('no active release')
+    return row['release'], f'{RELEASES}/{row["release"]}', json.loads(row['manifest'])
+
+
+def release_problems(directory, manifest):
+    out = []
+    for rel, digest in sorted(manifest.items()):
+        path = os.path.join(directory, rel)
+        if os.path.islink(path) or not os.path.isfile(path):
+            out.append(f'{rel}: missing or not a regular file')
+        elif file_sha(path) != digest:
+            out.append(f'{rel}: sha256 differs from the release manifest')
+    return out
+
+
+def release_manifest(directory):
+    manifest = {}
+    for sub in ('genome', 'organs', 'policies'):
+        for name in sorted(os.listdir(os.path.join(directory, sub))):
+            path = os.path.join(directory, sub, name)
+            if os.path.isfile(path) and not os.path.islink(path):
+                manifest[f'{sub}/{name}'] = file_sha(path)
+    return manifest
+
+
+# ------------------------------------------------------------------------------------------- organ config
+
+
+def load_organs(directory):
+    with open(os.path.join(directory, 'organs', 'organs.json'), encoding='utf-8') as handle:
+        data = json.load(handle, object_pairs_hook=_no_dup_keys)
+    problems = organs_problems(data)
+    if problems:
+        raise ValueError('organs.json: ' + '; '.join(problems))
+    return data
+
+
+def _no_dup_keys(pairs):
+    out = {}
+    for key, value in pairs:
+        if key in out:
+            raise ValueError(f'duplicate JSON key {key!r}')
+        out[key] = value
+    return out
+
+
+def organs_problems(data):
+    """The closed schema of organs/organs.json. Returns a list of problems (empty = valid)."""
+    out = []
+    if not isinstance(data, dict) or set(data) != {'version', 'organs', 'ladders'}:
+        return ['top level must be exactly {version, organs, ladders}']
+    if data['version'] != 2:
+        out.append('version must be 2')
+    organs = data['organs']
+    if not isinstance(organs, dict) or set(organs) != set(ORGANS):
+        return out + ['organs must name exactly ' + ', '.join(ORGANS)]
+    for name, spec in organs.items():
+        keys = {'kind', 'seed_node', 'seed_focus', 'divide_backlog'}
+        if not isinstance(spec, dict) or set(spec) != keys:
+            out.append(f'{name}: keys must be exactly ' + ', '.join(sorted(keys)))
+            continue
+        if spec['kind'] != ('agent' if name in AGENT_ORGANS else 'model'):
+            out.append(f'{name}: kind must be {"agent" if name in AGENT_ORGANS else "model"}')
+        if spec['seed_node'] not in NODES:
+            out.append(f'{name}: seed_node must be one of ' + ', '.join(NODES))
+        if not isinstance(spec['seed_focus'], str) or not 8 <= len(spec['seed_focus']) <= 120:
+            out.append(f'{name}: seed_focus is 8..120 characters')
+        if type(spec['divide_backlog']) is not int or not 4 <= spec['divide_backlog'] <= 64:
+            out.append(f'{name}: divide_backlog is an integer 4..64')
+    ladders = data['ladders']
+    if not isinstance(ladders, dict) or set(ladders) != set(PROGRAMS) | {'local-research'}:
+        out.append('ladders must name exactly every program plus local-research')
+    else:
+        for program, ladder in ladders.items():
+            if not isinstance(ladder, list) or not 1 <= len(ladder) <= 3 or any(m not in MODEL_MIB for m in ladder):
+                out.append(f'ladder {program}: 1..3 models drawn from ' + ', '.join(MODEL_MIB))
+            elif len(set(ladder)) != len(ladder):
+                out.append(f'ladder {program}: a model appears twice')
+    per_node = {}
+    for spec in organs.values():
+        if isinstance(spec, dict) and spec.get('seed_node') in NODES:
+            per_node[spec['seed_node']] = per_node.get(spec['seed_node'], 0) + 1
+    if any(n > NODE_CELL_CAP for n in per_node.values()):
+        out.append(f'seed placement puts more than {NODE_CELL_CAP} cells on one node')
+    return out
+
+
+# ------------------------------------------------------------------------------------------- templates
+
+PLACEHOLDERS = {                                  # every value a template may receive, and its exact form
+    'ws': re.compile(r'^/home/operator/symblicos/projects/life-(codebase|selfdev|database)-[0-9a-f]{8}$'),
+    'kit': re.compile(r'^' + re.escape(KIT) + r'$'),
+    'test_id': re.compile(r'^tests\.[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+){0,4}$'),
+    'finding_id': re.compile(r'^[0-9a-f]{16}$'),
+    'finding_text': re.compile(r'^[^`{}\n]{1,600}$'),
+    'scope': re.compile(r'^(files under tests/|Markdown files under docs/|the source files the failure names)$'),
+    'proposal_id': re.compile(r'^[0-9a-f]{16}$'),
+    'program': re.compile(r'^(' + '|'.join(re.escape(p) for p in PROGRAMS) + r')$'),
+    'lesson': re.compile(r'^[^`{}\n]{10,300}$'),
+    'migration_id': re.compile(r'^[0-9]{4}_[a-z0-9_]{1,40}$'),
+    'request': re.compile(r'^[^`{}\n]{10,600}$'),
+}
+TEMPLATE_FIELDS = {
+    'codebase': ('ws', 'kit', 'test_id', 'finding_id', 'finding_text', 'scope'),
+    'selfdev': ('ws', 'kit', 'proposal_id', 'program', 'lesson'),
+    'database': ('ws', 'kit', 'migration_id', 'request'),
+}
+FIELD_RX = re.compile(r'\{([a-z_]+)\}')
+# Derived by render() from ws, never passed in. The statement templates write the workspace as the literal
+# absolute prefix PROJECTS/life-<organ>- followed by {ws_id}, so the raw template text already names an absolute
+# folder (symblic_autogen.lint finds no warning without a root) and the rendered text is exactly ws.
+DERIVED_FIELDS = ('ws_id',)
+
+
+def render(text, organ, values):
+    """Fill a statement or policy template. Exactly the organ's fields, each matching its exact form, plus the
+    derived ws_id (the 8 hex digits that end ws); ws must belong to this organ."""
+    fields = TEMPLATE_FIELDS[organ]
+    if set(values) != set(fields):
+        raise ValueError(f'{organ} template needs exactly ' + ', '.join(fields))
+    for key, value in values.items():
+        if not isinstance(value, str) or not PLACEHOLDERS[key].match(value) or has_secret(value):
+            raise ValueError(f'{organ} template value {key} has the wrong form')
+    prefix = f'{PROJECTS}/life-{organ}-'
+    if not values['ws'].startswith(prefix):
+        raise ValueError(f'{organ} template value ws is not a {organ} workspace')
+    filled = dict(values, ws_id=values['ws'][len(prefix):])
+    used = set(FIELD_RX.findall(text))
+    if not used <= set(fields) | set(DERIVED_FIELDS):
+        raise ValueError(f'{organ} template names unknown fields: ' + ', '.join(sorted(used - set(fields) - set(DERIVED_FIELDS))))
+    return FIELD_RX.sub(lambda m: filled[m.group(1)], text)
+
+
+def render_run(release_dir, organ, values):
+    """(lines, policy dict) for one agent run, both rendered from the active release; the statements must
+    lint with zero findings and the policy must pass symblic_autogen.normalize."""
+    import sys
+    if REPO not in sys.path:
+        sys.path.insert(0, REPO)
+    import symblic_autogen as A
+    with open(os.path.join(release_dir, 'organs', f'{organ}.lines.txt'), encoding='utf-8') as handle:
+        lines = A.statements(render(handle.read(), organ, values))
+    if not lines or any(values['ws'] not in line for line in lines):
+        raise ValueError('every statement must name the workspace ' + values['ws'])
+    findings = A.lint(lines, values['ws'])
+    if findings:
+        raise ValueError('lint: ' + '; '.join(f'{lv} line {n}: {m}' for lv, n, m in findings)[:300])
+    with open(os.path.join(release_dir, 'policies', f'{organ}.json'), encoding='utf-8') as handle:
+        policy = json.loads(render(handle.read(), organ, values), object_pairs_hook=_no_dup_keys)
+    normalized = A.normalize(policy)
+    problems = agent_policy_problems(policy)
+    if problems:
+        raise ValueError('policy: ' + '; '.join(problems))
+    return lines, policy, normalized['sha256']
+
+
+AGENT_POLICY_FIXED = {'version': 1, 'perpetual': False, 'until_done': False, 'candidates': 1, 'regenerate': 2,
+                      'depth': 0, 'children': 2, 'generations': 1, 'agents_max': 3, 'attempt_seconds': 900,
+                      'wall_seconds': 3600, 'novelty_limit': 2, 'saturation': 0, 'strategies': ['fresh', 'feedback'],
+                      'syntax': True, 'require_change': True, 'self_split': False, 'designer': False,
+                      'final': [], 'hidden': []}
+
+
+def agent_policy_problems(policy):
+    """Every LIFE agent run uses exactly the fixed bounded policy; only its checks differ by organ."""
+    out = []
+    if set(policy) != set(AGENT_POLICY_FIXED) | {'checks'}:
+        out.append('keys must be exactly the fixed agent policy keys plus checks')
+    for key, value in AGENT_POLICY_FIXED.items():
+        if policy.get(key) != value or type(policy.get(key)) is not type(value):
+            out.append(f'{key} must be {value!r}')
+    checks = policy.get('checks')
+    if not isinstance(checks, dict) or set(checks) != {'0', '1'}:
+        out.append('checks must have exactly statement indexes "0" and "1"')
+    return out
+
+
+def policy_flags(policy):
+    """The complete, exact bin/symblic-task start flags for a LIFE agent policy. Every field of
+    AGENT_POLICY_FIXED is emitted (none is left to a server default); the tick then compares the run's
+    server-side policy sha256 with symblic_autogen.normalize(policy)['sha256']."""
+    problems = agent_policy_problems(policy)
+    if problems:
+        raise ValueError('; '.join(problems))
+    flags = ['--candidates', '1', '--regenerate', '2', '--decompose', '0', '--children', '2', '--handoff', '1',
+             '--agents-max', '3', '--attempt-seconds', '900', '--wall-seconds', '3600', '--novelty-limit', '2',
+             '--saturation', '0', '--strategies', 'fresh,feedback', '--no-self-split']
+    for index in ('0', '1'):
+        for command in policy['checks'][index]:
+            flags += ['--check', f'{index}:{command}']
+
+
+[This is part 7 of 8. Reply only with the word RECEIVED.]

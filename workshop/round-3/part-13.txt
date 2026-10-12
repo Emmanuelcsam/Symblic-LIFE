@@ -1,0 +1,414 @@
+[LIFE round-3 critique packet, part 13 of 14]
+
+        else:
+            buf.append(c)
+        i += 1
+    if quote:
+        raise ValueError('an unterminated quoted literal')
+    statements.append(''.join(buf))
+    return [s.strip() for s in statements if s.strip()]
+
+
+def migration_statements(sql_text):
+    return split_sql(sql_text)
+
+
+def snapshot_problems(snapshot_sql):
+    """A schema snapshot may hold only CREATE TABLE and CREATE [UNIQUE] INDEX statements (what sqlite_master holds
+    for the organism) and no denied word or function."""
+    out = []
+    if len((snapshot_sql or '').encode('utf-8')) > SNAPSHOT_MAX_BYTES:
+        return [f'the schema snapshot is larger than {SNAPSHOT_MAX_BYTES} bytes']
+    try:
+        statements = split_sql(snapshot_sql)
+    except ValueError as exc:
+        return [f'snapshot: {exc}']
+    for s in statements:
+        if not re.match(r'(?i)^CREATE (TABLE|(UNIQUE )?INDEX) ', s) or FUNCTION_DENY_RX.search(s) or re.search(
+                r'(?i)\b(ATTACH|DETACH|PRAGMA|VACUUM|TRIGGER|VIEW|INSERT|UPDATE|DELETE|DROP)\b', s):
+            out.append(f'snapshot statement not allowed: {s[:80]}')
+    return out
+
+
+def migration_problems(sql_text, snapshot_sql=''):
+    """An organism migration is valid only when every statement is one of the three additive forms, names only
+    org_ tables and indexes that do not exist yet (ADD COLUMN: a column that does not exist yet), references no
+    non-org table, uses no denied word or function, and the whole applies cleanly TWICE in memory on top of the
+    snapshot with the same resulting schema."""
+    out = []
+    if len((sql_text or '').encode('utf-8')) > MIGRATION_MAX_BYTES:
+        return [f'migration is larger than {MIGRATION_MAX_BYTES} bytes']
+    try:
+        statements = split_sql(sql_text)
+    except ValueError as exc:
+        return [str(exc)]
+    if not 1 <= len(statements) <= MIGRATION_STATEMENTS_MAX:
+        out.append(f'a migration has 1..{MIGRATION_STATEMENTS_MAX} statements')
+    for s in statements:
+        if MIGRATION_HEAD_DENY_RX.match(s) or FUNCTION_DENY_RX.search(s):
+            out.append(f'denied statement or function in: {s[:80]}')
+        elif not MIGRATION_RX.fullmatch(s):
+            out.append(f'not an allowed additive form: {s[:80]}')
+        for ref in REFERENCES_RX.finditer(s):
+            if not ref.group(2).startswith('org_'):
+                out.append(f'references a non-org table: {s[:80]}')
+    if out:
+        return out
+    problems = snapshot_problems(snapshot_sql) if snapshot_sql else []
+    if problems:
+        return problems
+    db = sqlite3.connect(':memory:')
+    try:
+        if snapshot_sql:
+            for s in split_sql(snapshot_sql):
+                db.execute(s)
+        existing = {r[0] for r in db.execute("SELECT name FROM sqlite_master")}
+        cols = {}
+        for s in statements:
+            m = MIGRATION_RX.fullmatch(s)
+            name = m.group(2) or m.group(4)
+            if name and name in existing:
+                out.append(f'{name} already exists: a migration creates new names only')
+            if m.group(6):
+                table = m.group(6)
+                have = cols.setdefault(table, {r[1] for r in db.execute(f'PRAGMA table_info("{table}")')}
+                                       if table in existing else set())
+                if m.group(7) in have:
+                    out.append(f'{table}.{m.group(7)} already exists')
+            if name:
+                existing.add(name)
+        if out:
+            return out
+        schemas = []
+        for _ in (1, 2):
+            for s in statements:
+                try:
+                    db.execute(s)
+                except sqlite3.OperationalError as exc:
+                    if s.startswith('ALTER TABLE') and 'duplicate column' in str(exc) and schemas:
+                        continue                  # the second application of an ADD COLUMN
+                    raise
+            schemas.append(sorted(tuple(r) for r in db.execute('SELECT type, name, sql FROM sqlite_master')))
+        if schemas[0] != schemas[1]:
+            out.append('a second application changed the schema')
+    except sqlite3.Error as exc:
+        out.append(f'sqlite refused: {exc}')
+    finally:
+        db.close()
+    return out
+
+
+# ------------------------------------------------------------------------------------------- genome rules
+
+# The instruction is the LAST top-level quoted string before " from ": the type may hold quoted enum descriptions.
+ASK_RX = re.compile(r'(?P<indent>[ \t]*)ask (?P<name>[a-z_][a-z0-9_]*): (?P<type>.*) "(?P<instr>(?:[^"\\]|\\.)*)" '
+                    r'(?P<tail>from [^"]*)')
+NOTE_RX = re.compile(r'[ \t]*note ')
+
+
+def genome_protected_problems(old_text, new_text):
+    """A selfdev proposal may change only the quoted instruction of ask lines. Every other line (notes, blank lines
+    and indentation included), and every ask's indentation, name, type (enum descriptions included) and trailing
+    from/with clause stay byte-identical and in order; each changed instruction keeps exactly the same {name}
+    placeholders; at least one instruction changes."""
+    old = (old_text or '').splitlines(True)
+    new = (new_text or '').splitlines(True)
+    if len(old) != len(new):
+        return ['the number of lines changed']
+    out, changed = [], 0
+    for n, (a, b) in enumerate(zip(old, new), 1):
+        if a == b:
+            continue
+        ma, mb = ASK_RX.fullmatch(a.rstrip('\n')), ASK_RX.fullmatch(b.rstrip('\n'))
+        if a.endswith('\n') != b.endswith('\n') or not (ma and mb) or any(
+                ma.group(k) != mb.group(k) for k in ('indent', 'name', 'type', 'tail')):
+            out.append(f'line {n}: only the quoted instruction of an ask line may change')
+        elif sorted(FIELD_RX.findall(ma.group('instr'))) != sorted(FIELD_RX.findall(mb.group('instr'))):
+            out.append(f'line {n}: the instruction must keep exactly the same {{placeholders}}')
+        else:
+            changed += 1
+    if not out and changed == 0:
+        out.append('no ask instruction changed')
+    return out
+
+
+VERIFY_LINES = {
+    'codebase': re.compile(r'finding=[0-9a-f]{16} test=tests\.[A-Za-z0-9_.]+'),
+    'selfdev': re.compile(r'proposal=[0-9a-f]{16} program=[a-z-]+'),
+    'database': re.compile(r'migration=[0-9]{4}_[a-z0-9_]{1,40}'),
+}
+
+
+def verify_line_problems(organ, data, expected):
+    """verify.txt must be exactly the expected line, optionally followed by one LF: no BOM, CR, spaces or other
+    lines. `data` is the file's bytes."""
+    if isinstance(data, str):
+        data = data.encode('utf-8')
+    if not VERIFY_LINES[organ].fullmatch(expected):
+        return ['the expected verify line has the wrong form']
+    if data not in (expected.encode('ascii'), expected.encode('ascii') + b'\n'):
+        return ['verify.txt must be exactly the line ' + expected]
+    return []
+
+
+# ------------------------------------------------------------------------------------------- loopback adapter
+
+
+class Telemetry(Exception):
+    def __init__(self, message, status=None):
+        super().__init__(message)
+        self.status = status                    # the HTTP status code, or None when there was no HTTP answer
+
+
+def http_json(path, body=None, timeout=30):
+    """GET (body None) or POST JSON to the loopback dashboard with bin/symblic-task's header shape: no proxy,
+    no redirect, Host 127.0.0.1:8080. Any HTTP error (status kept), oversize answer (> HTTP_MAX_BYTES), non-JSON
+    answer, non-object answer or timeout (per socket operation) raises Telemetry."""
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *args, **kwargs):
+            return None
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+    data = None if body is None else json.dumps(body).encode('utf-8')
+    req = urllib.request.Request(DASH + path, data=data, method='GET' if body is None else 'POST')
+    req.add_header('Host', '127.0.0.1:8080')
+    req.add_header('Accept', 'application/json')
+    req.add_header('User-Agent', 'life-tick')
+    if data is not None:
+        req.add_header('Content-Type', 'application/json')
+    try:
+        with opener.open(req, timeout=timeout) as res:
+            raw = res.read(HTTP_MAX_BYTES + 1)
+        if len(raw) > HTTP_MAX_BYTES:
+            raise Telemetry(f'{path}: answer larger than {HTTP_MAX_BYTES} bytes')
+        value = json.loads(raw.decode('utf-8'), parse_constant=lambda c: (_ for _ in ()).throw(ValueError(c)))
+    except urllib.error.HTTPError as exc:
+        raise Telemetry(f'{path}: HTTP {exc.code}', exc.code) from None
+    except (urllib.error.URLError, OSError, ValueError, TimeoutError) as exc:
+        raise Telemetry(f'{path}: {type(exc).__name__}: {str(exc)[:200]}') from None
+    if not isinstance(value, dict):
+        raise Telemetry(f'{path}: answer is not a JSON object')
+    return value
+
+
+# ------------------------------------------------------------------------------------------- processes
+
+
+class Procs:
+    """Every subprocess LIFE starts, so STOP (or a timeout) ends them the same way: SIGTERM to the process group,
+    then SIGKILL KILL_GRACE seconds later. Output goes to temporary files (memory stays bounded) and a process that
+    writes more than OUTPUT_KILL_BYTES is ended. `tracked=False` is for the cancel calls STOP itself makes."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.live = {}
+
+    def run(self, argv, timeout, cwd=None, env=None, tracked=True, stdin_text=None):
+        """Returns (rc, stdout, stderr); rc None = timeout or output limit, 127 = could not start, negative = signal."""
+        if tracked and os.path.lexists(STOP_FILE):
+            return None, '', 'STOP present: not started'
+        with tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
+            try:
+                proc = subprocess.Popen(argv, cwd=cwd, env=env, stdin=subprocess.PIPE if stdin_text is not None
+                                        else subprocess.DEVNULL, stdout=out, stderr=err, start_new_session=True)
+            except (OSError, ValueError) as exc:
+                return 127, '', f'could not start {argv[0] if argv else "?"}: {type(exc).__name__}: {exc}'
+            if stdin_text is not None:
+                try:
+                    proc.stdin.write(stdin_text.encode('utf-8'))
+                    proc.stdin.close()
+                except OSError:
+                    pass
+            if tracked:
+                with self.lock:
+                    self.live[proc.pid] = proc
+            end, rc = time.monotonic() + timeout, None
+            try:
+                while True:
+                    try:
+                        rc = proc.wait(timeout=1)
+                        break
+                    except subprocess.TimeoutExpired:
+                        pass
+                    if time.monotonic() >= end or os.fstat(out.fileno()).st_size + os.fstat(err.fileno()).st_size > OUTPUT_KILL_BYTES:
+                        self.end([proc])
+                        rc = None
+                        break
+            finally:
+                if tracked:
+                    with self.lock:
+                        self.live.pop(proc.pid, None)
+            out.seek(0)
+            err.seek(0)
+            return rc, out.read(OUTPUT_KEEP_BYTES).decode('utf-8', 'replace'), err.read(1 << 16).decode('utf-8', 'replace')
+
+    @staticmethod
+    def end(procs):
+        """SIGTERM every group, wait up to KILL_GRACE for all, SIGKILL the rest, reap for at most 5 s."""
+        for proc in procs:
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+            except OSError:
+                pass
+        deadline = time.monotonic() + KILL_GRACE
+        for proc in procs:
+            try:
+                proc.wait(timeout=max(0.1, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                pass
+        for proc in procs:
+            if proc.poll() is None:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except OSError:
+                    pass
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
+
+    def kill_all(self):
+        with self.lock:
+            procs = list(self.live.values())
+        if procs:
+            self.end(procs)
+        return len(procs)
+
+
+_RUNNER = Procs()
+
+
+def run_bounded(argv, *, timeout, cwd=None, env=None, tracked=True):
+    """One process through the shared runner (life-ctl, life-check and the cancel calls)."""
+    return _RUNNER.run(argv, timeout, cwd=cwd, env=env, tracked=tracked)
+
+
+PROTECTED_ENV = re.compile(r'^(PATH|HOME|LANG|LC_\w+|PYTHON\w*|DASH_URL|SYMBLIC_\w*|LD_\w+|DASHBOARD_DIR)$')
+
+
+def child_env(extra=None):
+    """The environment every trusted LIFE subprocess gets: nothing inherited, fixed PATH, thermal placement on.
+    `extra` may add only keys outside PROTECTED_ENV. Candidate (agent-written) code never runs with this
+    environment: it runs under sandbox_argv() with an empty temporary HOME."""
+    env = {'PATH': '/usr/local/bin:/usr/bin:/bin', 'HOME': '/home/operator', 'LANG': 'C.UTF-8',
+           'PYTHONDONTWRITEBYTECODE': '1', 'DASH_URL': DASH, 'SYMBLIC_THERMAL': '1',
+           'SYMBLIC_CALL_WALL_S': str(CALL_TIMEOUT)}
+    for key, value in (extra or {}).items():
+        if PROTECTED_ENV.match(key):
+            raise ValueError(f'child_env: {key} is protected')
+        env[key] = str(value)
+    return env
+
+
+def devcheck_tools():
+    """(env additions, read-only-exec dirs) so bin/devcheck finds ruff and ast-grep inside the sandbox: the same
+    candidate paths scripts/devcheck.py:find_ruff/find_ast_grep use, resolved through symlinks."""
+    env, dirs = {}, []
+    for var, candidates in (('DEVCHECK_RUFF', ('/home/operator/agent-upgrades/envs/ruff/bin/ruff', '/home/operator/.local/bin/ruff')),
+                            ('DEVCHECK_AST_GREP', ('/home/operator/.local/bin/ast-grep',
+                                                   '/home/operator/.local/share/uv/tools/ast-grep-cli/bin/ast-grep'))):
+        for path in candidates:
+            if os.path.isfile(path) and os.access(path, os.X_OK):
+                real = os.path.realpath(path)
+                env[var] = real
+                dirs.append(os.path.dirname(os.path.dirname(real)))
+                break
+    return env, dirs
+
+
+def sandbox_argv(cwd, home, command, rx=(), env_extra=None):
+    """Candidate code (a watched test, check 0 of a codebase run, the gate) runs ONLY like this: the repository's
+    Landlock launcher with --require (a missing Landlock refuses, exit 125, never an unsandboxed run), the system
+    read-only, `cwd` and the empty temporary `home` the only writable places, the rest of /home/operator (STATE,
+    ~/.ssh, ~/.config, the live checkout, .env) absent, no TCP except port 1 (so 127.0.0.1:8080 is unreachable),
+    no unix sockets, and an environment built from nothing."""
+    env = ['PATH=/usr/local/bin:/usr/bin:/bin', 'HOME=' + home, 'LANG=C.UTF-8', 'TMPDIR=' + home,
+           'PYTHONDONTWRITEBYTECODE=1']
+    for key, value in (env_extra or {}).items():
+        env.append(f'{key}={value}')
+    argv = ['env', '-i', *env, SYS_PY, '-I', '-B', SANDBOX_LAUNCHER, '--cwd', cwd, '--rw', cwd, '--rw', home,
+            '--require', '--no-unix', '--net-connect', '1']
+    for path in rx:
+        argv += ['--rx', path]
+    return argv + ['--', *command]
+
+
+def scope_env():
+    """child_env plus XDG_RUNTIME_DIR, so systemd-run --user reaches the user manager from the tick's unit."""
+    return child_env({'XDG_RUNTIME_DIR': f'/run/user/{os.getuid()}'})
+
+
+def scope_argv(command, memory='4G'):
+    """Heavy local work (watched tests, the gate, clones) runs in its own transient scope in work.slice
+    (CLAUDE.md: new local workloads get separate work.slice scopes), outside the tick's MemoryMax."""
+    return ['systemd-run', '--user', '--scope', '--quiet', '--collect', '--slice=work.slice',
+            '-p', f'MemoryMax={memory}', '-p', 'CPUQuota=200%', '--nice=19', '--', *command]
+
+
+# ------------------------------------------------------------------------------------------- STOP
+
+
+def stop_everything(conn, procs=None, reason='owner STOP'):
+    """Needs only the registry (never the active release): end every local LIFE process, cancel every LIFE autogen
+    run and benchmark job, re-queue only the items whose run or job was confirmed cancelled (unresolved ones stay
+    `running` and the next poll reconciles them), re-queue model-stage items (their processes are gone), and open a
+    `stopped` notice naming anything unresolved. Safe to call twice."""
+    killed = procs.kill_all() if procs else 0
+    cancelled, unresolved = 0, []
+    for run in conn.execute("SELECT * FROM runs WHERE state IN ('submitting','live','submit_unknown')").fetchall():
+        rc, _, err = run_bounded([TASK, 'autogen', 'cancel', run['run_id']], timeout=CANCEL_TIMEOUT, env=child_env(),
+                                 tracked=False)
+        if rc == 0:
+            with Tx(conn):
+                conn.execute("UPDATE runs SET state='cancelled', ended_at=?, detail=? WHERE request_id=?",
+                             (now(), one_line(reason, 400), run['request_id']))
+                # a new attempt number, so a later run uses a new request id (the platform never reschedules an id)
+                conn.execute("UPDATE items SET state='queued', attempts=attempts+1, updated_at=?, outcome=? WHERE "
+                             "item_id=? AND state='running'", (now(), one_line(f'{reason}: run cancelled', 400), run['item_id']))
+            cancelled += 1
+        else:
+            unresolved.append(run['run_id'])
+    for item in conn.execute("SELECT * FROM items WHERE state='running' AND stage='bench'").fetchall():
+        job = (json.loads(item['payload']) or {}).get('job_id') or ''
+        try:
+            http_json('/api/cluster/job/cancel', {'id': job}, timeout=JOB_CANCEL_TIMEOUT)
+            with Tx(conn):
+                conn.execute("UPDATE items SET state='queued', updated_at=?, outcome=? WHERE item_id=?",
+                             (now(), one_line(f'{reason}: benchmark job cancelled', 400), item['item_id']))
+            cancelled += 1
+        except Telemetry:
+            unresolved.append(job or item['item_id'])
+    with Tx(conn):
+        conn.execute("UPDATE items SET state='queued', updated_at=? WHERE state='running' AND stage NOT IN "
+                     "('patch','draft','bench')", (now(),))
+        notice(conn, 'stopped', 'STOP', f'{reason}: {cancelled} run(s)/job(s) cancelled, {killed} local process group(s) '
+               f'ended; unresolved: {", ".join(unresolved) or "none"} (their items stay running until a poll settles '
+               'them). Remove control/STOP with life-ctl unstop; nothing cancelled restarts by itself.')
+    log(f'STOP: cancelled {cancelled}, ended {killed}, unresolved {len(unresolved)}')
+    return cancelled, unresolved
+
+
+# ------------------------------------------------------------------------------------------- platform contract
+
+CONTRACT = (                                      # (file, regex, the fact LIFE relies on); LIFE.md section 17
+    ('symblicos/autogen.py', r"run_id = 'autogen-' \+ hashlib\.sha256\(request_id\.encode\(\)\)\.hexdigest\(\)\[:24\]",
+     'run id derivation'),
+    ('symblicos/autogen.py', r"ADMITTED_ENGINES = \([^)]*'agy'", 'agy admitted for autogen'),
+    ('symblicos/autogen.py', r"TERMINAL = \{'completed', 'failed', 'cancelled', 'unknown', 'stuck'\}", 'terminal run states'),
+    ('symblicos/autogen.py', r"os\.path\.isdir\(os\.path\.join\(cwd, '\.git'\)\)", 'cwd must be a git workspace'),
+    ('symblicos/autogen.py', r"^CHECK_TIMEOUT = 120$", 'policy checks time out at 120 s'),
+    ('symblicos/autogen.py', r"'base': base, 'policy': policy, 'lines': lines,", 'a run row carries its policy (with sha256)'),
+    ('symblicos/autogen.py', r"def sandbox_prefix\(folder, home, extra_files=\(\)\):", 'the Landlock check sandbox exists'),
+    ('symblic_autogen.py', r"^VERSION = 1$", 'autogen policy version 1'),
+    ('symblic_autogen.py', r"'agents_max': \(1, 96\)", 'agents_max limits'),
+    ('symblic_autogen.py', r"def normalize\(spec, \*, engines=\(\), nodes=\(\)\)", 'normalize signature'),
+    ('symblic_autogen.py', r"policy\['sha256'\] = digest\(\{k: v for k, v in policy\.items\(\) if k not in \('engines', 'nodes'\)\}\)",
+     'the policy sha256 excludes engines and nodes'),
+    ('symblic_autogen.py', r"'perpetual': False, 'checks': \{\}, 'final': \[\], 'hidden': \[\], 'syntax': True, 'require_change': True,",
+     'defaults of the flagless fields (perpetual, final, hidden, syntax, require_change)'),
+    ('symblic_autogen.py', r"'until_done': False, 'novelty_limit': 2, 'self_split': True, 'designer': False, 'saturation': 0,",
+     'defaults of the flagless fields (until_done, designer)'),
+    ('symblic_autogen.py', r"\\b\(\?:the previous\|the last\|as before\|like above\|earlier\)\\b", 'lint back-reference words'),
+    ('bin/symblic-task', r"'--novelty-limit', '--saturation'\}", 'start flags'),
+
+
+[This is part 13 of 14. Reply only with the word RECEIVED.]

@@ -1,0 +1,14 @@
+program LIFE reproducer.
+use profile=verified, context=none, determine=false, solve=false.
+note The reproducer is the second agent of every cell. It never does the cell's task, and it does not decide whether the cell divides: code already decided that from the cell's own counters (LIFE.md section 9). It names how the parent's focus splits into two narrower foci; assign-item.sym then sorts the queued items between them and code commits the division only when both sides are nonempty. Worst case 3 + 3 = 6 calls.
+given organ: Text.
+given parent_focus: Text.
+given sample_items: Text.
+ask focus_a: Text up to 14 words "Cell of organ {organ} with focus: {parent_focus}. Its queued items include: {sample_items}. Name a first narrower focus covering part of these items, as one short imperative clause." from parent_focus, sample_items with effort=low, retries=2
+ensure len(focus_a) >= 8 and len(focus_a) <= 120 else retry because "a focus is a clause between eight and one hundred twenty characters".
+ask focus_b: Text up to 14 words "Name a second narrower focus, different from the first, covering the rest of these items, as one short imperative clause." from parent_focus, sample_items, focus_a with effort=low, retries=2
+ensure len(focus_b) >= 8 and len(focus_b) <= 120 else retry because "a focus is a clause between eight and one hundred twenty characters".
+ensure lower(trim(focus_a)) != lower(trim(focus_b)) else retry because "the two foci must differ".
+ensure lower(trim(focus_a)) != lower(trim(parent_focus)) and lower(trim(focus_b)) != lower(trim(parent_focus)) else retry because "each child focus must be narrower than the parent's".
+let plan = {focus_a: trim(focus_a), focus_b: trim(focus_b)}.
+return plan.

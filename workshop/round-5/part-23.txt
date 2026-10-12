@@ -1,0 +1,432 @@
+MIGRATION_RULES = """LIFE migration rules (the apply stage refuses anything else: life_common.migration_problems)
+1. The file holds 1 to 24 SQLite statements, at most 16384 bytes; EVERY statement ends with a semicolon.
+2. Every statement is exactly one of these forms, key words in upper case exactly as shown, one space between words:
+   CREATE TABLE IF NOT EXISTS org_<name> (<column>, <column>, ..., <optional table constraint>)
+   CREATE INDEX IF NOT EXISTS org_<name> ON org_<table> (<column name>, ...)
+   CREATE UNIQUE INDEX IF NOT EXISTS org_<name> ON org_<table> (<column name>, ...)
+   ALTER TABLE org_<table> ADD COLUMN <column>
+3. A <column> is: <name> <TYPE> followed by none or more of NOT NULL, UNIQUE, PRIMARY KEY, DEFAULT <value>,
+   REFERENCES org_<table> (<column name>). <name> uses lower-case letters, digits and underscores, starts with a
+   letter, has at most 40 characters and never starts with sqlite_. <TYPE> is exactly TEXT, INTEGER, REAL, BLOB or
+   NUMERIC. <value> is a number, a text in single quotes, or NULL. An ADD COLUMN takes no UNIQUE and no PRIMARY KEY.
+4. A table constraint is PRIMARY KEY (<column name>, ...) or UNIQUE (<column name>, ...).
+5. A table or index name is org_ plus lower-case letters, digits and underscores, at most 44 characters.
+6. A created table or index name, and an added column, does not exist in schema-snapshot.sql. A table you alter or index
+   exists in schema-snapshot.sql or is created earlier in this same file.
+7. A UNIQUE index (or a UNIQUE or PRIMARY KEY column) may be created only on a table created in this same file, never
+   on a table listed in schema-snapshot.sql: its rows are not visible to you.
+8. REFERENCES names an org_ table that exists (rule 6) and one of its columns that is that table's single-column
+   PRIMARY KEY or has a single-column UNIQUE constraint or UNIQUE index.
+9. Never use: DROP, DELETE, UPDATE, INSERT, REPLACE, ATTACH, DETACH, PRAGMA, VACUUM, TRIGGER, VIEW, REINDEX, ANALYZE,
+   AUTOINCREMENT, WITHOUT ROWID, STRICT, CHECK, GENERATED, COLLATE, ON CONFLICT, CASCADE, RESTRICT, DEFERRABLE, a block
+   comment, a quoted identifier ("x", [x] or `x`), an expression, or the functions load_extension, readfile,
+   writefile, fts, zipfile, edit and sqlar_.
+10. A line comment starts with two hyphens.
+11. Validation: the whole file is applied twice in a row on a copy of the organism (with its rows while it is at most
+    64 MiB, else on the schema only), with foreign keys enforced; the second application must change nothing (an ADD
+    COLUMN's "duplicate column" on the second pass is expected and ignored); the resulting schema must again be a valid
+    schema snapshot.
+"""
+
+
+def split_sql(text, terminated=False):
+    """Statements of a restricted DDL text: `--` comments and `;` are recognised only outside '...' and "..."
+    literals; whitespace outside literals collapses to one space; literal contents are kept exactly. A block comment
+    is refused (ValueError), so no hidden text exists. terminated=True: text after the last `;` (other than white space
+    and comments) is refused (every statement ends with a semicolon)."""
+    statements, buf, quote, i = [], [], '', 0
+    text = text or ''
+    while i < len(text):
+        c = text[i]
+        if quote:
+            buf.append(c)
+            if c == quote:
+                if i + 1 < len(text) and text[i + 1] == quote:
+                    buf.append(text[i + 1])
+                    i += 1
+                else:
+                    quote = ''
+        elif c in '\'"':
+            quote = c
+            buf.append(c)
+        elif c == '-' and text[i:i + 2] == '--':
+            j = text.find('\n', i)
+            i = len(text) if j < 0 else j
+            continue
+        elif c == '/' and text[i:i + 2] == '/*':
+            raise ValueError('a block comment (/* */)')
+        elif c == ';':
+            statements.append(''.join(buf))
+            buf = []
+        elif c.isspace():
+            if buf and buf[-1] != ' ':
+                buf.append(' ')
+        else:
+            buf.append(c)
+        i += 1
+    if quote:
+        raise ValueError('an unterminated quoted literal')
+    if terminated and ''.join(buf).strip():
+        raise ValueError('a statement does not end with a semicolon')
+    statements.append(''.join(buf))
+    return [s.strip() for s in statements if s.strip()]
+
+
+def code_text(statement):
+    """The statement with the contents of every '...' literal removed (the quotes stay): what word and character
+    rules look at, so a word inside a literal is never mistaken for SQL."""
+    out, inside, i = [], False, 0
+    while i < len(statement):
+        c = statement[i]
+        if inside:
+            if c == "'" and statement[i + 1:i + 2] == "'":
+                i += 2
+                continue
+            if c == "'":
+                inside = False
+                out.append(c)
+        elif c == "'":
+            inside = True
+            out.append(c)
+        else:
+            out.append(c)
+        i += 1
+    return ''.join(out)
+
+
+def migration_statements(sql_text):
+    return split_sql(sql_text, terminated=True)
+
+
+def snapshot_sql(conn):
+    """The CREATE statements of a database in creation order (sqlite_master rowid: a table always precedes its
+    indexes), SQLite's internal sqlite_* objects excluded, joined as `stmt;\\n`: what schema-snapshot.sql holds."""
+    rows = conn.execute("SELECT sql FROM sqlite_master WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\' "
+                        'ORDER BY rowid').fetchall()
+    return ''.join(r[0] + ';\n' for r in rows)
+
+
+def snapshot_problems(snapshot_sql_text):
+    """A schema snapshot may hold only CREATE TABLE and CREATE [UNIQUE] INDEX statements (what sqlite_master holds
+    for the organism), no denied statement head, no denied function or word outside literals, no sqlite_ name. Words
+    inside identifiers (a column named view) are allowed: only statement heads and function calls are checked; since
+    migration_problems refuses every sqlite_ identifier, an accepted migration never makes a snapshot fail here."""
+    out = []
+    if len((snapshot_sql_text or '').encode('utf-8')) > SNAPSHOT_MAX_BYTES:
+        return [f'the schema snapshot is larger than {SNAPSHOT_MAX_BYTES} bytes']
+    try:
+        statements = split_sql(snapshot_sql_text)
+    except ValueError as exc:
+        return [f'snapshot: {exc}']
+    for s in statements:
+        code = code_text(s)
+        if (not re.match(r'(?i)^CREATE (TABLE|(UNIQUE )?INDEX) ', s) or MIGRATION_HEAD_DENY_RX.match(s)
+                or FUNCTION_DENY_RX.search(code) or re.search(r'(?i)\b(AUTOINCREMENT|WITHOUT\s+ROWID|STRICT)\b', code)
+                or re.search(r'(?i)\bsqlite_', code)):
+            out.append(f'snapshot statement not allowed: {s[:80]}')
+    return out
+
+
+def deadline_handler(seconds):
+    """A SQLite progress handler that aborts the running statement once `seconds` have passed or STOP appears."""
+    end = time.monotonic() + seconds
+    return lambda: 1 if time.monotonic() > end or stop_present() else 0
+
+
+def split_defs(body):
+    """The top-level comma-separated parts of a CREATE TABLE body (commas inside parentheses or quotes do not split)."""
+    parts, buf, depth, quote = [], [], 0, ''
+    for c in body:
+        if quote:
+            buf.append(c)
+            if c == quote:
+                quote = ''
+            continue
+        if c in '\'"':
+            quote = c
+        elif c == '(':
+            depth += 1
+        elif c == ')':
+            depth -= 1
+        elif c == ',' and depth == 0:
+            parts.append(''.join(buf).strip())
+            buf = []
+            continue
+        buf.append(c)
+    parts.append(''.join(buf).strip())
+    return parts
+
+
+def logical_bytes(db_path):
+    """page_count x page_size of a database, read-only (the logical size; WAL-resident pages included)."""
+    src = sqlite3.connect(f'file:{db_path}?mode=ro', uri=True)
+    try:
+        return src.execute('PRAGMA page_count').fetchone()[0] * src.execute('PRAGMA page_size').fetchone()[0]
+    finally:
+        src.close()
+
+
+def physical_bytes(db_path):
+    """The database file plus its -wal and -shm files, as stored (the physical footprint)."""
+    return sum(os.path.getsize(db_path + s) for s in ('', '-wal', '-shm') if os.path.exists(db_path + s))
+
+
+def _statement_problems(s, created):
+    """Grammar problems of one statement (MIGRATION_RULES 2-5 and 9); `created` collects tables created so far."""
+    code = code_text(s)
+    if MIGRATION_HEAD_DENY_RX.match(s) or FUNCTION_DENY_RX.search(code) or WORD_DENY_RX.search(code):
+        return [f'denied statement, word or function in: {s[:80]}']
+    if re.search(r'["`\[\]]', code):
+        return [f'identifiers are never quoted (no " [ ] or ` outside \'...\' literals): {s[:80]}']
+    if re.search(r'(?i)\bsqlite_', code):
+        return [f'no name may start with sqlite_: {s[:80]}']
+    m = MIGRATION_RX.fullmatch(s)
+    if not m:
+        return [f'not an allowed additive form: {s[:80]}']
+    if m.group(2):
+        parts = split_defs(m.group(3))
+        cols = [p for p in parts if COLUMN_RX.fullmatch(p)]
+        bad = [p for p in parts if not COLUMN_RX.fullmatch(p) and not TABLE_CONSTRAINT_RX.fullmatch(p)]
+        if bad or not cols:
+            return [f'not a column or table constraint of rule 3 or 4: {(bad or [s])[0][:80]}']
+        created.add(m.group(2))
+    elif m.group(8):
+        col = COLUMN_RX.fullmatch(m.group(9))
+        if not col or re.search(r' (UNIQUE|PRIMARY KEY)\b', col.group(3)):
+            return [f'ADD COLUMN takes one column of rule 3 without UNIQUE or PRIMARY KEY: {s[:80]}']
+    if len(REFERENCES_RX.findall(code)) != len(REFERENCE_NAME_RX.findall(code)):
+        return [f'every REFERENCES names an unquoted org_ table followed by (column): {s[:80]}']
+    return []
+
+
+def migration_problems(sql_text, snapshot_sql_text='', db_path=None):
+    """An organism migration is valid only when it follows MIGRATION_RULES exactly: 1..24 statements, each ended by a
+    semicolon and each one of the four additive forms with the column grammar; only org_ tables and indexes that do
+    not exist yet (ADD COLUMN: a column that does not exist yet on an existing table); a UNIQUE index or UNIQUE /
+    PRIMARY KEY column only on a table this file creates; references only to an existing org_ table's single-column
+    primary key or unique column; no quoted identifier, sqlite_ name, denied word or function outside literals; and
+    the whole applies cleanly TWICE in memory, with foreign keys enforced and foreign_key_check clean, with the same
+    resulting schema, which must itself pass snapshot_problems: on a copy of the database WITH its rows when db_path
+    is given and its logical size is at most ORGANISM_VALIDATE_MAX_BYTES, else on the snapshot; the copy, both passes
+    and the checks share ONE MIGRATION_SECONDS deadline (the copy in pages with a deadline check between batches)."""
+    out = []
+    if len((sql_text or '').encode('utf-8')) > MIGRATION_MAX_BYTES:
+        return [f'migration is larger than {MIGRATION_MAX_BYTES} bytes']
+    try:
+        statements = split_sql(sql_text, terminated=True)
+    except ValueError as exc:
+        return [str(exc)]
+    if not 1 <= len(statements) <= MIGRATION_STATEMENTS_MAX:
+        out.append(f'a migration has 1..{MIGRATION_STATEMENTS_MAX} statements')
+    created = set()
+    for s in statements:
+        out += _statement_problems(s, created)
+    if out:
+        return out
+    if snapshot_sql_text:
+        problems = snapshot_problems(snapshot_sql_text)
+        if problems:
+            return problems
+    end = time.monotonic() + MIGRATION_SECONDS
+
+    def past():
+        return time.monotonic() > end or stop_present()
+    db = sqlite3.connect(':memory:')
+    db.set_progress_handler(lambda: 1 if past() else 0, 10000)
+    try:
+        if db_path and logical_bytes(db_path) <= ORGANISM_VALIDATE_MAX_BYTES:
+            src = sqlite3.connect(f'file:{db_path}?mode=ro', uri=True)
+
+            def progress(_status, _remaining, _total):
+                if past():
+                    raise TimeoutError('the validation copy passed its deadline or STOP appeared')
+            try:
+                src.backup(db, pages=256, progress=progress)
+            finally:
+                src.close()
+        elif snapshot_sql_text:
+            for s in split_sql(snapshot_sql_text):
+                db.execute(s)
+        db.execute('PRAGMA foreign_keys=ON')
+        existing = {r[0] for r in db.execute("SELECT name FROM sqlite_master")}
+        before = set(existing)
+        cols = {}
+        for s in statements:
+            m = MIGRATION_RX.fullmatch(s)
+            name = m.group(2) or m.group(5)
+            if name and name in existing:
+                out.append(f'{name} already exists: a migration creates new names only')
+            if m.group(5):
+                if m.group(6) not in existing:
+                    out.append(f'index {m.group(5)} is on {m.group(6)}, which does not exist')
+                elif m.group(4) and m.group(6) in before:
+                    out.append(f'a UNIQUE index on {m.group(6)}: unique indexes only on tables this file creates (rule 7)')
+            if m.group(8):
+                table = m.group(8)
+                if table not in existing:
+                    out.append(f'ALTER TABLE {table}: no such table')
+                have = cols.setdefault(table, {r[1] for r in db.execute(f'PRAGMA table_info("{table}")')}
+                                       if table in existing else set())
+                col = COLUMN_RX.fullmatch(m.group(9)).group(1)
+                if col in have:
+                    out.append(f'{table}.{col} already exists')
+                have.add(col)
+            for ref, _col in REFERENCE_NAME_RX.findall(code_text(s)):
+                if ref not in existing and ref != m.group(2):
+                    out.append(f'REFERENCES {ref}: no such org_ table in the snapshot or earlier in this migration')
+            if name:
+                existing.add(name)
+        if out:
+            return out
+        schemas = []
+        for _ in (1, 2):
+            for s in statements:
+                if past():
+                    raise TimeoutError('the validation passed its deadline or STOP appeared')
+                try:
+                    db.execute(s)
+                except sqlite3.OperationalError as exc:
+                    if s.startswith('ALTER TABLE') and 'duplicate column' in str(exc) and schemas:
+                        continue                  # the second application of an ADD COLUMN (rule 11)
+                    raise
+            schemas.append(sorted(tuple(r) for r in db.execute('SELECT type, name, sql FROM sqlite_master')))
+        if schemas[0] != schemas[1]:
+            out.append('a second application changed the schema')
+        if db.execute("SELECT 1 FROM sqlite_master WHERE name='sqlite_sequence'").fetchone():
+            out.append('the migration created the internal sqlite_sequence table (AUTOINCREMENT)')
+        for table in sorted(existing - before):
+            if not table.startswith('org_') or db.execute("SELECT type FROM sqlite_master WHERE name=?", (table,)).fetchone()[0] != 'table':
+                continue
+            for fk in db.execute(f'PRAGMA foreign_key_list("{table}")').fetchall():
+                parent, to = fk[2], fk[4]
+                pk = [r[1] for r in db.execute(f'PRAGMA table_info("{parent}")') if r[5]]
+                unique = any(ix[2] and [c[2] for c in db.execute(f'PRAGMA index_info("{ix[1]}")')] == [to]
+                             for ix in db.execute(f'PRAGMA index_list("{parent}")'))
+                if pk != [to] and not unique:
+                    out.append(f'{table} REFERENCES {parent} ({to}): not its single-column primary key or a unique column')
+        if db.execute('PRAGMA foreign_key_check').fetchone():
+            out.append('foreign_key_check found rows that break a reference')
+        out += [f'resulting schema: {p}' for p in snapshot_problems(snapshot_sql(db))]
+    except (sqlite3.Error, TimeoutError) as exc:
+        out.append(f'sqlite refused: {exc}')
+    finally:
+        db.close()
+    return out
+
+
+# ------------------------------------------------------------------------------------------- genome rules
+
+# The instruction is the LAST top-level quoted string before " from ": the type may hold quoted enum descriptions.
+ASK_RX = re.compile(r'(?P<indent>[ \t]*)ask (?P<name>[a-z_][a-z0-9_]*): (?P<type>.*) "(?P<instr>(?:[^"\\]|\\.)*)" '
+                    r'(?P<tail>from [^"]*)')
+NOTE_RX = re.compile(r'[ \t]*note ')
+
+
+def genome_protected_problems(old_text, new_text):
+    """A selfdev proposal may change only the quoted instruction of ask lines. Every other line (notes, blank lines
+    and indentation included), and every ask's indentation, name, type (enum descriptions included) and trailing
+    from/with clause stay byte-identical and in order; each changed instruction keeps exactly the same {name}
+    placeholders; at least one instruction changes."""
+    old = (old_text or '').splitlines(True)
+    new = (new_text or '').splitlines(True)
+    if len(old) != len(new):
+        return ['the number of lines changed']
+    out, changed = [], 0
+    for n, (a, b) in enumerate(zip(old, new, strict=True), 1):
+        if a == b:
+            continue
+        ma, mb = ASK_RX.fullmatch(a.rstrip('\n')), ASK_RX.fullmatch(b.rstrip('\n'))
+        if a.endswith('\n') != b.endswith('\n') or not (ma and mb) or any(
+                ma.group(k) != mb.group(k) for k in ('indent', 'name', 'type', 'tail')):
+            out.append(f'line {n}: only the quoted instruction of an ask line may change')
+        elif sorted(FIELD_RX.findall(ma.group('instr'))) != sorted(FIELD_RX.findall(mb.group('instr'))):
+            out.append(f'line {n}: the instruction must keep exactly the same {{placeholders}}')
+        else:
+            changed += 1
+    if not out and changed == 0:
+        out.append('no ask instruction changed')
+    return out
+
+
+PLACEMENT_RX = re.compile(r'\b(by|applicator|model|node|engine)\s*=')
+
+
+def genome_placement_problems(text):
+    """A genome program never chooses its own model, node or engine: outside quoted strings, no `by=`, `applicator=`,
+    `model=`, `node=` or `engine=` option (an ask-level by would win over the tick's --by). check_release refuses it."""
+    bare = re.sub(r'"(?:[^"\\]|\\.)*"', '""', text or '')
+    return [f'line {n}: a placement option ({m.group(1)}=) is not allowed in a genome program'
+            for n, line in enumerate(bare.splitlines(), 1) for m in PLACEMENT_RX.finditer(line)]
+
+
+VERIFY_LINES = {
+    'codebase': re.compile(r'finding=[0-9a-f]{16} test=tests\.[A-Za-z0-9_.]+'),
+    'selfdev': re.compile(r'lesson=[0-9a-f]{16} program=[a-z-]+'),
+    'database': re.compile(r'migration=[0-9]{4}_[a-z0-9_]{1,40}'),
+}
+
+
+def verify_line_problems(organ, data, expected):
+    """verify.txt must be exactly the expected line, optionally followed by one LF: no BOM, CR, spaces or other
+    lines. `data` is the file's bytes."""
+    if isinstance(data, str):
+        data = data.encode('utf-8')
+    if not VERIFY_LINES[organ].fullmatch(expected):
+        return ['the expected verify line has the wrong form']
+    if data not in (expected.encode('ascii'), expected.encode('ascii') + b'\n'):
+        return ['verify.txt must be exactly the line ' + expected]
+    return []
+
+
+# ------------------------------------------------------------------------------------------- loopback adapter
+
+
+class Telemetry(Exception):
+    def __init__(self, message, status=None):
+        super().__init__(message)
+        self.status = status                    # the HTTP status code, or None when there was no HTTP answer
+
+
+def _finite_float(text):
+    value = float(text)
+    if not math.isfinite(value):
+        raise ValueError(f'a non-finite number {text[:20]}')
+    return value
+
+
+def _depth_ok(value, depth=0):
+    if depth > JSON_MAX_DEPTH:
+        return False
+    if isinstance(value, dict):
+        return all(_depth_ok(v, depth + 1) for v in value.values())
+    if isinstance(value, list):
+        return all(_depth_ok(v, depth + 1) for v in value)
+    return True
+
+
+def strict_json(raw):
+    """JSON as LIFE accepts it from any platform answer: duplicate keys, NaN/Infinity, numbers that overflow to an
+    infinite float and nesting deeper than JSON_MAX_DEPTH are refused (ValueError)."""
+    try:
+        value = json.loads(raw, object_pairs_hook=_no_dup_keys, parse_float=_finite_float,
+                           parse_constant=lambda c: (_ for _ in ()).throw(ValueError(c)))
+    except RecursionError:
+        raise ValueError('JSON nested too deeply') from None
+    if not _depth_ok(value):
+        raise ValueError(f'JSON nested deeper than {JSON_MAX_DEPTH}')
+    return value
+
+
+def _http_once(path, body, timeout, box=None):
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *args, **kwargs):
+            return None
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+    data = None if body is None else json.dumps(body).encode('utf-8')
+    req = urllib.request.Request(DASH + path, data=data, method='GET' if body is None else 'POST')
+    req.add_header('Host', '127.0.0.1:8080')
+    req.add_header('Accept', 'application/json')
+    req.add_header('User-Agent', 'life-tick')
+
+
+[This is part 23 of 26. Do not critique yet. Reply only with the word RECEIVED.]

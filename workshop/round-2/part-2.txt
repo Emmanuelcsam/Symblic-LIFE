@@ -1,0 +1,301 @@
+[LIFE round-2 critique packet, part 2 of 8]
+
+commands. Accepted files move to `inbox-done/`. The command's original text stays the only
+authoritative instruction; the classifier's `restated` line is display text.
+
+## 7. The organs, stage by stage
+
+Each organ's items move through a fixed stage list (`life_common.STAGES`). A **slot** stage uses its
+cell's worker node for one program run in step 14; an **the host** stage is code in step 11.
+
+### 7.1 command — `classify` (slot)
+
+`classify-command.sym` with `command_id`, `command_text` → `{organ, urgency, restated}`. Dispatch by code:
+
+| route | effect |
+|-------|--------|
+| learning | a question item (text <= 600 characters; longer: notice `command_too_long`) |
+| codebase | a finding item if the text names a test id `tests.<module>[...]`; else notice `command_needs_test` |
+| database | a request item |
+| compute | an experiment item |
+| selfdev | a lesson item if the text names one genome program; else notice `command_needs_program` |
+| immune, heartbeat, none | notice `command_<route>` for the operator (no lifecycle action follows from a model label) |
+
+The item's priority is the urgency (low 0, normal 1, high 2). The command row becomes `dispatched` or `owner`.
+
+### 7.2 learning — `research` (slot)
+
+`bin/local-research --model M --node NODE --tools 8 --json "QUESTION"` (timeout 900 s; the model
+searches through SearXNG at 127.0.0.1:18888 on the host and reads pages through code-run tools; it never
+touches the network itself). From the result's `sources`, in order, code keeps URLs that start with
+http(s), are at most 2000 characters, pass the credential screen, and whose
+`source_key = symblic_autogen.items_key(url)` is not yet in `sources` (the ONE dedup authority for
+every learning cell). At most 3 new sources per run; each becomes a `sources` row and a digest item.
+The question then: 0 new sources → `dry_runs + 1`; at 3 dry runs in a row it is `done` (exhausted);
+at 9 sources in total it is `done`; otherwise it returns to the back of the queue. A research error
+matching an infrastructure pattern (no capacity, offline, SearXNG down, timeout) is `infra`.
+
+### 7.3 digest — `fetch` (host) → `extract` (slot) → `distill` (slot)
+
+- **fetch**: `local_research.read_page(url, 6000)` in a subprocess (`.venv` Python, timeout 90 s) — the
+  existing `deep_research.safe_fetch` path: http(s) only, every resolved address global, every redirect
+  re-validated, robots honoured. Fewer than 200 characters: `abstained` (EMPTY). A refusal: `abstained`.
+  Otherwise the text is stored once at `STATE/text/<16hex>.txt` with its sha256; the snapshot never changes.
+- **extract**: `extract-source.sym` → `supported false`: `abstained` (NO_SUPPORTED_CLAIM). Else code
+  re-checks the snapshot hash, then that the whitespace-collapsed quote occurs in the
+  whitespace-collapsed snapshot, 12..400 characters, claim 20..300; it inserts a `knowledge` row with
+  `fact_id = first 16 hex of sha256(source_key + "\n" + quote)`, `quote_verified = 1` (the quote is in
+  the text; the claim's truth is NOT established; `claim_status = unreviewed`).
+- **distill**: `distill-lesson.sym` → target `genome` (with a program) → a selfdev lesson item; `compute`
+  → an experiment item; `database` → a request item; `none` → nothing. All taint `web`.
+
+### 7.4 codebase — `triage` (slot) → `patch` (agent run) → `gate` (host)
+
+- **Findings** come from two sources only: the operator's `control/watch.txt` (at most 20 lines
+  `tests.<module>[.<Class>[.<test>]]`) and operator commands naming a test id. Each tick at most one watched
+  test runs, each test at most every 6 h: `nice -n 19 /usr/bin/python3 -s -B -m unittest TEST` in a
+  codebase clone just reset to `origin/<branch recorded at seed>` (timeout 600 s). A nonzero exit makes a
+  finding (one open finding per test) with the last 40 output lines as `finding_text` (withheld if they
+  hold credential-like text). LIFE never reads the dashboard's logs or private stores.
+- **triage**: `triage-error.sym` → `unknown`, `signature_change` or `confident false`: `owner` (notice
+  `finding_owner`). Else the class is recorded.
+- **patch**: the clone is reset to the finding's base commit (operator findings: the branch head now); the
+  two-line `organs/codebase.lines.txt` is rendered with `scope` = "files under tests/" (test_only),
+  "Markdown files under docs/" (comment_or_doc) or "the source files the failure names" (local_fix);
+  checks: statement 0 `python3 -s -m unittest TEST`, statement 1 the verify line (section 7.9).
+- **gate** (after a completed run): the promoted change is staged; the diff excludes `verify.txt`,
+  `AUTOGEN-*`, `HANDOFF.md`. Refused when: no diff; test_only touches anything outside `tests/`; any
+  other class touches `tests/` (the judging test stays fixed); comment_or_doc touches anything but
+  `docs/*.md`; the diff holds credential-like text; or `checks/devcheck-gate.sh CLONE TEST` fails
+  (module resolves inside the clone, `./bin/devcheck`, the focused test under system Python; timeout
+  900 s). A pass writes `STATE/bundles/patches/<patch_id>/{patch.diff,meta.json}` with
+  `patch_id = first 16 hex of sha256(diff)`, a `patches` row (`bundled`), and an immune review item.
+  The clone is reset (`git reset --hard HEAD; git clean -fdq`) either way: only LIFE writes in it.
+- `path_class` (code, from the paths alone): `tests`, `docs`, `restart_gated` (any `.py`, `bin/`,
+  `.service`, `.timer`, `.sh`), `live_static` (anything else), or `mixed`. The operator sees it at apply.
+
+### 7.5 immune — `review` (slot), canaries (code)
+
+`review-patch.sym` with the bounded diff text (at most 6000 characters; a larger or missing diff goes
+to the operator unreviewed), `change_class`, `path_class` and `checks_passed` computed by code. `accept`
+→ patch `ready` + notice `patch_ready` (or proposal `ready` + `proposal_ready`); `reject` → `rejected`;
+`needs_work` → `rejected`, and for a patch whose finding has fewer than 2 attempts, the finding is
+re-queued at `patch` with the reviewer's reason appended. **Canaries** (`checks/canaries.txt`, shipped
+in the kit, never empty): `bin/symblic check` on each active genome program and
+`life-check.py registry` (`PRAGMA integrity_check`), every 12th tick, argv without a shell, timeout
+120 s. Any failure holds all new work until a later round passes. Quarantine is section 9.
+
+### 7.6 selfdev — `draft` (agent run) → `gate` (host); needs SELFDEV_ARMED
+
+Before a run the workspace's `genome/` is made equal to the active release (committed in the workspace).
+`organs/selfdev.lines.txt` asks the agent to change only the quoted instruction text of the named
+program's ask lines. Checks: `bin/symblic check genome/P.sym` and `life-check.py genome-protected`
+(versus the workspace HEAD), and the verify line. **gate**: the same protected-line rule against the
+active release (`life_common.genome_protected_problems`: only `ask` instruction strings and `note`
+lines may differ; every `given`, `define`, `ensure`, `let`, `if`, `return` line and every ask's name,
+type and `from`/`with` clause stay byte-identical; at least one ask changed), and `bin/symblic check`
+again. A pass bundles `STATE/bundles/proposals/<id>/` and queues an immune review. A proposal never
+takes effect until the operator runs `life-ctl.py adopt` (a new release). Acceptance rules, budgets, gates,
+placement and STOP are not in the genome, so selfdev cannot weaken them.
+
+### 7.7 compute — `propose` (slot) → `rank` (slot) → `bench` (slot; a cluster job)
+
+Needs a valid operator `control/benchmarks.json` (else items wait with notice `benchmarks_missing`).
+Each benchmark: `{id, description, cmd (contains {{item}}, <= 2000 characters), param_rx, baseline
+(matches param_rx), unit, timeout (30..900)}`; the cmd must print exactly one line
+`LIFE_RESULT <number> <unit>` per run. **The model never writes a command.**
+- **propose**: `propose-experiment.sym` with the seed text and the catalogue → code requires an existing
+  benchmark id, a parameter matching its `param_rx` and different from the baseline, a comparison
+  (`lt le gt ge` → `< <= > >=`) and `threshold_pct` 1..10000; `experiment_id = first 16 hex of
+  sha256(benchmark_id + "\n" + param)`; a repeated experiment is `abstained`.
+- **rank**: `rank-experiment.sym` → measured only when `feasible` is true AND `risk` is `low` AND
+  `score >= 60`; else the item is `done` as ineligible.
+- **bench**: `POST /api/cluster/map` with `cmd = "timeout T nice -n 15 " + cmd`, `items = [param,
+  baseline]` (run in that order), `targets = [the cell's node]`, `parallel = 1`, `timeout = 2T + 60`.
+  The node takes no other LIFE work while the job runs. Exactly two `LIFE_RESULT` lines in the
+  benchmark's unit, baseline > 0: `ratio_pct = floor(100 x candidate / baseline)`, passed when
+  `ratio_pct <op> threshold_pct`. A passed experiment opens an `experiment_passed` notice: adopting a
+  new way to compute or store is the operator's decision. A job past `timeout + 300` s is cancelled.
+  LIFE never enables high-power mode; nothing here changes power settings.
+
+### 7.8 database — `draft` (agent run) → `apply` (host)
+
+Before a run the workspace's `schema-snapshot.sql` is made equal to organism.sqlite3's schema.
+`migration_id = <4-digit next number>_<slug of the request, <= 30 characters>`. The agent writes
+`migrations/<id>.sql`. **apply**: `life_common.migration_problems`: 1..24 statements, at most 16384
+bytes, each exactly one of `CREATE TABLE IF NOT EXISTS org_x (...)`, `CREATE [UNIQUE] INDEX IF NOT
+EXISTS org_x ON org_y (...)`, `ALTER TABLE org_x ADD COLUMN c TYPE ...`; none of DROP, DELETE, UPDATE,
+INSERT, REPLACE, ATTACH, DETACH, PRAGMA, VACUUM, TRIGGER, VIEW, load_extension, readfile, writefile;
+and the whole applies cleanly in memory on top of the snapshot. Then: a backup copy of
+organism.sqlite3, one transaction applying every statement plus a `schema_migrations` row, a commit of
+the migration file in the workspace, a `migrations` registry row and a `migration_applied` notice. The
+control registry is a different file, so no migration can touch control state.
+
+### 7.9 Agent runs (codebase patch, selfdev draft, database draft)
+
+- **Policy** (every LIFE agent run, `policies/<organ>.json`, checked by `agent_policy_problems`):
+  `perpetual false, until_done false, candidates 1, regenerate 2, depth 0, children 2, generations 1,
+  agents_max 3, attempt_seconds 900, wall_seconds 3600, novelty_limit 2, saturation 0, strategies
+  [fresh, feedback], syntax true, require_change true, self_split false, designer false, final [],
+  hidden []` and checks on statements 0 and 1. So: no engine or node rotation, no internal splitting
+  (`self_split false` and bounded-mode `depth 0` make `decide` never decompose), at most 3 agents.
+  `generations 1` is the platform minimum; a remote handoff request is refused by the platform
+  ("remote handoff unsupported") and counts as a failed attempt.
+- **Statements**: rendered from the active release's template with exactly the organ's fields, each
+  matching its exact form (`life_common.PLACEHOLDERS`) and passing the credential screen; the result
+  must name the workspace in every statement and lint with ZERO findings (`symblic_autogen.lint` with
+  the workspace as root). The templates write the workspace as the literal absolute prefix
+  `/home/operator/symblicos/projects/life-<organ>-` followed by `{ws_id}`, which `render` derives from
+  `ws` (its last 8 hex digits, refused when `ws` belongs to another organ), so even the raw template
+  text names an absolute folder and lints with ZERO findings without a root.
+- **Submit**: `request_id = life-<organ>-<cell hex8>-<item 16hex>-<attempt>`; expected
+  `run_id = autogen-<first 24 hex of sha256(request_id)>`. A `runs` row (`submitting`) is committed
+  BEFORE `bin/symblic-task start --lines SNAPSHOT --root WS --cwd WS --node NODE --engine agy --id
+  REQUEST_ID --json` plus the full flag list (`policy_flags`: every field explicit, none left to a
+  server default). The CLI reads the snapshot file at submit time (`read_lines_file`), so the snapshot
+  is evidence, not a live input. rc 1 or 2: `not_submitted` (item re-queued; failed after 3).
+  Anything else: `unknown` until the next poll finds the run (then its server policy sha256 must equal
+  `symblic_autogen.normalize(policy)['sha256']`, else the run is cancelled) or the API answers 404
+  (`not_submitted`).
+- **Placement**: the cell's node only, and only when the task-engine catalogue
+  (`bin/symblic-task catalog --json`) reports agy ready there; otherwise notice `agy_not_ready` and
+  wait. Never another node, never the host. At most 2 LIFE runs live fleet-wide, 1 per cell, 12 a UTC day.
+- **Collection**: `completed` → the next stage. `failed`/`stuck`/`cancelled`/`unknown`: when every
+  attempt failure is non-semantic (INFRASTRUCTURE, REFUSAL, CANCELLED, CONFLICT, FETCH_FAILURE,
+  TIMEOUT) the item is re-queued (failed after 3 such runs); otherwise the item fails and the cell's
+  `failures_in_a_row` grows. The workspace is reset after every failed run.
+- **verify.txt**: exactly one line — codebase `finding=<16hex> test=<test_id>`, selfdev
+  `proposal=<16hex> program=<name>`, database `migration=<id>` — checked by `life-check.py verify-line`.
+
+## 8. Light models: ladders, the program contract, escalation
+
+**Ladders** (`organs/organs.json`, release-managed; models drawn from those installed on all five LIFE
+worker nodes according to the authoring pass's `bin/local-research --list`; a model missing on a node fails
+as `infra` there and never counts against the cell):
+
+| program | rung 0 | rung 1 |
+|---------|--------|--------|
+| classify-command | llama3.2:1b | qwen3:4b-instruct |
+| triage-error | qwen2.5-coder:3b | qwen3:4b-instruct |
+| extract-source | qwen3:4b-instruct | — |
+| distill-lesson | llama3.2:1b | qwen3:4b-instruct |
+| propose-experiment | qwen3:4b-instruct | — |
+| rank-experiment | llama3.2:1b | qwen3:4b-instruct |
+| review-patch | qwen2.5-coder:3b | qwen3:4b-instruct |
+| reproduce | llama3.2:1b | qwen3:4b-instruct |
+| assign-item | qwen2.5:0.5b | llama3.2:1b |
+| local-research | qwen3:4b-instruct | — |
+
+**The program contract.** The tick runs, from cwd STATE with a fixed environment (PATH, HOME, LANG,
+`SYMBLIC_THERMAL=1`, `SYMBLIC_CALL_WALL_S=900`, `DASH_URL`, nothing inherited):
+
+```
+bin/symblic run STATE/release/<n>/genome/P.sym --by ollama:MODEL@NODE --json --max-calls 12 \
+  --ollama-limits '{"num_predict": 1024, "timeout_seconds": 600}' --dir STATE/calls/<call_id> \
+  --input NAME=<JSON-encoded value> ...
+```
+
+in its own process group, killed at 900 s. Genome asks carry no `by`: an ask-level `by` would win over
+`--by` (`symblic_run.Run._apps`), so the code chooses model and node. Values are JSON-encoded so text
+stays text. Every call goes through the fleet runner (`symblic_apply` → `fleet_runner.launch`), which allows one
+model process per node (`fleet_runner._check_capacity`) and waits up to 1800 s for a busy node;
+LIFE adds one program run per node per tick and requires `memAvailMiB >= 2048 + the model's size`
+(0.5b 400, 1b 1300/900, 3b 1900, 4b 2600 MiB) before a call. Each program's worst-case model calls
+(votes x attempts) is written in its `note` and is at most 12.
+
+**Outcome classification** (code): exit 0 with `status done` and exactly one returned record → `done`.
+No JSON, a timeout, or an error whose kind is `unavailable`/`capacity`/`timeout` or whose message
+matches the infrastructure pattern → `infra`: the item stays queued, the node is held 300 s, nothing
+counts against the cell. Anything else → `failed`.
+
+**Escalation and tuning** (per item, per cell): a `failed` item retries at the next rung (at most 2
+extra rungs). Past the top it fails, the cell's `failures_in_a_row` grows, and a code lesson
+(`taint code`) asks selfdev to improve that program. Each cell keeps, per program, a base rung and a
+window of its last 10 outcomes (b = done at base, e = needed escalation, f = failed): 5 or more e/f in
+the last 10 moves the base rung up; 10 b in a row moves it down one (the cheapest model that works).
+This is how cells learn efficiently without a model deciding anything about itself.
+
+## 9. Reproduction
+
+The full protocol is `spawn/PROTOCOL.md`. Summary: code decides eligibility (active, 0 failures,
+depth < 10, backlog >= the organ's `divide_backlog` for 3 ticks, organ < 3 live cells, organism <= 16,
+<= 8 births a day, one open division, 6 h after an abort, organ efficiency >= 0.2, a second worker node
+free); the reproducer names two foci; assign-item sorts up to 16 items (4 per tick; the rest by the
+parity of sha256(item_id)); one transaction births both children (child a on the parent's worker node,
+child b on another), moves the items and retires the parent (`divided`).
+`cell_id = <organ>.<depth>.<first 8 hex of sha256(parent + "\n" + letter + "\n" + focus)>`. Seeds are
+`<organ>.0.00000000`. A repeated lineage key aborts the division. Endings: apoptosis after 288 idle
+ticks when a sibling remains; quarantine after 8 failed items in a row (operator releases); operator retire.
+The organism therefore grows where work piles up, shrinks where it is idle, never below one cell per
+organ, and never past the heat, budget and placement limits.
+
+## 10. Metabolism (the governor)
+
+Every tick reads `GET /api/cluster/status` (fields used: `ts`, and per node `online`, `vitals.cpu` =
+percent busy over the probe interval, `vitals.temp` °C, `vitals.memavail` bytes) and
+`GET /api/cluster/highpower/state` (`cool.phase`), with bin/symblic-task's request shape (loopback,
+no proxy, no redirect, Host 127.0.0.1:8080).
+
+- **Hold** (no new work at all) when: the status is unreadable or its `ts` is older than 180 s; cool
+  mode is on or unreadable; the host `load1 >= 0.75 x nproc`; the host `/proc/pressure/io` full avg60 >=
+  10.0 or unreadable. Telemetry is never replaced by zero.
+- **Fleet loaded** in a sample: at least 3 online LIFE worker nodes with `cpu >= 50`. `dt` = seconds since the
+  previous sample, at most 1500. Loaded: `continuous += dt`, `quiet = 0`. Not loaded: `quiet += dt`; when
+  `quiet >= 600`, `continuous = 0`. **Rest** when `continuous >= 3000` and until `quiet >= 600`. A short
+  gap never resets the window; the fleet's own non-LIFE load counts too. This implements "continuous
+  all-worker node load under about an hour, then rest".
+- **Per node**: hot at `temp >= 85` and cool again below 75 (hysteresis; the same numbers as
+  `symblic_apply.THERMAL_HOT/THERMAL_COOL`); a missing temperature counts as hot. A hot, offline, held
+  or benchmarking node takes no new LIFE action.
+- The governor row (`governor` table) is the single truth both scheduling and status read.
+
+## 11. Immunity and safety
+
+- Review: section 7.5. Canaries: section 7.5. Quarantine: section 9.
+- Integrity: release manifests every tick; the platform contract every tick (section 17).
+- Secrets: the credential screen (`SECRET_RX`) on inbox text, finding text, rendered template values,
+  URLs and patch diffs; matching text is refused or withheld, never stored or echoed. LIFE reads no
+  `.env`, no `easy_config.json`, no private store, no log. Subprocesses get a fixed environment.
+- Web text: section 6 (taint). Model processes have no network; research and fetches go through the
+  existing safe-fetch path; guest internet is untouched.
+- Rollback: `life-ctl.py revert` restores the recorded pre-apply bytes only when every touched file
+  still has its post-apply hash; otherwise it names the changed files and does nothing. `git checkout --`
+  is never used on the live tree.
+- LIFE renders nothing in a web page in v2; any later dashboard view must escape every string and pass
+  the CSP and service-worker rules.
+
+## 12. Databases
+
+- **Registry** `STATE/life.sqlite3` (`db/life.sql`): WAL, `synchronous=FULL`, `busy_timeout=5000`,
+  `foreign_keys=ON`; one writer at a time under `STATE/tick.lock`; CHECK constraints encode every enum,
+  range and identity rule (organs, nodes, depth 0..10, one active release, one open division per
+  parent, quote_verified = 1, ...). Times are UTC Unix seconds from `int(time.time())`.
+- **Organism** `STATE/organism.sqlite3` (`db/organism.sql`): starts with `schema_migrations` only;
+  grows only by section 7.8 migrations.
+- **Backups**: the first tick of each UTC day copies both through the SQLite backup API to
+  `STATE/backups/{life,organism}-YYYY-MM-DD.sqlite3` (mode 0600, the newest 7 kept); every migration
+  first copies the organism database to `organism-before-<id>.sqlite3`. Restore is an operator action:
+  stop the timer, copy a backup over the file, start the timer.
+- Python's `sqlite3` module is used everywhere (`sqlite3` CLI is not installed on the host).
+
+## 13. Every number
+
+| name | value | meaning |
+|------|-------|---------|
+| TICK_SECONDS | 300 | timer interval after the previous tick ends |
+| TICK_DEADLINE | 1200 s | no new work starts later in a tick |
+| CALL_TIMEOUT | 900 s | one program or research process |
+| CALL_MAX_MODEL_CALLS | 12 | `--max-calls` per program run |
+| OLLAMA_LIMITS | num_predict 1024, timeout 600 s | per model call |
+| ASSIGN_PER_SLOT | 4 | assign-item runs per division tick |
+| LIFE_MAX_CELLS / ORGAN_CELL_CAP / NODE_CELL_CAP | 16 / 3 / 4 | live cells |
+| MAX_DEPTH | 10 | deepest child |
+| DIVIDE_SUSTAIN / DIVISION_COOLDOWN / DIVISIONS_OPEN_MAX | 3 ticks / 21600 s / 1 | division |
+| APOPTOSIS_IDLE_TICKS / QUARANTINE_FAILURES | 288 / 8 | endings |
+| NODE_HOLD_SECONDS | 300 | after an infra answer |
+| AGENT_RUNS_LIVE_MAX / AGENT_RUN_KILL_SECONDS | 2 / 4500 s | agent runs |
+| PROGRAM_RUNS_PER_DAY / AGENT_RUNS_PER_DAY / BENCH_JOBS_PER_DAY / BIRTHS_PER_DAY | 1200 / 12 / 12 / 8 | UTC-day budgets |
+| QUESTION_DRY_LIMIT / QUESTION_SOURCE_LIMIT / NEW_SOURCES_PER_RUN / RESEARCH_TOOLS | 3 / 9 / 3 / 8 | research |
+
+
+[This is part 2 of 8. Reply only with the word RECEIVED.]

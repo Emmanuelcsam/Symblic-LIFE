@@ -1,0 +1,288 @@
+[LIFE round-4 critique packet, part 20 of 21]
+
+    for path in rx:
+        argv += ['--rx', path]
+    return argv + ['--', *command]
+
+
+# What the sandbox probe asserts from INSIDE the sandbox (life-ctl gate-selftest and arm run it; exit 0 = every
+# boundary held). It writes nothing outside its own temporary HOME.
+SANDBOX_PROBE = (
+    "import os, socket, sys\n"
+    "bad = []\n"
+    "for p in ('/home/operator/.local/state/life', '/home/operator/.ssh', '/home/operator/host-checkout'):\n"
+    "    try:\n"
+    "        os.listdir(p); bad.append('readable ' + p)\n"
+    "    except OSError:\n"
+    "        pass\n"
+    "try:\n"
+    "    socket.create_connection(('127.0.0.1', 8080), 2).close(); bad.append('tcp 127.0.0.1:8080')\n"
+    "except OSError:\n"
+    "    pass\n"
+    "try:\n"
+    "    s = socket.socket(socket.AF_UNIX); s.connect('/run/user/%d/bus' % os.getuid()); bad.append('unix socket')\n"
+    "except OSError:\n"
+    "    pass\n"
+    "print('sandbox probe:', 'held' if not bad else 'BROKEN: ' + ', '.join(bad)); sys.exit(1 if bad else 0)\n")
+
+
+def scope_env():
+    """child_env plus XDG_RUNTIME_DIR, so systemd-run --user reaches the user manager from the tick's unit."""
+    return child_env({'XDG_RUNTIME_DIR': f'/run/user/{os.getuid()}'})
+
+
+def scope_argv(command, memory='4G', runtime=None, name='work'):
+    """Heavy local work (watched tests, the gate, clones, fetches) runs in its own transient scope in work.slice
+    (CLAUDE.md: new local workloads get separate work.slice scopes), outside the tick's MemoryMax: unit
+    life-<name>-<8 hex>.scope, MemoryMax `memory`, CPUQuota 200 %, TasksMax SCOPE_TASKS_MAX, RuntimeMaxSec `runtime`
+    (+ KILL_GRACE) so a process that outlives the tick still ends; STOP and the unit's ExecStopPost stop every
+    life-*.scope (stop_scopes)."""
+    unit = f'life-{name}-{secrets.token_hex(4)}'
+    argv = ['systemd-run', '--user', '--scope', '--quiet', '--collect', f'--unit={unit}', '--slice=work.slice',
+            '-p', f'MemoryMax={memory}', '-p', 'CPUQuota=200%', '-p', f'TasksMax={SCOPE_TASKS_MAX}']
+    if runtime:
+        argv += ['-p', f'RuntimeMaxSec={int(runtime) + KILL_GRACE}']
+    return argv + ['--nice=19', '--', *command]
+
+
+def stop_scopes():
+    """systemctl --user stop 'life-*.scope': every transient scope LIFE started (watched tests, gates, clones, fetches)."""
+    return run_bounded(['systemctl', '--user', 'stop', 'life-*.scope'], timeout=CANCEL_TIMEOUT, env=scope_env(),
+                       tracked=False)[0]
+
+
+# ------------------------------------------------------------------------------------------- STOP
+
+
+def stop_everything(conn, procs=None, reason='owner STOP'):
+    """Needs only the registry (never the active release, never a schema check). In this order: end every local
+    LIFE process group and every life-*.scope; remove ARMED (a STOP disarms: after unstop the operator arms again);
+    ask the platform to cancel EVERY LIFE autogen run and benchmark job, each target on its own (one failure never
+    skips the rest; the answers are collected first); then record what it can, each record in its own transaction
+    (a registry that cannot be written never blocks a cancel): a cancel the platform accepted is only a REQUEST, so
+    the run or job stays live/running with detail `cancel requested` until a poll sees it end; model-stage items
+    return to the queue and their nodes are held ORPHAN_HOLD_SECONDS; a `stopped` notice names every target whose
+    cancel was not accepted. Safe to call at every tick while STOP exists."""
+    killed = procs.kill_all() if procs else 0
+    stop_scopes()
+    try:
+        os.remove(ARMED_FILE)
+    except OSError:
+        pass
+    runs, benches = [], []
+    try:
+        runs = conn.execute("SELECT request_id, run_id FROM runs WHERE state IN ('submitting','live','submit_unknown')").fetchall()
+    except sqlite3.Error as exc:
+        log(f'STOP: runs unreadable: {exc}')
+    try:
+        benches = conn.execute("SELECT item_id, payload FROM items WHERE state='running' AND stage='bench'").fetchall()
+    except sqlite3.Error as exc:
+        log(f'STOP: benchmark items unreadable: {exc}')
+    answers = []
+    for run in runs:
+        try:
+            rc, _out, err = run_bounded([TASK, 'autogen', 'cancel', run['run_id']], timeout=CANCEL_TIMEOUT,
+                                        env=child_env(), tracked=False)
+            answers.append(('run', run['request_id'], run['run_id'], rc == 0))
+        except Exception:  # noqa: BLE001 - one failed cancel never skips the rest
+            answers.append(('run', run['request_id'], run['run_id'], False))
+    for item in benches:
+        try:
+            job = (json.loads(item['payload']) or {}).get('job_id') or ''
+        except ValueError:
+            job = ''
+        ok = False
+        if job:
+            try:
+                ok = http_json('/api/cluster/job/cancel', {'id': job}, timeout=JOB_CANCEL_TIMEOUT).get('success') is True
+            except Telemetry:
+                ok = False
+        answers.append(('job', item['item_id'], job or 'label only', ok))
+    for kind, key, _target, ok in answers:
+        try:
+            with Tx(conn):
+                if kind == 'run':
+                    conn.execute('UPDATE runs SET detail=? WHERE request_id=?',
+                                 ('cancel requested' if ok else 'cancel not confirmed', key))
+                else:
+                    conn.execute('UPDATE items SET outcome=? WHERE item_id=?',
+                                 ('benchmark cancel requested' if ok else 'benchmark cancel not confirmed', key))
+        except sqlite3.Error:
+            pass
+    unresolved = [target for _k, _key, target, ok in answers if not ok]
+    try:
+        with Tx(conn):
+            for r in conn.execute("SELECT c.node FROM items i JOIN cells c ON c.cell_id=i.cell_id WHERE i.state='running' "
+                                  "AND i.stage NOT IN ('patch','draft','bench')").fetchall():
+                conn.execute('INSERT OR REPLACE INTO node_holds (node, until, reason) VALUES (?, ?, ?)',
+                             (r['node'], now() + ORPHAN_HOLD_SECONDS, 'STOP: an ended model process may leave its fleet-runner run'))
+            conn.execute("UPDATE items SET state='queued', updated_at=? WHERE state='running' AND stage NOT IN "
+                         "('patch','draft','bench')", (now(),))
+            notice(conn, 'stopped', 'STOP', f'{reason}: {killed} local process group(s) ended, ARMED removed; cancel '
+                   f'requested for {len(answers) - len(unresolved)} run(s)/job(s); not confirmed: '
+                   f'{", ".join(unresolved) or "none"}. Runs and jobs stay live until a poll sees them end. '
+                   'life-ctl unstop removes STOP; life-ctl arm is needed again; nothing cancelled restarts by itself.')
+    except sqlite3.Error as exc:
+        log(f'STOP: the registry could not record the stop: {exc}')
+    log(f'STOP: asked {len(answers)} cancel(s), ended {killed}, not confirmed {len(unresolved)}')
+    return len(answers) - len(unresolved), unresolved
+
+
+# ------------------------------------------------------------------------------------------- platform contract
+
+CONTRACT = (                                      # (file, regex, the fact LIFE relies on); LIFE.md section 17
+    ('symblicos/autogen.py', r"run_id = 'autogen-' \+ hashlib\.sha256\(request_id\.encode\(\)\)\.hexdigest\(\)\[:24\]",
+     'run id derivation'),
+    ('symblicos/autogen.py', r"if row\['request_digest'\] != request_digest:",
+     'a repeated start with the same request id and the same statements and policy returns the existing run'),
+    ('symblicos/autogen.py', r"ADMITTED_ENGINES = \([^)]*'agy'", 'agy admitted for autogen'),
+    ('symblicos/autogen.py', r"TERMINAL = \{'completed', 'failed', 'cancelled', 'unknown', 'stuck'\}", 'terminal run states'),
+    ('symblicos/autogen.py', r"os\.path\.isdir\(os\.path\.join\(cwd, '\.git'\)\)", 'cwd must be a git workspace'),
+    ('symblicos/autogen.py', r"^CHECK_TIMEOUT = 120$", 'policy checks time out at 120 s'),
+    ('symblicos/autogen.py', r"'base': base, 'policy': policy, 'lines': lines,", 'a run row carries its base, policy (with sha256) and lines'),
+    ('symblicos/autogen.py', r"base = \{'engine': engine, 'model': body\.get\('model'\) or '', 'effort': body\.get\('effort'\) or '', 'node': node,",
+     'the run base names its engine, node and cwd'),
+    ('symblicos/autogen.py', r"if row\['status'\] not in \('completed', 'failed', 'cancelled'\) and not row\['cancel_requested'\]:",
+     'autogen cancel only REQUESTS the end of a run (and answers ok for an ended one)'),
+    ('symblicos/autogen.py', r"def sandbox_prefix\(folder, home, extra_files=\(\)\):", 'the Landlock check sandbox exists'),
+    ('symblicos_engine.py', r"result = \{'version': symblic_autogen\.VERSION, 'limits': symblic_autogen\.LIMITS,\s*'defaults': symblic_autogen\.DEFAULTS",
+     'the autogen catalogue answers version and defaults'),
+    ('symblic_autogen.py', r"^VERSION = 1$", 'autogen policy version 1'),
+    ('symblic_autogen.py', r"'agents_max': \(1, 96\)", 'agents_max limits'),
+    ('symblic_autogen.py', r"def normalize\(spec, \*, engines=\(\), nodes=\(\)\)", 'normalize signature'),
+    ('symblic_autogen.py', r"policy\['sha256'\] = digest\(\{k: v for k, v in policy\.items\(\) if k not in \('engines', 'nodes'\)\}\)",
+     'the policy sha256 excludes engines and nodes'),
+    ('symblic_autogen.py', r"'perpetual': False, 'checks': \{\}, 'final': \[\], 'hidden': \[\], 'syntax': True, 'require_change': True,",
+     'defaults of the flagless fields (perpetual, final, hidden, syntax, require_change)'),
+    ('symblic_autogen.py', r"'until_done': False, 'novelty_limit': 2, 'self_split': True, 'designer': False, 'saturation': 0,",
+     'defaults of the flagless fields (until_done, designer)'),
+    ('symblic_autogen.py', r"'interval_seconds': 900,\s*'feedback_chars': 2000,", 'defaults of the flagless fields (interval_seconds, feedback_chars)'),
+    ('symblic_autogen.py', r"^FAILURE_CLASSES = \('INFRASTRUCTURE', 'REFUSAL', 'NO_OUTPUT',", 'attempt failure labels'),
+    ('symblic_autogen.py', r"\\b\(\?:the previous\|the last\|as before\|like above\|earlier\)\\b", 'lint back-reference words'),
+    ('bin/symblic-task', r"'--novelty-limit', '--saturation'\}", 'start flags'),
+    ('bin/symblic-task', r"def cmd_autogen_get", 'autogen get'),
+    ('bin/symblic-task', r"def cmd_autogen_control\(action, o, args\):", 'autogen cancel'),
+    ('bin/symblic-task', r"raise ApiError\(f'HTTP \{e\.code\}", 'an HTTP error from start exits REFUSED (1) and prints HTTP <code>'),
+    ('bin/symblic-task', r"def cmd_catalog\(o\):\n    d = request\('catalog'\)\n    if o\.get\('json'\):\n        print\(json\.dumps\(d, indent=2",
+     'catalog --json prints the catalogue object (nodes[].id, online, ready)'),
+    ('bin/symblic-task', r"d = request\('workspace/create', \{'name': args\[0\]\}\)", 'workspace NAME creates a symblicos workspace'),
+    ('bin/symblic-task', r"Where a statement names the folder \{cwd\}, use the same relative path inside your checkout",
+     'remote agents map the host workspace path into their own checkout'),
+    ('bin/symblic', r"p\.add_argument\('--max-calls'", 'symblic run --max-calls'),
+    ('bin/symblic', r"p\.add_argument\('--ollama-limits'", 'symblic run --ollama-limits'),
+    ('bin/symblic', r"p\.add_argument\('--input', action='append'", 'symblic run --input NAME=VALUE (JSON or text)'),
+    ('bin/symblic', r"p\.add_argument\('--dir'", 'symblic run --dir'),
+    ('bin/symblic', r"p\.add_argument\('--json', action='store_true'", 'symblic run --json'),
+    ('symblic_run.py', r"by = self\._opt\(s, 'by', env\)\n\s+if by is None:\n\s+by = self\.defaults\.get\('applicator'\) or self\.opts\.get\('by'\)",
+     'ask-level by wins over --by'),
+    ('symblic_run.py', r"signal\.signal\(signal\.SIGTERM, on_signal\)", 'symblic run stops its calls on SIGTERM'),
+    ('symblic_run.py', r"return \{'program': self\.program, 'status': self\.status, 'error': self\.error,",
+     'the run report carries status and error'),
+    ('symblic_run.py', r"'asks': self\.asks, 'calls': self\.calls,", 'the run report counts calls'),
+    ('symblic_run.py', r"self\.status = 'done'", 'a finished run reports status done'),
+    ('symblic_run.py', r"row = \{'kind': s\.k, 'line': s\.line, 'label': label, 'value': S\.to_plain\(value\),",
+     'a return output carries kind and value'),
+    ('symblic_apply.py', r"THERMAL_HOT, THERMAL_COOL, THERMAL_TTL = 85\.0, 75\.0", 'thermal thresholds'),
+    ('symblic_apply.py', r"placed = node in \('', 'auto', 'nodes'\)", 'a call named @NODE is never re-placed (thermal only refuses)'),
+    ('symblic_apply.py', r"os\.environ\.get\('SYMBLIC_CALL_WALL_S'\)", 'SYMBLIC_CALL_WALL_S sets the call wall'),
+    ('symblic_apply.py', r"cancelled = ba\.cancel\(\{'id': row\['id'\]\}\)", 'a stopped call cancels its fleet-runner run'),
+    ('fleet_runner.py', r"def _check_capacity\(run: dict, kind: str, node_id: str, account: str, cfg: dict\)",
+     'one model process per node'),
+    ('fleet_runner.py', r"^def cancel\(run: dict\) -> bool:", 'the fleet runner run cancel'),
+    ('local_research.py', r'def read_page\(url: str, chars: int = PAGE_CHARS\) -> str:', 'read_page'),
+    ('local_research.py', r"\+ \('\\n\[…page continues…\]' if len\(text\) > chars else ''\)", 'read_page continuation marker'),
+    ('local_research.py', r"^def _denied\(url: str\) -> str:", 'the research URL deny rule'),
+    ('local_research.py', r"^def page_text\(html: str\) -> str:", 'HTML to text'),
+    ('local_research.py', r"^def pdf_text\(data: bytes", 'PDF to text'),
+    ('local_research.py', r"'timeout': STEP_TIMEOUT, 'role': run_label", 'research generations read STEP_TIMEOUT at call time'),
+    ('local_research.py', r"deadline = time\.time\(\) \+ STEP_TIMEOUT \+ 120", 'a generation is polled STEP_TIMEOUT + 120 s'),
+    ('local_research.py', r"row = ba\.launch\(req\)", 'research generations go through fleet_runner.launch'),
+    ('local_research.py', r"^def research\(question: str, model: str = DEFAULT_MODEL, node: str = DEFAULT_NODE, max_tools: int = MAX_TOOLS,\n\s+log=None, gen=None, stop=None\) -> dict:",
+     'research signature (stop is checked before every generation)'),
+    ('local_research.py', r"for _ in range\(max_tools \+ 2\):", 'research makes at most max_tools + 2 generations'),
+    ('local_research.py', r"return \{'model': model, 'node': node, 'answer': answer, 'sources': sources, 'steps': steps,",
+     'research returns answer, sources and steps'),
+    ('bin/local-research', r"p\.add_argument\('--list'", 'local-research --list (model inventory)'),
+    ('bin/local-research', r"print\(f\"\{t\['node'\]:10\} \{t\['model'\]:28\}", 'the inventory line is <node> <model> <size>'),
+    ('deep_research.py', r"def safe_fetch\(url: str, max_hops: int = 5, binary: bool = False,", 'safe_fetch: at most 5 hops'),
+    ('deep_research.py', r"out = \{'status': r\.status_code, 'url': cur, 'ctype': ctype,", 'safe_fetch returns the HTTP status'),
+    ('deep_research.py', r"raise RuntimeError\(f'that file is larger than the \{max_bytes // 1048576\}MB cap'\)", 'safe_fetch: a byte cap'),
+    ('deep_research.py', r"raise RuntimeError\('too many redirects'\)", 'safe_fetch: refuses past its redirect limit'),
+    ('landlock_sandbox.py', r"if a in \('--ro', '--rx', '--rw', '--cwd'\) and i \+ 1 < len\(argv\):", 'sandbox path flags'),
+    ('landlock_sandbox.py', r"if a in \('--require', '--no-unix', '--net-bind-ephemeral'\):", 'sandbox --require/--no-unix'),
+    ('landlock_sandbox.py', r"if a == '--net-connect' and i \+ 1 < len\(argv\):", 'sandbox --net-connect'),
+    ('landlock_sandbox.py', r"NET_ABI_ERROR = 'network rules need Landlock ABI 4'", 'a kernel without network rules is refused'),
+    ('landlock_sandbox.py', r"UDP \(DNS\) and Unix sockets are not network rules", 'the sandbox does not block UDP (GAP 15)'),
+    ('bin/devcheck', r"bin/devcheck --changed BASE", 'devcheck --changed BASE'),
+    ('scripts/devcheck.py', r"r = git\(root, 'diff', '-U0', '--no-color', '--no-ext-diff', '--no-renames', base, '--'\)",
+     'devcheck --changed BASE diffs the working tree (uncommitted changes included) against BASE'),
+    ('scripts/devcheck.py', r"say\(f'devcheck: \{what\}: \{len\(ctx\.changes\)\} file\(s\)'", 'devcheck prints how many files it checks'),
+    ('cluster_engine.py', r"if route == 'map':", 'cluster map route'),
+    ('cluster_engine.py', r"^CMD_TIMEOUT_MAX = 3600", 'a map job timeout is at most 3600 s'),
+    ('cluster_engine.py', r"^OUT_HEAD = 40_000", 'a job keeps the first 40000 bytes of each node output'),
+    ('cluster_engine.py', r"shlex\.quote\(cmd\.replace\('\{\{item\}\}', '\"\$1\"'\) \+ ' 2>&1'\)", 'map passes {{item}} as "$1"'),
+    ('cluster_engine.py', r"'label': str\(data\.get\('label'\) or ''\)\[:80\],", 'map stores the label in meta.label'),
+    ('cluster_engine.py', r"_fanout_job\('map', targets, make, meta, timeout, heavy=True\)", 'map is a job'),
+    ('cluster_engine.py', r"'out': _head\(body\),", 'a job keeps each node output under out[node].out'),
+    ('cluster_engine.py', r"limit = _int\(handler\.get_query_param\('limit'\), 40, 1, 200\)", 'jobs listing pages of 200'),
+    ('cluster_engine.py', r"handler\.send_json\(\{'jobs': page, 'total': len\(rows\), 'offset': offset,", 'the jobs listing gives total'),
+    ('cluster_engine.py', r"'ts': int\(time\.time\(\)\)\}\)", 'status ts is the answer time'),
+    ('cluster_engine.py', r"'online': online,", 'status rows carry online as a boolean'),
+    ('cluster_engine.py', r"'memAvailMiB': int\(v\['memavail'\] / 1048576\)", 'vitals.memavail is in bytes'),
+    ('cluster_engine.py', r"for key in \('cpu', 'temp', 'uptime', 'volts'\):", 'vitals.cpu and vitals.temp are numbers'),
+    ('cluster_engine.py', r"TENANT_STACKS = \{'node-h': \('protected service stack'", 'node-h hosts the protected service stack'),
+    ('host_routes.py', r"route in \('job/cancel', 'jobs/cancel'\)", 'job cancel route'),
+    ('host_routes.py', r"handler\.send_json\(\{'success': ok,", 'job cancel answers success (a request, not an end)'),
+    ('host_routes.py', r"\('queued', 'running', 'done', 'failed', 'cancelled', 'unknown'\)", 'job statuses'),
+    ('cluster_highpower.py', r"route=='state'", 'highpower state route'),
+    ('cluster_highpower.py', r"'restUntil':rest_until\(s\),'cool':cool", 'highpower view: restUntil and cool'),
+    ('cluster_highpower.py', r"isinstance\(s\.get\('started'\),\(int,float\)\):return 0", 'restUntil is 0 when no rest is pending'),
+    ('cluster_highpower.py', r"s\.get\('phase'\) not in \('off','applying','active','partial','restoring','restore_pending'\)",
+     'highpower phase values'),
+    ('agent_hub.py', r"'node': str\(r\['id'\]\)\.startswith\('node'\), 'ready': ready, 'notes': notes,", 'catalog ready per engine'),
+    ('agent_hub.py', r"REMOTE_ENGINES = \([^)]*'agy'", 'agy runs remotely'),
+    ('agent_hub.py', r"worktree add -q \{q\(wt\)\} \{q\(git\[\"branch\"\]\)\}", 'a worker node agent checkout is a full worktree of the branch'),
+    ('restart-host.sh', r"\S", 'the operator restart script life-ctl apply names exists'),
+)
+
+
+def contract_problems():
+    """The platform facts LIFE relies on, checked from the source text (no import with side effects). Any problem
+    holds all new work and opens a `contract` notice. Recovery: read the platform change; if LIFE's assumption still
+    holds, update the matching CONTRACT row here and LIFE.md section 17 together, run VALIDATE.sh (must end STATIC
+    PASS), re-arm (the kit hash changed), and run life-ctl.py contract (must print 'contract holds'); the hold clears
+    at the next tick. If the fact changed by accident, revert the platform change instead."""
+    out = []
+    for rel, pattern, what in CONTRACT:
+        path = os.path.join(REPO, rel)
+        try:
+            with open(path, encoding='utf-8') as handle:
+                text = handle.read()
+        except OSError as exc:
+            out.append(f'{what}: cannot read {rel}: {exc.strerror}')
+            continue
+        if not re.search(pattern, text, re.M):
+            out.append(f'{what}: pattern not found in {rel}')
+    return out
+
+
+# ------------------------------------------------------------------------------------------- generated documentation
+
+LIMITS_LINE_RX = re.compile(r'^([A-Z_][A-Z0-9_]*(?:, [A-Z_][A-Z0-9_]*)*) = (.+?)\s+#\s+(.+)$')
+
+
+def limits_rows():
+    """[(names, shown value, meaning)] of every line of this module's limits block, read from this file's own text.
+    LIFE.md section 13 is exactly these rows; VALIDATE.sh check 13 compares. A limits line without a trailing comment
+    raises ValueError (every number has a written meaning)."""
+    with open(os.path.abspath(__file__), encoding='utf-8') as handle:
+        src = handle.read()
+    block = src.split('# ' + '-' * 91 + ' limits\n', 1)[1].split('# ' + '-' * 91 + ' small helpers', 1)[0]
+    rows = []
+    for line in block.splitlines():
+        if not line.strip() or line.startswith('#'):
+            continue
+        m = LIMITS_LINE_RX.match(line)
+
+
+[This is part 20 of 21. Reply only with the word RECEIVED.]

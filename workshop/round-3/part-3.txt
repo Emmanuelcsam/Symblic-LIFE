@@ -1,0 +1,247 @@
+[LIFE round-3 critique packet, part 3 of 14]
+
+since bin/ and scripts/ cannot change — and the focused test under `/usr/bin/python3`); or the staged diff after
+the gate differs from the one before it. A pass writes `STATE/bundles/patches/<patch_id>/{patch.diff,meta.json}`
+(`patch_id = first 16 hex of sha256(diff)`; meta records the base, files, classes and the diff's sha256), a
+`patches` row (`bundled`) and an immune review item, in one transaction, then resets the clone. A diff that
+was already bundled before ends the finding `owner` (notice `patch_repeat`).
+
+`path_class` (code, from the paths alone): `tests` (tests/), `docs` (docs/**/*.md), `restart_gated` (any
+`.py`, `bin/`, `.service`, `.timer`, `.sh`), `live_static` (.html .js .mjs .css .json .svg .png .webp .ico .txt
+.webmanifest), `other` (anything else), or `mixed`. The operator sees it at apply.
+
+### 7.5 immune — `review` (slot), canaries (code)
+
+`review-patch.sym` with the bounded diff text (at most 6000 bytes; a larger or missing diff goes to the operator
+unreviewed: the patch or proposal state becomes `owner`, notice `review_owner`), `change_class`, `path_class`,
+`checks_passed` and the `objective` computed by code (the finding text, or the lesson quoted as data). The record
+must echo the subject id. `accept` → patch `ready` + notice `patch_ready` (or proposal `ready` + `proposal_ready`);
+`reject` → `rejected`; `needs_work` → `rejected`, and for a patch whose finding has had fewer than 2 review
+rounds, the finding is re-queued at `patch` with a new attempt number and the reviewer's reason as `review_note`
+(at the second round: notice `finding_owner`). A proposal's needs_work is a rejection: its lesson is not
+re-queued (the operator may send it again as a command). **Canaries** (`checks/canaries.txt`, exactly nine
+`bin/symblic check` lines and `life-check.py registry`, which runs `PRAGMA integrity_check` and
+`foreign_key_check`): hourly and at once while none ever passed, argv without a shell, 60 s per line, 600 s per
+round. Any failure holds all new work until a later round passes (`life-ctl.py canaries` runs one now).
+Quarantine is section 9.
+
+### 7.6 selfdev — `draft` (agent run) → `gate` (host); needs SELFDEV_ARMED
+
+A web- or model-derived lesson waits for the operator's approval (section 6). Before a run, the workspace's
+`genome/` AND `genome-base/` are both made equal to the active release and committed; the run records that
+release (`base_release`) and that commit (`base_commit`). `organs/selfdev.lines.txt` asks the agent to change
+only the quoted instruction text that ends the program's ask lines, keeping every placeholder name, every
+other line and genome-base. Checks: `bin/symblic check genome/P.sym` and `life-check.py genome-protected
+genome/P.sym genome-base/P.sym` (both files inside the staging checkout; the base travels with the run, so the
+check compares the proposal with the release it started from), and the verify line. **gate**: the active
+release must still be `base_release` (else `abstained`, "release changed during the draft", no failure); the
+run must have changed exactly `genome/P.sym` (plus the excluded root control files); then the protected-line
+rule against the release (`life_common.genome_protected_problems`: the files have the same number of lines;
+every line is byte-identical except ask lines whose indentation, name, type — enum descriptions included —
+and trailing from/with clause are identical and whose instruction, the LAST quoted string before ` from `,
+changed while keeping exactly the same `{name}` placeholders; notes are protected; at least one instruction
+changed), and `bin/symblic check`. A pass bundles `STATE/bundles/proposals/<proposal_id>/` with
+`proposal_id = first 16 hex of sha256(lesson item id + "\n" + sha256(new text))` and queues an immune review.
+A proposal never takes effect until the operator runs `life-ctl.py adopt` (a new release). Acceptance rules,
+budgets, gates, placement and STOP are not in the genome, so selfdev cannot weaken them; whether a proposal
+makes a program better is the operator's judgement until recorded fixtures exist (GAP 9).
+
+### 7.7 compute — `propose` (slot) → `rank` (slot) → `bench` (slot; a cluster job)
+
+Needs a valid operator `control/benchmarks.json` (version 2; else items wait with notice `benchmarks_missing`).
+Each benchmark (`bench_problems`): exactly `{id ([a-z0-9-]{2,40}, unique), description (10..600 characters),
+cmd (contains {{item}}, <= 2000 characters), param_rx (a valid regular expression), baseline (matches param_rx
+and [A-Za-z0-9._:+-]{1,64}), unit ([A-Za-z/%]{1,12}), timeout (integer 30..300 s per run), better ("lower" or
+"higher"), min_gain_pct (integer 1..90)}`; an invalid entry is skipped (notice `benchmarks_invalid`), duplicate
+ids or duplicate JSON keys invalidate the file. Each run of `cmd` must print exactly one line
+`LIFE_RESULT <number> <unit>` (number: 1..12 digits, optionally a point and 1..9 digits, no sign, no exponent).
+**The model never writes a command and never sets the pass rule.**
+- **propose**: `propose-experiment.sym` with the seed text and the catalogue → code strips quotes, backticks
+  and a final period from the answers, takes the last word of a parameter that does not match whole, and requires
+  an existing benchmark id, a parameter matching its `param_rx` AND `[A-Za-z0-9._:+-]{1,64}` and different from the
+  baseline, and a hypothesis of 20..300 characters; `experiment_id = first 16 hex of sha256(sha256 of the template
+  entry + "\n" + param)` (a changed template is a new experiment); a repeated experiment is `abstained`.
+- **rank**: `rank-experiment.sym` → measured only when `feasible` is true AND `risk` is `low` AND `score >= 60`;
+  else the item is `done` as ineligible. The model's labels can only decline; the bounds below are code.
+- **bench**: code first records the job intent (label `life-<experiment_id>-<attempt>`, the bench budget charged),
+  then `POST /api/cluster/map` with `cmd = "timeout --kill-after=10 T nice -n 15 prlimit --as=4294967296
+  --fsize=2147483648 --nofile=256 sh -c '<the operator's cmd with {{item}} as "$1">' life-bench {{item}}"` (GNU
+  timeout signals the whole process group, so a compound command is bounded too), `items = [baseline, param]`
+  three times (baseline first, alternating), `targets = [the cell's node]`, `parallel = 1`, `timeout = 6T + 60`.
+  The map route passes each item as `"$1"` (never shell text). The node takes no other LIFE work while the job
+  runs. A refused submit is infra; a submit with no answer is looked up by its label in the jobs listing.
+  **Scoring** (exact decimals): the job must be `done` with exactly 6 `LIFE_RESULT` lines in the template's unit,
+  every value above 0; pair k = (baseline_k, candidate_k); gain_k = (baseline − candidate) / baseline × 100 when
+  lower is better, else (candidate − baseline) / baseline × 100; passed when every gain is above 0 AND the median
+  gain is at least `min_gain_pct`. Results keep every measurement and gain. A passed experiment opens an
+  `experiment_passed` notice: adopting a new way to compute or store is the operator's decision (the template
+  descriptions say what a timing does not measure, such as compression ratio or durability). A job past
+  `timeout + 300` s is cancelled and fails. LIFE never enables high-power mode; nothing here changes power settings.
+
+### 7.8 database — `draft` (agent run) → `apply` (host)
+
+A web- or model-derived request waits for the operator's approval (section 6). Before a run the workspace's
+`schema-snapshot.sql` is made equal to organism.sqlite3's CREATE statements (ordered by type, then name) and
+committed; its sha256 is rendered into check 0, so an edited snapshot fails the check.
+`migration_id = <4-digit number>_<slug>`: number = 1 + the largest number in the `migrations` table or in any
+database item's payload (the tick is the only writer, under the lock; refused ids are never reused); slug = the
+request's lowercase ASCII words joined by `_`, cut to 30 characters, `table` when empty; after 9999 the organ
+holds with notice `migration_numbers`. The agent writes `migrations/<id>.sql` and nothing else. Check 0:
+`life-check.py migration migrations/<id>.sql schema-snapshot.sql <sha256>`. **apply**: the run must have changed
+exactly that file; the text must pass `life_common.migration_problems` against the organism's CURRENT schema:
+at most 16384 bytes; statements split by a tokenizer that respects quoted literals (literal contents kept
+exactly, `--` comments and `;` recognised only outside literals); 1..24 statements, each exactly one of
+`CREATE TABLE IF NOT EXISTS org_x (...)`, `CREATE [UNIQUE] INDEX IF NOT EXISTS org_x ON org_y (...)`,
+`ALTER TABLE org_x ADD COLUMN c TYPE ...`; no statement whose first three words include DROP, DELETE,
+UPDATE, INSERT, REPLACE, ATTACH, DETACH, PRAGMA, VACUUM, TRIGGER, VIEW, REINDEX or ANALYZE; no call of
+load_extension, readfile, writefile, fts*, zipfile, edit or sqlar_*; every REFERENCES names an org_ table;
+every created table or index name and every added column is new; the whole applies twice in memory on the
+snapshot with the same resulting schema. Then: a backup copy `organism-before-<id>.sqlite3`, one transaction
+applying every statement plus a `schema_migrations` row, the text kept in `STATE/bundles/migrations/<id>.sql`,
+a commit of the file in the workspace, a `migrations` registry row and a `migration_applied` notice. A migration
+id already in `schema_migrations` with the same sha256 (a crash after the organism commit) is recovered as
+applied; with another sha256 it is refused. The control registry is a different file, so no migration can touch
+control state.
+
+**What "creates databases" means in v2.1 (decision).** The database organ grows the organism database's schema
+from data requests; LIFE writes no rows into `org_` tables (no model-generated DML exists anywhere). Filling a
+table is an operator action or a later typed adapter (GAP 13).
+
+### 7.9 Agent runs (codebase patch, selfdev draft, database draft)
+
+- **Policy** (every LIFE agent run, `policies/<organ>.json`, checked by `agent_policy_problems`):
+  `perpetual false, until_done false, candidates 1, regenerate 2, depth 0, children 2, generations 1,
+  agents_max 4, attempt_seconds 900, wall_seconds 3600, novelty_limit 2, saturation 0, strategies
+  [fresh, feedback], syntax true, require_change true, self_split false, designer false, final [],
+  hidden []` and exactly the organ's checks (`life_common.AGENT_CHECKS`) on statements 0 and 1. So: no engine
+  or node rotation, no internal splitting (`self_split false` and bounded-mode `depth 0` make `decide` never
+  decompose), at most 4 agents per run (statement 0 can use 3, leaving statement 1 at least 1).
+  `generations 1` is the platform minimum; a remote handoff request is refused by the platform ("remote handoff
+  unsupported") and counts as a failed attempt. bin/symblic-task has flags for every field except perpetual,
+  until_done, syntax, require_change, designer, final and hidden: those equal `symblic_autogen.DEFAULTS`
+  (pinned by the contract, and compared with the RUNNING server's `/api/symblicos/autogen/catalog` defaults each
+  armed tick). `VALIDATE.sh` feeds `policy_flags()` through bin/symblic-task's own `parse` and `autogen_policy`
+  and requires the normalised sha256 to equal LIFE's.
+- **Statements**: rendered from the active release's template with exactly the organ's fields, each FULLY matching
+  its exact form (`life_common.PLACEHOLDERS`) and free of credential-shaped values; free text passes `lint_safe`
+  (the lint back-reference words "the previous", "the last", "as before", "like above", "earlier" become "the
+  prior", "the final", "as stated", "as stated", "before"); the result must be exactly two statements, each naming
+  the workspace, each at most 1400 characters, linting with ZERO findings (`symblic_autogen.lint` with the
+  workspace as root). The templates write the workspace as the literal absolute prefix
+  `/home/operator/symblicos/projects/life-<organ>-` followed by `{ws_id}` (= `<depth>-<8hex>`), so even the raw
+  template text names an absolute folder and lints with ZERO findings without a root. A remote agent maps that
+  path into its own checkout (the platform's run note: "Where a statement names the folder {cwd}, use the same
+  relative path inside your checkout", pinned by the contract).
+- **Submit**: `request_id = life-<organ>-<depth>-<hex8>-<item 16hex>-<attempt>` (the full cell identity);
+  expected `run_id = autogen-<first 24 hex of sha256(request_id)>`. A `runs` row (`submitting`, with the release,
+  base commit, statements sha256 and policy sha256) and the day's agent-run budget are committed BEFORE
+  `bin/symblic-task start --lines SNAPSHOT --root WS --cwd WS --node NODE --engine agy --id REQUEST_ID --json` plus
+  `policy_flags`. The CLI reads the snapshot file at submit time, so the snapshot is evidence. Exit 0: the next
+  poll confirms the run. Any other exit, refusals included (a 5xx after the server stored the run also exits 1):
+  LIFE asks the API for the expected run id: 404 → `not_submitted` (the item is re-queued with a new attempt;
+  failed after 3 starts); a run → kept, confirmed by the next poll; no answer → `submit_unknown`, polled until
+  the server answers, never resubmitted meanwhile. A confirmed run's server policy sha256 must equal LIFE's
+  (`symblic_autogen.normalize(policy)['sha256']`, which excludes engines and nodes); otherwise the run is
+  cancelled and its item goes to the operator (notice `policy_mismatch`).
+- **Placement**: the cell's node only, and only when that node is available (section 10) and the task-engine
+  catalogue (`bin/symblic-task catalog --json`) reports `ready.agy` true there; otherwise notice `agy_not_ready`
+  and wait. Never another node, never the host. At most 2 LIFE runs in `submitting`, `live` or `submit_unknown`
+  fleet-wide, 1 per cell, 12 a UTC day. A cell with a queued or running gate, apply or confirm item starts no run.
+- **Collection**: `completed` → the next stage. A run LIFE cancelled at 4500 s → `failed` (the cell's failure
+  streak grows). `failed`/`stuck`/`cancelled`/`unknown` (and a live run the server no longer knows): when every
+  attempt failure is non-semantic (INFRASTRUCTURE, REFUSAL, CANCELLED, CONFLICT, FETCH_FAILURE, TIMEOUT), or a
+  cancelled or unknown run has no attempt failure at all, it is infrastructure (re-queued with a new attempt; operator
+  after 6); otherwise the item fails and the cell's `failures_in_a_row` grows. The workspace is reset after every
+  failed run.
+- **verify.txt**: its bytes are exactly one line plus at most one LF — codebase `finding=<16hex> test=<test_id>`,
+  selfdev `proposal=<16hex> program=<name>`, database `migration=<id>` — checked by `life-check.py verify-line`.
+
+## 8. Light models: ladders, the program contract, escalation
+
+**Ladders** (`organs/organs.json`, release-managed; models drawn from those the authoring pass found on the five
+LIFE worker nodes with `bin/local-research --list`). The tick re-reads that inventory once a day (`meta.models`); at plan
+time it uses the cell's rung model or the next rung up that is installed on the node, and with none installed it
+skips the item there with notice `model_absent` (an unreadable inventory never blocks; the infra counters bound
+what follows).
+
+| program | rung 0 | rung 1 |
+|---------|--------|--------|
+| classify-command | llama3.2:1b | qwen3:4b-instruct |
+| triage-error | qwen2.5-coder:3b | qwen3:4b-instruct |
+| extract-source | qwen3:4b-instruct | — |
+| distill-lesson | llama3.2:1b | qwen3:4b-instruct |
+| propose-experiment | qwen3:4b-instruct | — |
+| rank-experiment | llama3.2:1b | qwen3:4b-instruct |
+| review-patch | qwen2.5-coder:3b | qwen3:4b-instruct |
+| reproduce | llama3.2:1b | qwen3:4b-instruct |
+| assign-item | qwen2.5:0.5b | llama3.2:1b |
+| local-research | qwen3:4b-instruct | — |
+
+**The program contract.** The tick runs, from cwd STATE with a fixed environment (PATH, HOME, LANG,
+`PYTHONDONTWRITEBYTECODE=1`, `SYMBLIC_THERMAL=1`, `SYMBLIC_CALL_WALL_S=900`, `DASH_URL`, nothing inherited; extra
+keys may never override these):
+
+```
+bin/symblic run STATE/release/<n>/genome/P.sym --by ollama:MODEL@NODE --json --max-calls 12 \
+  --ollama-limits '{"num_predict": 320, "timeout_seconds": 240}' --dir STATE/calls/<call_id> \
+  --input NAME=<JSON-encoded value> ...
+```
+
+in its own process group, ended at 900 s (SIGTERM, then SIGKILL 30 s later); stdout and stderr go to temporary
+files (1 MiB and 64 KiB kept; a process writing more than 16 MiB is ended). Genome asks carry no `by`: an
+ask-level `by` would win over `--by` (`symblic_run.Run._apps`), so the code chooses model and node. Values are
+JSON-encoded so text stays text. Every call goes through the fleet runner (`symblic_apply` → `fleet_runner.launch`),
+which allows one model process per node (`fleet_runner._check_capacity`) and waits up to 1800 s for a busy node;
+LIFE adds at most one program run per node per tick and requires `memAvailMiB >= 2048 + the model's size + 1024`
+(0.5b 400, 1b 1300/900, 3b 1900, 4b 2600 MiB; 1024 MiB is the context allowance) before a call. Every genome
+answer is at most 40 words, so 320 tokens per call suffice. Each program's worst-case model calls (votes x
+attempts, an `ensure ... else retry` counting against the ask's retries) is written in its `note` and is at most
+12; `--max-calls 12` is the hard bound either way.
+
+**Outcome classification** (code): exit 0 with `status done`, exactly one returned record, and (classify,
+triage, extract, review) the record echoing the subject it was asked about → `done`. No JSON, a timeout, or an
+error whose kind is `unavailable`/`capacity`/`timeout` or whose message matches the infrastructure pattern →
+`infra`: the item stays queued, the node is held 1800 s (so at least the next tick skips it), `infra_runs`
+grows (operator at 6), nothing counts against the cell. Anything else → `failed`.
+
+**Escalation and tuning** (per item, per cell): a `failed` item retries at the next rung (at most 2 extra
+rungs). Past the top it fails, the cell's `failures_in_a_row` grows, and code files one selfdev lesson per
+program per release (code-written text, taint code: "The program P failed at every rung of its ladder on a K
+input; make its ask instructions clearer for small models."). Each cell keeps, per program, a base rung and a
+window of its last 10 outcomes (b = done at base, e = needed escalation, f = failed): 5 or more e/f in the last
+10 moves the base rung up; 10 b in a row moves it down one (the cheapest model that works); a move clears the
+window; a rung beyond a shortened ladder is read as its top. A successful answer at any stage resets the cell's
+failure streak (a cell that answers is healthy); abstentions reset it too; infra and operator endings leave it.
+This is how cells learn efficiently without a model deciding anything about itself. "done" means the answer was
+well-formed and passed code's checks; whether it was right is what review, gates, quote checks and the operator
+decide downstream.
+
+## 9. Reproduction
+
+The full protocol is `spawn/PROTOCOL.md`. Summary: code decides eligibility (active, 0 failures, depth < 10,
+workable backlog >= the organ's `divide_backlog` for 3 armed ticks, organ + 1 <= 3 live cells, organism + 1 <=
+16, births + 2 <= 8 a day, no open division fleet-wide, 6 h after an abort, organ efficiency >= 0.2, a second
+worker node available); the reproducer names two foci; assign-item sorts up to 16 items (4 per tick; the rest, and
+every failed answer, by the parity of sha256(item_id)); commit re-checks the organism-wide rules, creates agent
+workspaces first, then one transaction births both children (child a on the parent's worker node, child b on another),
+moves the items and retires the parent (`divided`).
+`cell_id = <organ>.<depth>.<first 8 hex of sha256(parent + "\n" + letter + "\n" + focus)>`; seeds are
+`<organ>.0.00000000`. A repeated lineage key aborts the division; a division open 3 h aborts. Endings:
+apoptosis after 86400 s empty and idle when a sibling remains; quarantine after 8 failed items in a row (the
+operator releases; an organ's only cell is released once automatically after 24 h at the top rung); operator retire;
+a workspace that cannot be re-created 3 times. A cell whose worker node has reported offline for 6 h moves to another.
+
+**Dispatch keeps the children different.** Every unassigned queued item goes to the active cell of its organ
+whose focus shares the most routing words with the item's label (words of 4 or more letters after `norm_text`;
+at least one shared word), else, and on ties, to the cell with the fewest queued-or-running items, then the
+lowest cell id. So a "research porous ceramic structure questions" child keeps receiving ceramic foams questions.
+The organism therefore grows where workable work piles up, shrinks where it is idle, never below one cell per
+organ, and never past the heat, budget and placement limits.
+
+## 10. Metabolism (the governor)
+
+Every tick reads `GET /api/cluster/status` (60 s; per node `id`, `online` (must be the boolean true),
+`vitals.cpu` = percent busy 0..100, `vitals.temp` °C, `vitals.memavail` bytes; a value that is missing, not a
+
+
+[This is part 3 of 14. Reply only with the word RECEIVED.]

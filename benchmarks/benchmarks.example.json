@@ -1,0 +1,27 @@
+{
+  "version": 2,
+  "benchmarks": [
+    {
+      "id": "zlib-level",
+      "description": "Seconds for Python zlib to compress 64 MiB of generated mixed text at level N, median of five runs (time.perf_counter); no file is written. Compression ratio is not measured: a faster level may compress less.",
+      "cmd": "python3 -c 'import zlib,time,statistics,sys; n=int(sys.argv[1]); data=(b\"life organism \"*400+bytes(range(256)))*17000; data=data[:67108864]; ts=[]\nfor _ in range(5):\n s=time.perf_counter(); zlib.compress(data,n); ts.append(time.perf_counter()-s)\nprint(\"LIFE_RESULT %.4f s\" % statistics.median(ts))' {{item}}",
+      "param_rx": "^[1-9]$",
+      "baseline": "6",
+      "unit": "s",
+      "timeout": 300,
+      "better": "lower",
+      "min_gain_pct": 10
+    },
+    {
+      "id": "sqlite-journal",
+      "description": "Seconds to insert 200000 rows into a fresh SQLite file with journal mode N (DELETE, WAL, MEMORY, TRUNCATE), median of five runs, in a temporary folder removed even on failure. Durability differs between modes and is not measured.",
+      "cmd": "python3 -c 'import sqlite3,tempfile,time,statistics,sys; m=sys.argv[1]; ts=[]\nfor _ in range(5):\n with tempfile.TemporaryDirectory() as d:\n  c=sqlite3.connect(d+\"/t.db\")\n  try:\n   c.execute(\"PRAGMA journal_mode=\"+m); c.execute(\"CREATE TABLE t(a,b)\"); s=time.perf_counter(); c.executemany(\"INSERT INTO t VALUES(?,?)\",((i,str(i)) for i in range(200000))); c.commit(); ts.append(time.perf_counter()-s)\n  finally:\n   c.close()\nprint(\"LIFE_RESULT %.4f s\" % statistics.median(ts))' {{item}}",
+      "param_rx": "^(DELETE|WAL|MEMORY|TRUNCATE)$",
+      "baseline": "DELETE",
+      "unit": "s",
+      "timeout": 300,
+      "better": "lower",
+      "min_gain_pct": 10
+    }
+  ]
+}

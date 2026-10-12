@@ -1,0 +1,398 @@
+                '-p', 'MemoryMax=4G', '-p', 'CPUQuota=200%', '-p', f'TasksMax={L.SCOPE_TASKS_MAX}',
+                '-p', f'RuntimeMaxSec={timeout + 15 + L.KILL_GRACE}', '--nice=19', '--',
+                *L.sandbox_argv(os.getcwd(), home, inner, rx=rx, env_extra=env)]
+        child = subprocess.Popen(argv, start_new_session=True, close_fds=True, stdin=subprocess.DEVNULL, env=L.scope_env())
+        try:
+            rc = child.wait(timeout=timeout + 15)
+        except subprocess.TimeoutExpired:
+            kill_group()
+            child.wait()
+            print(f'life-check: the sandboxed command passed {timeout} s', file=sys.stderr)
+            return 1
+        kill_group()                       # descendants left in the group end with it
+        if rc == 125:
+            return 125
+        if rc != 0:
+            print(f'life-check: the sandboxed command failed (rc {rc})', file=sys.stderr)
+            return 1
+        return 0
+    finally:
+        shutil.rmtree(home, ignore_errors=True)
+        L.shm_cleanup(shm0)
+
+
+def main(argv):
+    if not argv:
+        print(__doc__)
+        return 2
+    cmd, args = argv[0], argv[1:]
+    try:
+        if cmd == 'sandboxed' and args:
+            return sandboxed(args)
+        if cmd == 'verify-line' and len(args) >= 3 and args[0] in L.VERIFY_LINES:
+            problems = L.verify_line_problems(args[0], read_inside(args[1], L.VERIFY_MAX_BYTES), ' '.join(args[2:]))
+        elif cmd == 'migration' and len(args) == 3:
+            snapshot = read_inside(args[1], L.SNAPSHOT_MAX_BYTES)
+            if L.sha(snapshot.decode('utf-8')) != args[2]:
+                return fail('schema-snapshot.sql differs from the snapshot LIFE wrote (never edit it)')
+            problems = L.snapshot_problems(snapshot.decode('utf-8'))
+            problems += L.migration_problems(read_inside(args[0], L.MIGRATION_MAX_BYTES).decode('utf-8'),
+                                             snapshot.decode('utf-8')) if not problems else []
+        elif cmd == 'genome-protected' and len(args) == 2:
+            if not all(a.startswith(('genome/', 'genome-base/')) and a.endswith('.sym') for a in args):
+                return fail('the files must be genome/<program>.sym and genome-base/<program>.sym')
+            new = read_inside(args[0], L.GENOME_MAX_BYTES).decode('utf-8')
+            problems = L.genome_protected_problems(read_inside(args[1], L.GENOME_MAX_BYTES).decode('utf-8'), new)
+            problems += L.genome_placement_problems(new)
+            if os.path.basename(args[0])[:-4] in L.SELFDEV_PROTECTED:
+                problems.append('this program is protected from selfdev')
+        elif cmd == 'registry' and not args:
+            conn = L.connect(readonly=True)
+            rows = [r[0] for r in conn.execute('PRAGMA integrity_check')]
+            fks = conn.execute('PRAGMA foreign_key_check').fetchall()
+            problems = ([] if rows == ['ok'] else ['integrity_check: ' + '; '.join(rows)[:300]]) + \
+                       ([f'foreign_key_check: {len(fks)} dangling reference(s)'] if fks else [])
+        else:
+            print(__doc__)
+            return 2
+    except (OSError, ValueError, UnicodeDecodeError) as exc:
+        return fail(str(exc)[:300])
+    except Exception as exc:  # noqa: BLE001 - any other fault is a failed check, never a pass
+        return fail(f'{type(exc).__name__}: {str(exc)[:300]}')
+    if problems:
+        return fail('; '.join(problems)[:600])
+    print('life-check: pass')
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))
+
+===== FILE: bin/life-status.py =====
+#!/usr/bin/env python3
+"""LIFE status for the operator. Read-only: opens the registry with mode=ro inside ONE read transaction (one consistent
+registry snapshot), reads the control switches separately, writes nothing, calls nothing.
+
+    life-status.py           control, governor, budgets, live cells, live runs, open notices
+    life-status.py --json    the same as one JSON object
+
+Exit 0 when the registry and the control files were read; 1 UNKNOWN (not seeded, a seed that did not finish, a
+registry schema other than life_common.SCHEMA_VERSION, not exactly one governor-or-none and one active release row,
+the registry unreadable, or ARMED malformed or unreadable: an unknown grant is never shown as an ordinary disarm): no
+traceback, no invented state; 2 usage (any argument but --json, or more than one). The registry and the control switches are two samples, each with its
+own time (registry_sampled_at, control_sampled_at); when ARMED, STOP or FREEZE changes while the registry is read, the
+control is read again once and the output says so.
+Every string from the registry, identifiers included, is printed through life_common.one_line (control
+characters removed, length capped); the JSON columns of the governor (hot, reasons, node_rest) are decoded first and
+--json keeps them as JSON lists and objects.
+"""
+import sys
+sys.dont_write_bytecode = True                  # no .pyc is ever written under bin/ (kit_sha256 hashes __pycache__)
+import json  # noqa: E402
+import os  # noqa: E402
+import sqlite3  # noqa: E402
+import time  # noqa: E402
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import life_common as L  # noqa: E402
+
+
+def age(t):
+    if not t:
+        return 'never'
+    s = max(0, L.now() - int(t))
+    return f'{s}s ago' if s < 2 * 60 else f'{s // 60}m ago' if s < 2 * L.HOUR else f'{s // L.HOUR}h ago'
+
+
+def clean(row, limit=300):
+    return {k: (L.one_line(v, limit) if isinstance(v, str) else v) for k, v in dict(row).items()}
+
+
+def governor_view(gov):
+    """The governor row with its JSON columns decoded (a column that does not decode is shown as UNKNOWN)."""
+    out = clean(gov)
+    for key in ('hot', 'reasons', 'node_rest'):
+        try:
+            out[key] = json.loads(gov[key])
+        except (TypeError, ValueError):
+            out[key] = 'UNKNOWN'
+    return out
+
+
+def main(argv):
+    if argv not in ([], ['--json']):
+        print('usage: life-status.py [--json]')
+        return 2
+    try:
+        ctl_before = L.control_state()
+        conn = L.connect(readonly=True)
+        conn.execute('BEGIN')
+        gov = conn.execute('SELECT * FROM governor WHERE id=1').fetchone()
+        rel = conn.execute('SELECT release FROM releases WHERE active=1').fetchone()
+        budget = conn.execute('SELECT * FROM budget WHERE day=?', (L.utc_day(),)).fetchone()
+        cells = conn.execute("SELECT * FROM cells WHERE state != 'retired' ORDER BY organ, cell_id").fetchall()
+        queued = {r[0]: r[1] for r in conn.execute("SELECT cell_id, COUNT(*) FROM items WHERE state='queued' GROUP BY cell_id")}
+        runs = conn.execute("SELECT * FROM runs WHERE state IN ('submitting','live','submit_unknown') ORDER BY submitted_at").fetchall()
+        notes = conn.execute("SELECT * FROM notices WHERE state='open' ORDER BY at").fetchall()
+        unassigned = conn.execute("SELECT COUNT(*) FROM items WHERE state='queued' AND cell_id IS NULL").fetchone()[0]
+        meta = {r['key']: r['value'] for r in conn.execute("SELECT key, value FROM meta WHERE key IN ('tick_no','fault_hold',"
+                                                            "'canary_failed','codebase_branch','schema','seed_complete',"
+                                                            "'working_tick_no')")}
+        releases = conn.execute('SELECT COUNT(*) FROM releases WHERE active=1').fetchone()[0]
+        conn.execute('COMMIT')
+        if meta.get('schema') != L.SCHEMA_VERSION or meta.get('seed_complete') != '1' or releases != 1:
+            raise ValueError(f'registry schema {meta.get("schema")!r}, seed_complete {meta.get("seed_complete")!r}, '
+                             f'{releases} active release(s): not a finished seed of this kit')
+        armed_state, _armed = L.armed_read()
+        if armed_state in ('malformed', 'unreadable'):
+            raise ValueError(f'control/ARMED is {armed_state}')
+        registry_at = L.now()
+        conn.close()
+        ctl_after = L.control_state()
+        reread = {k: ctl_before[k] for k in ('stop', 'freeze', 'armed')} != {k: ctl_after[k] for k in ('stop', 'freeze', 'armed')}
+        ctl = L.control_state() if reread else ctl_after
+        control_at = L.now()
+    except (sqlite3.Error, OSError, ValueError) as exc:
+        print(f'LIFE status UNKNOWN: {L.one_line(str(exc), 200)}')
+        return 1
+    data = {'at': L.now(), 'registry_sampled_at': registry_at, 'control_sampled_at': control_at,
+            'control_changed_while_reading': reread, 'control': ctl, 'release': rel[0] if rel else None, 'tick_no': meta.get('tick_no'), 'codebase_branch': L.one_line(meta.get('codebase_branch'), 100),
+            'fault_hold': L.one_line(meta.get('fault_hold'), 200), 'canary_failed': L.one_line(meta.get('canary_failed'), 300),
+            'governor': governor_view(gov) if gov else None, 'budget': dict(budget) if budget else None,
+            'working_tick_no': meta.get('working_tick_no'),
+            'cells': [dict(clean(c, 120), queued=queued.get(c['cell_id'], 0)) for c in cells], 'unassigned': unassigned,
+            'runs': [clean(r) for r in runs], 'notices': [clean(n) for n in notes]}
+    if argv == ['--json']:
+        print(json.dumps(data, indent=1, sort_keys=True, default=str))
+        return 0
+    state = ('STOP' if ctl['stop'] else 'frozen' if ctl['freeze'] else 'armed' if ctl['admit']
+             else 'armed, KIT, PLATFORM OR DECISIONS CHANGED (observe only)' if ctl['armed'] else 'disarmed (observe only)')
+    print(f'LIFE {time.strftime("%Y-%m-%d %H:%M:%S")}  release {data["release"]}  tick {L.one_line(data["tick_no"], 12)}  {state}'
+          f'  selfdev {"armed" if ctl["selfdev"] else "off"}  codebase branch {data["codebase_branch"]}')
+    if data['fault_hold'] or data['canary_failed']:
+        print(f'  HOLD: {data["fault_hold"] or ""} {data["canary_failed"] or ""}')
+    g = data['governor']
+    if g:
+        print(f'  governor {g["state"]} (sampled {age(g["at"])}): {g["continuous_seconds"]}s loaded, {g["quiet_seconds"]}s quiet, '
+              f'hot {L.one_line(json.dumps(g["hot"]), 80)}, resting {L.one_line(json.dumps(g["node_rest"]), 80)}, '
+              f'reasons {L.one_line(json.dumps(g["reasons"]), 200)}')
+    if budget:
+        print(f'  today: program runs {budget["program_runs"]}/{L.PROGRAM_RUNS_PER_DAY}, model calls {budget["model_calls"]}/'
+              f'{L.MODEL_CALLS_PER_DAY}, agent runs {budget["agent_runs"]}/{L.AGENT_RUNS_PER_DAY}, bench jobs '
+              f'{budget["bench_jobs"]}/{L.BENCH_JOBS_PER_DAY}, births {budget["births"]}/{L.BIRTHS_PER_DAY}')
+    print(f'  cells ({len(cells)} live, {unassigned} unassigned item(s)):')
+    for c in data['cells']:
+        print(f'    {c["cell_id"]:24} {c["state"]:11} {c["node"]:7} queued {c["queued"]:4} done {c["items_done"]:5} '
+              f'fail-run {c["failures_in_a_row"]}  {L.one_line(c["focus"], 60)}')
+    for r in data['runs']:
+        print(f'  run {r["run_id"]} {r["state"]} {r["organ"]} on {r["node"]} submitted {age(r["submitted_at"])}')
+    for n in data['notices']:
+        print(f'  notice {n["notice_id"]} x{n["count"]} {n["kind"]}: {n["subject"]}: {n["text"]}')
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))
+
+===== FILE: bin/life-fetch.py =====
+#!/usr/bin/env python3
+"""LIFE source fetch: one URL through the platform's safe path, printed as ONE JSON object. No model.
+
+    life-fetch.py URL
+
+local_research._denied(URL) (the research deny rule) -> deep_research.safe_fetch (http(s) only, every resolved address
+global, every redirect re-validated, robots honoured, a byte cap) -> the HTTP status is classified HERE, before any
+text is used: 2xx -> text; 401, 403, 404, 410, 451 and every other non-2xx status not listed next -> refused; 408, 425,
+429 and 5xx -> error (transient). The URL is fetched ONCE, as bytes (binary=True), and the parser is chosen from that
+same response: a PDF (by its content type or path) goes through local_research.pdf_text, anything else is decoded
+with the charset its content type names (else UTF-8, undecodable bytes replaced) and HTML through
+local_research.page_text. The text is cut to SOURCE_TEXT_CHARS. Prints {"ok": true, "text": ...} or {"ok": false,
+"kind": "refused" | "error", "detail": ...}: refused = the safe path or the status said no (RuntimeError/ResearchError:
+robots, address, size, type) or an unknown fault; error = a transient network fault (OSError, URLError, timeout) or a
+transient status, which LIFE retries as infra. Run by bin/life-tick.py with the dashboard's .venv Python (bs4/pypdf),
+-I -B, a fixed environment, FETCH_TIMEOUT s, in its own life-fetch-*.scope with MemoryMax FETCH_MEMORY and prlimit --as.
+"""
+import sys
+sys.dont_write_bytecode = True                  # no .pyc is ever written under bin/ (kit_sha256 hashes __pycache__)
+import codecs  # noqa: E402
+import json  # noqa: E402
+import os  # noqa: E402
+import re  # noqa: E402
+import urllib.parse  # noqa: E402
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+import life_common as L  # noqa: E402
+
+TRANSIENT = {408, 425, 429}
+
+
+def classify(status):
+    """'ok' | 'error' | 'refused' for an HTTP status."""
+    if isinstance(status, int) and 200 <= status <= 299:
+        return 'ok'
+    if isinstance(status, int) and (status in TRANSIENT or 500 <= status <= 599):
+        return 'error'
+    return 'refused'
+
+
+def main(argv):
+    if len(argv) != 1 or not argv[0].startswith(('http://', 'https://')):
+        print(json.dumps({'ok': False, 'kind': 'refused', 'detail': 'usage: life-fetch.py http(s)://URL'}))
+        return 0
+    url = argv[0]
+    sys.path.insert(0, L.REPO)
+    try:
+        import deep_research as D
+        import local_research as R
+        why = R._denied(url)
+        if why:
+            raise RuntimeError(why)
+        got = D.safe_fetch(url, binary=True)
+        kind = classify(got.get('status'))
+        if kind != 'ok':
+            print(json.dumps({'ok': False, 'kind': kind, 'detail': f'HTTP {got.get("status")}'}))
+            return 0
+        ctype = str(got.get('ctype') or '').lower()
+        data = got.get('data') or b''
+        if 'pdf' in ctype or urllib.parse.urlsplit(url).path.lower().endswith('.pdf') or data[:5] == b'%PDF-':
+            text = R.pdf_text(data)
+        else:
+            m = re.search(r'charset=([A-Za-z0-9._-]{1,40})', ctype)
+            enc = m.group(1) if m else 'utf-8'
+            try:
+                codecs.lookup(enc)
+            except LookupError:
+                enc = 'utf-8'
+            text = data.decode(enc, 'replace')
+            if 'html' in ctype or text.lstrip()[:1] == '<':
+                text = R.page_text(text)
+        text = re.sub(r'\n{3,}', '\n\n', text).strip()
+        print(json.dumps({'ok': True, 'text': text[:L.SOURCE_TEXT_CHARS]}))
+    except (OSError, TimeoutError) as exc:           # URLError and socket timeouts are OSError subclasses
+        print(json.dumps({'ok': False, 'kind': 'error', 'detail': f'{type(exc).__name__}: {str(exc)[:200]}'}))
+    except Exception as exc:  # noqa: BLE001 - RuntimeError/ResearchError refusals and anything unknown: never retried
+        print(json.dumps({'ok': False, 'kind': 'refused', 'detail': f'{type(exc).__name__}: {str(exc)[:200]}'}))
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))
+
+===== FILE: bin/life-research.py =====
+#!/usr/bin/env python3
+"""LIFE research run: one question, one light model, one worker node, printed as ONE JSON object. Calls a model only when
+bin/life-tick.py runs it (a node slot); importing it does nothing.
+
+    life-research.py --model MODEL --node NODE --question TEXT
+
+Wraps local_research.research (search through SearXNG on the host, page reads through the safe-fetch path, every
+generation through fleet_runner.launch on NODE) with LIFE's bounds: RESEARCH_TOOLS tool uses, RESEARCH_STEP_TIMEOUT
+seconds per generation (local_research.STEP_TIMEOUT is read at call time), and at most RESEARCH_GENERATIONS model
+launches: a further launch raises model_call_limit and the run reports that error. It writes no report into the live
+checkout (bin/local-research would write local_research_data/). Every launch is recorded with SIGTERM and SIGINT
+blocked, so a signal arriving during a launch is handled only once the new run id is recorded; on SIGTERM or SIGINT it
+cancels every fleet-runner run it started (fleet_runner.cancel) before exiting, so a killed research run never keeps a
+worker node's only Ollama slot; every OTHER exit (an exception, a normal return) also cancels, in a bounded final phase, every
+the fleet runner run it started (cancelling an ended run is harmless). Prints exactly {"model", "node", "answer", "sources":
+[{"url", "title"}], "steps", "error"}: steps = the number of model launches it made (LAUNCHES). The platform's result
+is validated before anything is converted: a result that is not an object, an answer that is not a string, a source
+list that is not a list of objects with a string url, or a steps value that is not a list is the error
+"contract: ..." (the tick records a contract outcome), never coerced. A URL longer than URL_MAX is dropped, never
+shortened; titles are cut to 200 characters (display only). The question is passed as the operative text the operator
+wrote (life_common.plain_line: control characters and runs of white space only; braces and backticks kept).
+"""
+import sys
+sys.dont_write_bytecode = True                  # no .pyc is ever written under bin/ (kit_sha256 hashes __pycache__)
+import argparse  # noqa: E402
+import json  # noqa: E402
+import os  # noqa: E402
+import signal  # noqa: E402
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+import life_common as L  # noqa: E402
+
+STARTED = []
+LAUNCHES = [0]
+
+
+def main(argv):
+    p = argparse.ArgumentParser(prog='life-research.py')
+    p.add_argument('--model', required=True)
+    p.add_argument('--node', required=True, choices=L.NODES)
+    p.add_argument('--question', required=True)
+    a = p.parse_args(argv)
+    sys.path.insert(0, L.REPO)
+    import fleet_runner as ba
+    import local_research as lr
+    launch = ba.launch
+    masked = {signal.SIGTERM, signal.SIGINT}
+
+    def tracked_launch(req, *args, **kwargs):
+        if LAUNCHES[0] >= L.RESEARCH_GENERATIONS:
+            raise RuntimeError(f'model_call_limit: more than {L.RESEARCH_GENERATIONS} generations')
+        LAUNCHES[0] += 1
+        signal.pthread_sigmask(signal.SIG_BLOCK, masked)
+        try:
+            row = launch(req, *args, **kwargs)
+            if isinstance(row, dict) and row.get('id'):
+                STARTED.append(row['id'])
+        finally:
+            signal.pthread_sigmask(signal.SIG_UNBLOCK, masked)
+        return row
+
+    def cancel_started():
+        for rid in list(STARTED):
+            try:
+                ba.cancel({'id': rid})
+            except Exception:  # noqa: BLE001 - best effort; the fleet runner's unit RuntimeMaxSec bounds it anyway
+                pass
+
+    def on_term(signum, _frame):
+        cancel_started()
+        os._exit(128 + signum)
+
+    ba.launch = tracked_launch
+    lr.STEP_TIMEOUT = L.RESEARCH_STEP_TIMEOUT
+    signal.signal(signal.SIGTERM, on_term)
+    signal.signal(signal.SIGINT, on_term)
+    out = {'model': a.model, 'node': a.node, 'answer': '', 'sources': [], 'steps': 0, 'error': ''}
+    try:
+        res = lr.research(L.plain_line(a.question, L.QUESTION_CHARS), a.model, a.node, L.RESEARCH_TOOLS)
+        sources = res.get('sources') if isinstance(res, dict) else None
+        if not isinstance(res, dict):
+            out['error'] = 'contract: research returned no result object'
+        elif not isinstance(res.get('answer', ''), str) or not isinstance(res.get('error', ''), (str, type(None))):
+            out['error'] = 'contract: the answer or error is not a string'
+        elif not isinstance(sources, list) or not all(isinstance(s, dict) and isinstance(s.get('url'), str) for s in sources):
+            out['error'] = 'contract: the sources are not a list of objects with a string url'
+        elif not isinstance(res.get('steps', []), list):
+            out['error'] = 'contract: steps is not a list'
+        else:
+            out['answer'] = (res.get('answer') or '')[:L.ANSWER_CHARS]
+            out['sources'] = [{'url': s['url'], 'title': str(s.get('title') or '')[:200]}
+                              for s in sources if len(s['url']) <= L.URL_MAX][:20]
+            out['error'] = (res.get('error') or '')[:300]
+    except Exception as exc:  # noqa: BLE001 - reported as the research error (LIFE classifies it)
+        out['error'] = f'{type(exc).__name__}: {str(exc)[:300]}'
+    finally:
+        signal.pthread_sigmask(signal.SIG_BLOCK, masked)
+        cancel_started()                     # every exit path settles every run it started
+    out['steps'] = LAUNCHES[0]
+    print(json.dumps(out))
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))
+
+===== FILE: bin/life_common.py =====
+"""LIFE v2.3 shared contract: paths, limits, identities, validators, the process runner and the loopback adapter.
+
+Imported by bin/life-tick.py, bin/life-ctl.py, bin/life-status.py, bin/life-check.py, bin/life-research.py and
+bin/life-fetch.py. Inert on import: importing this module reads nothing, writes nothing and starts nothing.
+Every number here is the single definition LIFE.md section 13 tabulates: the table is generated from the limits block
+
+
+[This is part 17 of 26. Do not critique yet. Reply only with the word RECEIVED.]

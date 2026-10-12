@@ -1,0 +1,9 @@
+program LIFE item assignment.
+use profile=verified, context=none, determine=false, solve=false.
+note Part of the reproducer. One queued item and the two child foci in, one side out. The tiniest rung suffices: a two-way closed choice. Code assigns at most four items per node slot this way (life_common.ASSIGN_PER_SLOT) and at most sixteen per division; the rest are split by the parity of sha256(item_id). Worst case 3 calls.
+given focus_a: Text.
+given focus_b: Text.
+given item_text: Text.
+ask side: one of {a: "the item fits the first focus better", b: "the item fits the second focus better"} "Which focus fits this item better? First: {focus_a}. Second: {focus_b}. Item: {item_text}" from item_text, focus_a, focus_b with effort=low, retries=2
+let assignment = {side: side}.
+return assignment.

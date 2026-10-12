@@ -1,0 +1,223 @@
+[LIFE round-2 critique packet, part 8 of 8]
+
+    return flags
+
+
+def autogen_run_id(request_id):
+    """symblicos/autogen.py submit: run_id = 'autogen-' + sha256(client_request_id)[:24]."""
+    return 'autogen-' + hashlib.sha256(request_id.encode()).hexdigest()[:24]
+
+
+# ------------------------------------------------------------------------------------------- code-owned classifiers
+
+RESTART_GATED_RX = re.compile(r'\.py$|(^|/)bin/|\.(service|timer|sh)$')
+LIVE_STATIC_RX = re.compile(r'\.(html|js|mjs|css|json|svg)$')
+
+
+def path_class(files):
+    """Code decides how a patch reaches the operator, from the paths alone (the model's class never overrides)."""
+    classes = set()
+    for f in files:
+        if f.startswith('tests/'):
+            classes.add('tests')
+        elif f.startswith('docs/') and f.endswith('.md') or (f.endswith('.md') and '/' not in f):
+            classes.add('docs')
+        elif RESTART_GATED_RX.search(f):
+            classes.add('restart_gated')
+        else:
+            classes.add('live_static')
+    if len(classes) == 1:
+        return classes.pop()
+    return 'mixed'
+
+
+MIGRATION_RX = re.compile(
+    r'^(CREATE TABLE IF NOT EXISTS org_[a-z0-9_]{1,40} \(.+\)|'
+    r'CREATE (UNIQUE )?INDEX IF NOT EXISTS org_[a-z0-9_]{1,40} ON org_[a-z0-9_]{1,40} \([a-z0-9_, ]+\)|'
+    r'ALTER TABLE org_[a-z0-9_]{1,40} ADD COLUMN [a-z0-9_]{1,40} [A-Z]+( [^;]*)?)$', re.S)
+MIGRATION_DENY_RX = re.compile(r'(?i)\b(DROP|DELETE|UPDATE|INSERT|REPLACE|ATTACH|DETACH|PRAGMA|VACUUM|TRIGGER|VIEW|'
+                               r'load_extension|readfile|writefile)\b')
+
+
+def migration_statements(sql_text):
+    text = re.sub(r'--[^\n]*', '', sql_text or '')
+    return [re.sub(r'\s+', ' ', s).strip() for s in text.split(';') if s.strip()]
+
+
+def migration_problems(sql_text, snapshot_sql=''):
+    """An organism migration is valid only when every statement is one of the three additive forms, names
+    only org_ tables, uses no denied word, and applies cleanly twice in memory on top of the snapshot."""
+    out = []
+    if len((sql_text or '').encode('utf-8')) > 16384:
+        return ['migration is larger than 16384 bytes']
+    statements = migration_statements(sql_text)
+    if not 1 <= len(statements) <= 24:
+        out.append('a migration has 1..24 statements')
+    for s in statements:
+        if MIGRATION_DENY_RX.search(s):
+            out.append(f'denied word in: {s[:80]}')
+        elif not MIGRATION_RX.match(s):
+            out.append(f'not an allowed additive form: {s[:80]}')
+    if out:
+        return out
+    db = sqlite3.connect(':memory:')
+    try:
+        if snapshot_sql:
+            db.executescript(snapshot_sql)
+        for s in statements:
+            try:
+                db.execute(s)
+            except sqlite3.OperationalError as exc:
+                if s.startswith('ALTER TABLE') and 'duplicate column' in str(exc):
+                    continue
+                out.append(f'sqlite refused: {exc}')
+    finally:
+        db.close()
+    return out
+
+
+ASK_RX = re.compile(r'^ask ([a-z_][a-z0-9_]*): (.+?) "((?:[^"\\]|\\.)*)"(.*)$')
+
+
+def genome_protected_problems(old_text, new_text):
+    """A selfdev proposal may change only the quoted instruction of ask lines (and note lines). Every other
+    line, and every ask's name, type and trailing from/with clause, must stay byte-identical and in order."""
+    old = [ln for ln in (old_text or '').splitlines() if ln.strip()]
+    new = [ln for ln in (new_text or '').splitlines() if ln.strip()]
+    if len(old) != len(new):
+        return ['the number of nonblank lines changed']
+    out, changed = [], 0
+    for n, (a, b) in enumerate(zip(old, new), 1):
+        if a == b:
+            continue
+        if a.startswith('note ') and b.startswith('note '):
+            continue
+        ma, mb = ASK_RX.match(a), ASK_RX.match(b)
+        if not (ma and mb) or (ma.group(1), ma.group(2), ma.group(4)) != (mb.group(1), mb.group(2), mb.group(4)):
+            out.append(f'line {n}: only an ask instruction or a note may change')
+        else:
+            changed += 1
+    if not out and changed == 0:
+        out.append('no ask instruction changed')
+    return out
+
+
+VERIFY_LINES = {
+    'codebase': re.compile(r'^finding=[0-9a-f]{16} test=tests\.[A-Za-z0-9_.]+$'),
+    'selfdev': re.compile(r'^proposal=[0-9a-f]{16} program=[a-z-]+$'),
+    'database': re.compile(r'^migration=[0-9]{4}_[a-z0-9_]{1,40}$'),
+}
+
+
+def verify_line_problems(organ, text, expected):
+    lines = [ln for ln in (text or '').splitlines() if ln.strip()]
+    if len(lines) != 1:
+        return ['verify.txt must hold exactly one nonblank line']
+    if not VERIFY_LINES[organ].match(lines[0].strip()):
+        return ['verify.txt line has the wrong form']
+    if lines[0].strip() != expected:
+        return ['verify.txt names a different item']
+    return []
+
+
+# ------------------------------------------------------------------------------------------- loopback adapter
+
+
+class Telemetry(Exception):
+    pass
+
+
+def http_json(path, body=None, timeout=30):
+    """GET (body None) or POST JSON to the loopback dashboard with bin/symblic-task's header shape: no proxy,
+    no redirect, Host 127.0.0.1:8080. Any HTTP error, non-JSON answer or timeout raises Telemetry."""
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *args, **kwargs):
+            return None
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+    data = None if body is None else json.dumps(body).encode('utf-8')
+    req = urllib.request.Request(DASH + path, data=data, method='GET' if body is None else 'POST')
+    req.add_header('Host', '127.0.0.1:8080')
+    req.add_header('Accept', 'application/json')
+    req.add_header('User-Agent', 'life-tick')
+    if data is not None:
+        req.add_header('Content-Type', 'application/json')
+    try:
+        with opener.open(req, timeout=timeout) as res:
+            raw = res.read(8 * 1024 * 1024)
+        value = json.loads(raw.decode('utf-8'))
+    except (urllib.error.URLError, OSError, ValueError, TimeoutError) as exc:
+        raise Telemetry(f'{path}: {type(exc).__name__}: {str(exc)[:200]}') from None
+    if not isinstance(value, dict):
+        raise Telemetry(f'{path}: answer is not a JSON object')
+    return value
+
+
+def run_bounded(argv, *, timeout, cwd=None, env=None, limit=1 << 20):
+    """Run argv in its own process group; kill the group at `timeout`. Returns (rc, stdout, stderr) with each
+    output cut to `limit` bytes; rc None means the timeout fired."""
+    proc = subprocess.Popen(argv, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            start_new_session=True)
+    try:
+        out, err = proc.communicate(timeout=timeout)
+        rc = proc.returncode
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, 9)
+        except OSError:
+            pass
+        out, err = proc.communicate()
+        rc = None
+    return rc, out[:limit].decode('utf-8', 'replace'), err[:limit].decode('utf-8', 'replace')
+
+
+def child_env(extra=None):
+    """The environment every LIFE subprocess gets: no inherited secrets, fixed PATH, thermal placement on."""
+    env = {'PATH': '/usr/local/bin:/usr/bin:/bin', 'HOME': '/home/operator', 'LANG': 'C.UTF-8',
+           'PYTHONDONTWRITEBYTECODE': '1', 'DASH_URL': DASH, 'SYMBLIC_THERMAL': '1',
+           'SYMBLIC_CALL_WALL_S': str(CALL_TIMEOUT)}
+    env.update(extra or {})
+    return env
+
+
+# ------------------------------------------------------------------------------------------- platform contract
+
+
+def contract_problems():
+    """The platform facts LIFE relies on, checked from the source text (no import with side effects). Any
+    problem holds all new work and opens a notice; the operator reviews, then runs life-ctl rebase."""
+    checks = [
+        (REPO + '/symblicos/autogen.py', r"run_id = 'autogen-' \+ hashlib\.sha256\(request_id\.encode\(\)\)\.hexdigest\(\)\[:24\]",
+         'run id derivation'),
+        (REPO + '/symblicos/autogen.py', r"ADMITTED_ENGINES = \([^)]*'agy'", 'agy admitted for autogen'),
+        (REPO + '/symblicos/autogen.py', r"TERMINAL = \{'completed', 'failed', 'cancelled', 'unknown', 'stuck'\}",
+         'terminal run states'),
+        (REPO + '/symblicos/autogen.py', r"os\.path\.isdir\(os\.path\.join\(cwd, '\.git'\)\)", 'cwd must be a git workspace'),
+        (REPO + '/symblic_autogen.py', r"'agents_max': \(1, 96\)", 'agents_max limits'),
+        (REPO + '/symblic_autogen.py', r"def normalize\(spec, \*, engines=\(\), nodes=\(\)\)", 'normalize signature'),
+        (REPO + '/bin/symblic-task', r"'--novelty-limit', '--saturation'\}", 'start flags'),
+        (REPO + '/bin/symblic-task', r"def cmd_autogen_get", 'autogen get'),
+        (REPO + '/bin/symblic', r"p\.add_argument\('--max-calls'", 'symblic run --max-calls'),
+        (REPO + '/bin/symblic', r"p\.add_argument\('--ollama-limits'", 'symblic run --ollama-limits'),
+        (REPO + '/symblic_run.py', r"by = self\._opt\(s, 'by', env\)\n\s+if by is None:\n\s+by = self\.defaults\.get\('applicator'\) or self\.opts\.get\('by'\)",
+         'ask-level by wins over --by'),
+        (REPO + '/symblic_apply.py', r"THERMAL_HOT, THERMAL_COOL, THERMAL_TTL = 85\.0, 75\.0", 'thermal thresholds'),
+        (REPO + '/local_research.py', r'def read_page\(url: str, chars: int = PAGE_CHARS\) -> str:', 'read_page'),
+        (REPO + '/bin/local-research', r"p\.add_argument\('--json'", 'local-research --json'),
+        (REPO + '/cluster_engine.py', r"if route == 'map':", 'cluster map route'),
+        (REPO + '/cluster_highpower.py', r"route=='state'", 'highpower state route'),
+    ]
+    out = []
+    for path, pattern, what in checks:
+        try:
+            with open(path, encoding='utf-8') as handle:
+                text = handle.read()
+        except OSError as exc:
+            out.append(f'{what}: cannot read {path}: {exc}')
+            continue
+        if not re.search(pattern, text):
+            out.append(f'{what}: pattern not found in {os.path.relpath(path, REPO)}')
+    return out
+
+
+
+[This is part 8 of 8, the last part. You now have the full packet. Now write the full critique at maximum depth, following the critic brief in part 1 exactly: think as long as you need, numbered findings with severity, location, the exact ambiguity or defect, and the atomic fix with replacement text; end with FINDINGS_TOTAL=<n>, UNDEFINED_DETAILS=<n> on their own lines and a final line VERDICT=<CONVERGED|CHANGES NEEDED>.]

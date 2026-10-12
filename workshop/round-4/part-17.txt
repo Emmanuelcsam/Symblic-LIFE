@@ -1,0 +1,367 @@
+[LIFE round-4 critique packet, part 17 of 21]
+
+            self.conn.execute('COMMIT')
+        except sqlite3.Error:
+            if self.conn.in_transaction:
+                self.conn.execute('ROLLBACK')
+            raise
+        return False
+
+
+# Every notice kind, with its subject. The operator acknowledges a notice; acknowledging never clears the condition.
+NOTICE_KINDS = {
+    'stopped': 'STOP', 'integrity': 'state | release N | kit | platform | decisions', 'contract': 'platform',
+    'canary_failed': 'canaries', 'storage': 'state | organism | backup', 'budget': '<budget column> <UTC day>',
+    'held': 'the hold reason', 'telemetry': 'node', 'overflow': '<organ> <UTC day>', 'no_capacity': 'slots',
+    'inbox_refused': 'first 16 hex of sha256(file name)', 'agenda_invalid': 'entry id or agenda.json',
+    'agenda_skipped': 'entry id', 'command_too_long': 'command id', 'command_needs_test': 'command id',
+    'command_needs_program': 'command id', 'command_database_confirm': 'command id', 'command_heartbeat': 'command id',
+    'command_immune': 'command id', 'command_none': 'command id', 'command_merged': 'command id',
+    'command_failed': 'command id', 'command_done': 'command id', 'report_truncated': 'command id',
+    'approve_needed': 'item id', 'tracked_private_data': 'codebase', 'already_passing': 'item id',
+    'watch_timeout': 'test id', 'watch_too_slow': 'test id', 'watch_error': 'test id', 'sandbox': 'landlock',
+    'finding_owner': 'item id', 'finding_failed': 'item id', 'patch_ready': 'patch id', 'patch_test_only': 'patch id',
+    'patch_repeat': 'patch id', 'proposal_ready': 'proposal id', 'review_owner': 'item id',
+    'migration_applied': 'migration id', 'migration_numbers': 'database', 'migration_recovery_required': 'migration id',
+    'migration_imported': 'migration id', 'store_table': 'org table', 'experiment_passed': 'experiment id',
+    'benchmarks_missing': 'compute', 'benchmarks_invalid': 'benchmark id or benchmarks.json', 'bench_refused': 'experiment id',
+    'job_unknown': 'job id or label', 'job_lost': 'job label', 'agy_not_ready': 'node', 'catalogue_shape': 'catalog',
+    'inventory_shape': 'inventory', 'model_absent': '<node> <program>', 'workspace': 'workspace path',
+    'quarantine': 'cell id', 'auto_released': 'cell id', 'moved': 'cell id', 'abstain_rate': 'cell id',
+    'render': 'item id', 'run_unknown': 'run id', 'policy_mismatch': 'run id', 'infra_repeat': 'item id',
+    'tick_fault': 'exception type',
+}
+
+
+def notice(conn, kind, subject, text):
+    """Open an operator notice, or, when one with this kind and subject is already open, count the repeat
+    (count + 1, last_at, text = the newest text). notice_id = first 12 hex of sha256(kind, subject, at, 8 random
+    hex): unique per occurrence; (kind, subject) is the condition key. An unknown kind is a programming error."""
+    if kind not in NOTICE_KINDS:
+        raise ValueError(f'unknown notice kind {kind!r}')
+    subject, text = one_line(subject, 120), one_line(redact(text), 600)
+    t = now()
+    if conn.execute("UPDATE notices SET count=count+1, last_at=?, text=? WHERE kind=? AND subject=? AND state='open'",
+                    (t, text, kind, subject)).rowcount:
+        return
+    conn.execute("INSERT INTO notices (notice_id, kind, subject, text, state, at, last_at, count) VALUES (?, ?, ?, ?, 'open', ?, ?, 1)",
+                 (sha(kind, subject, t, secrets.token_hex(4))[:12], kind, subject, text, t, t))
+
+
+BUDGET_COLUMNS = ('program_runs', 'model_calls', 'agent_runs', 'bench_jobs', 'births', 'self_questions')
+METRIC_COLUMNS = ('items_done', 'items_failed', 'items_abstained', 'program_runs', 'agent_runs')
+
+
+def budget_row(conn, day=None):
+    day = day or utc_day()
+    conn.execute('INSERT OR IGNORE INTO budget (day) VALUES (?)', (day,))
+    return conn.execute('SELECT * FROM budget WHERE day=?', (day,)).fetchone()
+
+
+def budget_add(conn, column, n=1, day=None):
+    """Add n (an int >= 0) to one budget counter of `day` (the UTC day captured once by the caller)."""
+    if column not in BUDGET_COLUMNS or type(n) is not int or n < 0:
+        raise ValueError(f'budget_add {column} {n!r}')
+    day = day or utc_day()
+    budget_row(conn, day)
+    conn.execute(f'UPDATE budget SET {column}={column}+? WHERE day=?', (n, day))
+
+
+def metric_add(conn, organ, column, n=1, day=None):
+    if column not in METRIC_COLUMNS or organ not in ORGANS or type(n) is not int or n < 0:
+        raise ValueError(f'metric_add {organ} {column} {n!r}')
+    day = day or utc_day()
+    conn.execute('INSERT OR IGNORE INTO metrics (organ, day) VALUES (?, ?)', (organ, day))
+    conn.execute(f'UPDATE metrics SET {column}={column}+? WHERE organ=? AND day=?', (n, organ, day))
+
+
+def live_cells(conn, organ=None, node=None):
+    sql = "SELECT * FROM cells WHERE state IN ('active','dividing','quarantined')"
+    args = []
+    if organ:
+        sql += ' AND organ=?'
+        args.append(organ)
+    if node:
+        sql += ' AND node=?'
+        args.append(node)
+    return conn.execute(sql + ' ORDER BY cell_id', args).fetchall()
+
+
+def active_release(conn):
+    rows = conn.execute('SELECT * FROM releases WHERE active=1').fetchall()
+    if len(rows) != 1:
+        raise RuntimeError(f'{len(rows)} active releases (exactly one is required)')
+    row = rows[0]
+    return row['release'], f'{RELEASES}/{row["release"]}', json.loads(row['manifest'])
+
+
+RELEASE_DIRS = ('genome', 'organs', 'policies')
+RELEASE_KEY_RX = re.compile(r'(genome|organs|policies)/[A-Za-z0-9][A-Za-z0-9._-]{0,80}')
+
+
+def release_manifest(directory):
+    """{relative path: sha256} of every regular file directly inside genome/, organs/ and policies/."""
+    manifest = {}
+    for sub in RELEASE_DIRS:
+        for name in sorted(os.listdir(os.path.join(directory, sub))):
+            path = os.path.join(directory, sub, name)
+            if os.path.isfile(path) and not os.path.islink(path):
+                manifest[f'{sub}/{name}'] = file_sha(path)
+    return manifest
+
+
+def release_problems(directory, manifest):
+    """The release folder must hold EXACTLY genome/, organs/ and policies/ (real directories, nothing else at its
+    root), each holding only regular files (no symlink, subdirectory, FIFO or other entry), and those files must be
+    exactly the manifest's with the recorded hashes. Keys are canonical relative paths; an empty manifest is invalid."""
+    out = []
+    if not isinstance(manifest, dict) or not manifest:
+        return ['the release manifest is empty or malformed']
+    for rel in manifest:
+        if not RELEASE_KEY_RX.fullmatch(rel):
+            out.append(f'{rel}: not a canonical release path')
+    try:
+        if not stat.S_ISDIR(os.lstat(directory).st_mode):
+            return out + ['the release folder is not a real directory']
+        root = sorted(os.listdir(directory))
+        if root != sorted(RELEASE_DIRS):
+            return out + ['the release folder must hold exactly genome, organs and policies, it holds: ' + ', '.join(root)]
+        for sub in RELEASE_DIRS:
+            if not stat.S_ISDIR(os.lstat(os.path.join(directory, sub)).st_mode):
+                return out + [f'{sub} is not a real directory']
+            for name in os.listdir(os.path.join(directory, sub)):
+                if not stat.S_ISREG(os.lstat(os.path.join(directory, sub, name)).st_mode):
+                    out.append(f'{sub}/{name}: not a regular file')
+        actual = release_manifest(directory)
+    except OSError as exc:
+        return out + [f'cannot list the release: {exc}']
+    for rel in sorted(set(manifest) - set(actual)):
+        out.append(f'{rel}: missing or not a regular file')
+    for rel in sorted(set(actual) - set(manifest)):
+        out.append(f'{rel}: not in the release manifest')
+    for rel in sorted(set(actual) & set(manifest)):
+        if actual[rel] != manifest[rel]:
+            out.append(f'{rel}: sha256 differs from the release manifest')
+    return out
+
+
+# ------------------------------------------------------------------------------------------- organ config
+
+
+def load_organs(directory):
+    with open(os.path.join(directory, 'organs', 'organs.json'), encoding='utf-8') as handle:
+        data = json.load(handle, object_pairs_hook=_no_dup_keys)
+    problems = organs_problems(data)
+    if problems:
+        raise ValueError('organs.json: ' + '; '.join(problems))
+    return data
+
+
+def _no_dup_keys(pairs):
+    out = {}
+    for key, value in pairs:
+        if key in out:
+            raise ValueError(f'duplicate JSON key {key!r}')
+        out[key] = value
+    return out
+
+
+def organs_problems(data):
+    """The closed schema of organs/organs.json. Returns a list of problems (empty = valid). Every scalar's exact
+    type is checked before it is compared."""
+    out = []
+    if not isinstance(data, dict) or set(data) != {'version', 'organs', 'ladders'}:
+        return ['top level must be exactly {version, organs, ladders}']
+    if type(data['version']) is not int or data['version'] != 2:
+        out.append('version must be the integer 2')
+    organs = data['organs']
+    if not isinstance(organs, dict) or set(organs) != set(ORGANS):
+        return out + ['organs must name exactly ' + ', '.join(ORGANS)]
+    for name, spec in organs.items():
+        keys = {'kind', 'seed_node', 'seed_focus', 'divide_backlog'}
+        if not isinstance(spec, dict) or set(spec) != keys:
+            out.append(f'{name}: keys must be exactly ' + ', '.join(sorted(keys)))
+            continue
+        if spec['kind'] != ('agent' if name in AGENT_ORGANS else 'model'):
+            out.append(f'{name}: kind must be {"agent" if name in AGENT_ORGANS else "model"}')
+        if not isinstance(spec['seed_node'], str) or spec['seed_node'] not in NODES:
+            out.append(f'{name}: seed_node must be one of ' + ', '.join(NODES))
+        focus = spec['seed_focus']
+        if not isinstance(focus, str) or not 8 <= len(focus) <= 120 or one_line(focus, 120) != focus or has_secret(focus):
+            out.append(f'{name}: seed_focus is one clean line of 8..120 characters')
+        if type(spec['divide_backlog']) is not int or not 4 <= spec['divide_backlog'] <= 64:
+            out.append(f'{name}: divide_backlog is an integer 4..64')
+    ladders = data['ladders']
+    if not isinstance(ladders, dict) or set(ladders) != set(PROGRAMS) | {'local-research'}:
+        out.append('ladders must name exactly every program plus local-research')
+    else:
+        for program, ladder in ladders.items():
+            if (not isinstance(ladder, list) or not 1 <= len(ladder) <= 3
+                    or any(not isinstance(m, str) or m not in MODEL_MIB or m not in NON_THINKING_MODELS for m in ladder)):
+                out.append(f'ladder {program}: 1..3 non-thinking models drawn from ' + ', '.join(MODEL_MIB))
+            elif len(set(ladder)) != len(ladder):
+                out.append(f'ladder {program}: a model appears twice')
+    per_node = {}
+    for spec in organs.values():
+        if isinstance(spec, dict) and isinstance(spec.get('seed_node'), str) and spec['seed_node'] in NODES:
+            per_node[spec['seed_node']] = per_node.get(spec['seed_node'], 0) + 1
+    if any(n > NODE_CELL_CAP for n in per_node.values()):
+        out.append(f'seed placement puts more than {NODE_CELL_CAP} cells on one node')
+    return out
+
+
+# ------------------------------------------------------------------------------------------- item payloads
+# (kind, stage) -> (required keys, optional keys): the closed payload schema of every item at every stage (LIFE.md
+# section 6). Tick.new_item and Tick.item_update refuse any payload outside it, and any payload over PAYLOAD_MAX.
+_FINDING = {'test_id', 'finding_text', 'base_commit', 'source', 'wall_s', 'trace_files', 'trace_functions'}
+_SOURCE = {'source_key', 'url'}
+PAYLOAD_KEYS = {
+    ('command', 'classify'): ({'command_id'}, set()),
+    ('question', 'research'): ({'question', 'command_id', 'found'}, set()),
+    ('source', 'fetch'): (_SOURCE, set()),
+    ('source', 'extract'): (_SOURCE | {'text_path', 'text_sha256'}, set()),
+    ('source', 'distill'): (_SOURCE | {'text_path', 'text_sha256', 'fact_id', 'claim', 'quote'}, set()),
+    ('finding', 'confirm'): ({'test_id', 'finding_text', 'base_commit', 'source', 'command_text'}, set()),
+    ('finding', 'triage'): (_FINDING, set()),
+    ('finding', 'patch'): (_FINDING | {'change_class'}, {'review_note', 'previous_patch'}),
+    ('finding', 'gate'): (_FINDING | {'change_class'}, {'review_note', 'previous_patch'}),
+    ('patch', 'review'): ({'subject', 'patch_id'}, set()),
+    ('proposal', 'review'): ({'subject', 'proposal_id'}, set()),
+    ('lesson', 'draft'): ({'program', 'lesson'}, {'lesson_id', 'base_release', 'base_commit'}),
+    ('lesson', 'gate'): ({'program', 'lesson', 'lesson_id', 'base_release', 'base_commit'}, set()),
+    ('experiment', 'propose'): ({'seed_text'}, set()),
+    ('experiment', 'rank'): ({'seed_text', 'experiment_id'}, set()),
+    ('experiment', 'bench'): ({'seed_text', 'experiment_id'}, {'job_id', 'node', 'unit', 'started', 'timeout', 'label'}),
+    ('request', 'draft'): ({'request'}, {'migration_id', 'snapshot_sha', 'base_commit'}),
+    ('request', 'apply'): ({'request', 'migration_id', 'snapshot_sha', 'base_commit'}, set()),
+}
+
+
+def operative_sha(kind, payload):
+    """sha256 of the fields an operator approval covers: a lesson's program and text, a request's text. Any change to them
+    after approval makes the approval void (the item waits again)."""
+    return sha(kind, payload.get('program', ''), payload.get('lesson', ''), payload.get('request', ''))
+
+
+def payload_problems(kind, stage, payload):
+    """Empty when `payload` (a dict) is exactly the closed schema of (kind, stage) and its JSON fits PAYLOAD_MAX."""
+    spec = PAYLOAD_KEYS.get((kind, stage))
+    if spec is None:
+        return [f'no payload schema for {kind} at {stage}']
+    if not isinstance(payload, dict):
+        return ['the payload is not an object']
+    required, optional = spec
+    out = []
+    if required - set(payload):
+        out.append(f'{kind}/{stage} payload lacks ' + ', '.join(sorted(required - set(payload))))
+    if set(payload) - required - optional:
+        out.append(f'{kind}/{stage} payload has unknown keys ' + ', '.join(sorted(set(payload) - required - optional)))
+    if len(json.dumps(payload, sort_keys=True)) > PAYLOAD_MAX:
+        out.append(f'PAYLOAD_TOO_LARGE: over {PAYLOAD_MAX} characters')
+    return out
+
+
+# ------------------------------------------------------------------------------------------- templates
+
+SCOPES = {'comment_or_doc': 'Markdown files under docs/'}   # test_only: 'the file <module>'; local_fix: 'function bodies inside the file(s) <paths>'
+PATH_TOKEN = r'(?!(?:[^,]*/)?\.{1,2}(?:/|,|$))[A-Za-z0-9_][A-Za-z0-9_./-]{0,119}'   # no . or .. component
+PLACEHOLDERS = {                                  # every value a template may receive, and its exact (full) form
+    'kit': re.compile(re.escape(KIT)),
+    'test_id': TEST_ID_RX,
+    'finding_id': re.compile(r'[0-9a-f]{16}'),
+    'finding_text': re.compile(r'[^`{}\n]{1,700}'),
+    'scope': re.compile(r'Markdown files under docs/|(?:function bodies inside )?the files? ' + PATH_TOKEN + r'(?:, ' + PATH_TOKEN + r'){0,2}'),
+    'lesson_id': re.compile(r'[0-9a-f]{16}'),
+    'program': re.compile('|'.join(re.escape(p) for p in PROGRAMS if p not in SELFDEV_PROTECTED)),
+    'lesson': re.compile(r'[^`{}\n]{10,300}'),
+    'migration_id': re.compile(r'[0-9]{4}_[a-z0-9_]{1,40}'),
+    'request': re.compile(r'[^`{}\n]{10,600}'),
+    'snapshot_sha': re.compile(r'[0-9a-f]{64}'),
+}
+TEMPLATE_FIELDS = {
+    'codebase': ('ws', 'kit', 'test_id', 'finding_id', 'finding_text', 'scope'),
+    'selfdev': ('ws', 'kit', 'lesson_id', 'program', 'lesson'),
+    'database': ('ws', 'kit', 'migration_id', 'request', 'snapshot_sha'),
+}
+FIELD_RX = re.compile(r'\{([a-z_]+)\}')
+# Derived by render() from ws, never passed in. The statement templates write the workspace as the literal
+# absolute prefix /home/operator/symblicos/projects/life-<organ>- followed by {ws_id} (= <depth>-<hex8>), so the raw
+# template text already names an absolute folder (symblic_autogen.lint finds no warning without a root) and the
+# rendered text is exactly ws.
+DERIVED_FIELDS = ('ws_id',)
+STATEMENT_MAX = 1400                              # every rendered statement stays below lint's 1500 warning
+
+
+def ws_rx(organ):
+    return re.compile(re.escape(f'{PROJECTS}/life-{organ}-') + r'(0|[1-9]|10)-[0-9a-f]{8}')
+
+
+def render(text, organ, values):
+    """Fill a statement or policy template. Exactly the organ's fields, each FULLY matching its exact form and
+    free of credential-shaped text, plus the derived ws_id; ws must be a workspace of this organ."""
+    fields = TEMPLATE_FIELDS[organ]
+    if set(values) != set(fields):
+        raise ValueError(f'{organ} template needs exactly ' + ', '.join(fields))
+    for key, value in values.items():
+        rx = ws_rx(organ) if key == 'ws' else PLACEHOLDERS[key]
+        if not isinstance(value, str) or not rx.fullmatch(value) or has_secret(value) or (
+                key == 'test_id' and not valid_test_id(value)):
+            raise ValueError(f'{organ} template value {key} has the wrong form')
+    filled = dict(values, ws_id=values['ws'][len(f'{PROJECTS}/life-{organ}-'):])
+    used = set(FIELD_RX.findall(text))
+    if not used <= set(fields) | set(DERIVED_FIELDS):
+        raise ValueError(f'{organ} template names unknown fields: ' + ', '.join(sorted(used - set(fields) - set(DERIVED_FIELDS))))
+    return FIELD_RX.sub(lambda m: filled[m.group(1)], text)
+
+
+AGENT_POLICY_FIXED = {'version': 1, 'perpetual': False, 'until_done': False, 'candidates': 1, 'regenerate': 2,
+                      'depth': 0, 'children': 2, 'generations': 1, 'agents_max': 4, 'attempt_seconds': 900,
+                      'wall_seconds': 3600, 'interval_seconds': 900, 'feedback_chars': 2000, 'novelty_limit': 2,
+                      'saturation': 0, 'strategies': ['fresh', 'feedback'], 'syntax': True, 'require_change': True,
+                      'self_split': False, 'designer': False, 'final': [], 'hidden': []}
+# Fields bin/symblic-task has no flag for: the server fills them from symblic_autogen.DEFAULTS, so LIFE's value must
+# equal that default (contract_problems pins each one; each armed tick compares the RUNNING server's catalogue).
+DEFAULT_FIELDS = ('perpetual', 'until_done', 'syntax', 'require_change', 'designer', 'final', 'hidden',
+                  'interval_seconds', 'feedback_chars')
+LC = '/usr/bin/python3 -B {kit}/bin/life-check.py'
+AGENT_CHECKS = {                                  # the exact check commands per organ (raw, before render)
+    'codebase': {'0': [LC + ' sandboxed /usr/bin/python3 -s -B -m unittest {test_id}'],
+                 '1': [LC + ' verify-line codebase verify.txt finding={finding_id} test={test_id}']},
+    'selfdev': {'0': [REPO + '/bin/symblic check genome/{program}.sym',
+                      LC + ' genome-protected genome/{program}.sym genome-base/{program}.sym'],
+                '1': [LC + ' verify-line selfdev verify.txt lesson={lesson_id} program={program}']},
+    'database': {'0': [LC + ' migration migrations/{migration_id}.sql schema-snapshot.sql {snapshot_sha}'],
+                 '1': [LC + ' verify-line database verify.txt migration={migration_id}']},
+}
+
+
+def agent_policy_problems(policy, organ=None, raw_checks=None):
+    """Every LIFE agent run uses exactly the fixed bounded policy; its checks are exactly the organ's
+    AGENT_CHECKS (compared on the raw template when raw_checks is given)."""
+    out = []
+    if not isinstance(policy, dict) or set(policy) != set(AGENT_POLICY_FIXED) | {'checks'}:
+        return ['keys must be exactly the fixed agent policy keys plus checks']
+    for key, value in AGENT_POLICY_FIXED.items():
+        if policy.get(key) != value or type(policy.get(key)) is not type(value):
+            out.append(f'{key} must be {value!r}')
+    checks = policy.get('checks')
+    if not isinstance(checks, dict) or set(checks) != {'0', '1'} or not all(
+            isinstance(v, list) and v and all(isinstance(c, str) and c for c in v) for v in checks.values()):
+        out.append('checks must have exactly statement indexes "0" and "1", each a nonempty list of commands')
+    if organ is not None and raw_checks is not None and raw_checks != AGENT_CHECKS[organ]:
+        out.append(f'checks must be exactly life_common.AGENT_CHECKS[{organ!r}]')
+    return out
+
+
+def render_run(release_dir, organ, values):
+    """(lines, policy, sha256) for one agent run, rendered from the release: exactly two statements, each naming
+    the workspace, at most STATEMENT_MAX characters and linting with ZERO findings; the policy equal to the fixed
+    policy with the organ's exact checks, accepted by symblic_autogen.normalize."""
+    import sys
+    if REPO not in sys.path:
+        sys.path.insert(0, REPO)
+    import symblic_autogen as A
+    with open(os.path.join(release_dir, 'organs', f'{organ}.lines.txt'), encoding='utf-8') as handle:
+
+
+[This is part 17 of 21. Reply only with the word RECEIVED.]

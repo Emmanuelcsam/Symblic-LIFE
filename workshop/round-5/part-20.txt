@@ -1,0 +1,441 @@
+    """sha256 of DECISIONS.md (the operator's requirements decisions); arm records it with the operator's confirmation."""
+    return file_sha(DECISIONS_FILE)
+
+
+# Platform files LIFE executes or imports outside the server process: their bytes are recorded at arm, and a
+# different byte anywhere is an integrity hold until the operator reads the change, runs VALIDATE.sh and arms again.
+PLATFORM_PINS = ('landlock_sandbox.py', 'deep_research.py', 'local_research.py', 'bin/symblic-task', 'symblic_autogen.py',
+                 'bin/symblic', 'symblic_run.py', 'symblic_apply.py', 'fleet_runner.py', 'bin/local-research')
+# Pinned by bytes: the files LIFE's own processes execute or import on the host (the sandbox launcher, the fetch and
+# research path, the task CLI, the program runner and its fleet-runner client). The server-side files LIFE only talks to are
+# pinned by CONTRACT regexes instead (a platform edit there does not disarm LIFE unless a pinned fact changes). The
+# transitive imports of these files are not byte-pinned (GAP 18).
+
+
+def platform_sha256():
+    h = hashlib.sha256()
+    for rel in PLATFORM_PINS:
+        h.update(rel.encode() + b'\0' + file_sha(os.path.join(REPO, rel)).encode() + b'\n')
+    return h.hexdigest()
+
+
+PRIVATE_ROOTS = ('/home/operator/.ssh', '/home/operator/.config', REPO)   # never under a sandbox read-exec grant
+
+
+def state_problems():
+    """Every STATE directory must be a real directory (lstat, no symlink) owned by this uid with mode EXACTLY 0700
+    (stat.S_IMODE == 0o700: 0500 or 0000 fail too); the registry, the organism database, their -wal files and the two
+    lock files, when they exist, must be regular files owned by this uid with no group or other permission and one
+    link; and no read-exec directory the sandbox is given (devcheck_tools) may contain STATE or a PRIVATE_ROOTS path."""
+    out, uid = [], os.getuid()
+    for path in STATE_DIRS:
+        try:
+            st = os.lstat(path)
+        except OSError as exc:
+            out.append(f'{path}: {exc.strerror}')
+            continue
+        if not stat.S_ISDIR(st.st_mode):
+            out.append(f'{path} is not a real directory')
+        elif st.st_uid != uid or stat.S_IMODE(st.st_mode) != 0o700:
+            out.append(f'{path} must be owned by uid {uid} with mode exactly 0700 (it is {oct(stat.S_IMODE(st.st_mode))})')
+    for path in (REGISTRY, REGISTRY + '-wal', ORGANISM, ORGANISM + '-wal', LOCK_FILE, CONTROL_LOCK):
+        try:
+            st = os.lstat(path)
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            out.append(f'{path}: {exc.strerror}')
+            continue
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != uid or st.st_mode & 0o077 or st.st_nlink != 1:
+            out.append(f'{path} must be a regular file owned by uid {uid}, without group or other permission, with one link')
+    for d in devcheck_tools()[1]:
+        for p in (STATE,) + PRIVATE_ROOTS:
+            if p == d or p.startswith(d.rstrip('/') + '/'):
+                out.append(f'the sandbox read-exec grant {d} contains {p}')
+    return out
+
+
+def ensure_dirs():
+    for path in STATE_DIRS:
+        os.makedirs(path, mode=0o700, exist_ok=True)
+
+
+def read_owner_file(path, limit):
+    """The bytes of an operator file (control/*, an inbox file): opened with O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC (a FIFO
+    never blocks, a symlink is refused), checked ON THE OPEN DESCRIPTOR to be a regular file owned by this uid, read
+    up to `limit` bytes. Raises OSError (FileNotFoundError when absent) on any rule failure or a larger file."""
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid():
+            raise OSError(f'{os.path.basename(path)} is not a regular file owned by the operator')
+        data = b''
+        while len(data) <= limit:
+            chunk = os.read(fd, limit + 1 - len(data))
+            if not chunk:
+                break
+            data += chunk
+    finally:
+        os.close(fd)
+    if len(data) > limit:
+        raise OSError(f'{os.path.basename(path)} is larger than {limit} bytes')
+    return data
+
+
+def read_in(root, rel, limit):
+    """The bytes of a regular file `rel` inside the folder `root`, opened relative to root's descriptor one component
+    at a time with O_NOFOLLOW (a symlink anywhere, an absolute path, an empty, . or .. component is refused), checked on
+    the open descriptor (a regular file), read up to `limit` bytes; OSError on any rule failure or a larger file.
+    Nothing is checked and then reopened by name. life-check, the gates, the migration apply and traceback resolution
+    read candidate-written files only through this."""
+    parts = rel.split('/')
+    if os.path.isabs(rel) or any(p in ('', '.', '..') for p in parts):
+        raise OSError(f'{rel} must be a relative path inside the folder')
+    fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for part in parts[:-1]:
+            nxt = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            os.close(fd)
+            fd = nxt
+        ffd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
+    finally:
+        os.close(fd)
+    try:
+        if not stat.S_ISREG(os.fstat(ffd).st_mode):
+            raise OSError(f'{rel} is not a regular file')
+        data = b''
+        while len(data) <= limit:
+            chunk = os.read(ffd, limit + 1 - len(data))
+            if not chunk:
+                break
+            data += chunk
+    finally:
+        os.close(ffd)
+    if len(data) > limit:
+        raise OSError(f'{rel} is larger than {limit} bytes')
+    return data
+
+
+def write_atomic(path, data, mode=0o600):
+    """Write a new random temporary file in the same directory (O_EXCL, mode), fsync it, rename it over
+    `path`, then fsync the directory. Never follows or reuses an existing temporary path."""
+    directory = os.path.dirname(path) or '.'
+    tmp = os.path.join(directory, f'.{os.path.basename(path)}.tmp-{secrets.token_hex(8)}')
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode)
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+    fsync_dir(directory)
+
+
+def fsync_dir(directory):
+    dfd = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(dfd)
+    finally:
+        os.close(dfd)
+
+
+def publish_noreplace(src, dest):
+    """Move src to dest only if dest does not exist (os.link fails with EEXIST: never overwrites), then remove src.
+    Returns False when dest exists."""
+    try:
+        os.link(src, dest, follow_symlinks=False)
+    except FileExistsError:
+        return False
+    os.remove(src)
+    fsync_dir(os.path.dirname(dest))
+    return True
+
+
+def open_lock(path):
+    """The lock file opened for flock, created mode 0600 (never through a symlink)."""
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    return os.fdopen(fd, 'r+', encoding='utf-8')
+
+
+def log(message):
+    os.makedirs(LOGS, mode=0o700, exist_ok=True)
+    path = LOGS + '/tick.log'
+    try:
+        if os.path.getsize(path) > LOG_ROTATE_BYTES:
+            for n in (2, 1):
+                if os.path.exists(f'{path}.{n}'):
+                    os.replace(f'{path}.{n}', f'{path}.{n + 1}')
+            os.replace(path, path + '.1')
+    except OSError:
+        pass
+    line = f'{time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())} {one_line(redact(str(message)), 600)}'
+    try:
+        with open(path, 'a', encoding='utf-8', opener=lambda p, f: os.open(p, f, 0o600)) as handle:
+            handle.write(line + '\n')
+    except OSError:
+        pass                                   # a full disk never blocks STOP or a tick's own handling
+    print(line, flush=True)
+
+
+# ------------------------------------------------------------------------------------------- control
+ARMED_KEYS = ('boot_id', 'kit_sha256', 'platform_sha256', 'decisions_sha256')
+HEX64_RX = re.compile(r'[0-9a-f]{64}')
+BOOT_ID_RX = re.compile(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
+
+
+def armed_read():
+    """(state, data): 'absent' (no ARMED), 'valid' (exactly {"boot_id": a canonical boot id, "kit_sha256",
+    "platform_sha256", "decisions_sha256": 64 lowercase hex each}, strict JSON: unique keys, at most 1024 bytes, a
+    regular operator file read without following a link), 'malformed' or 'unreadable'. Only 'valid' can arm."""
+    try:
+        raw = read_owner_file(ARMED_FILE, 1024)
+    except FileNotFoundError:
+        return 'absent', None
+    except OSError:
+        return 'unreadable', None
+    try:
+        data = strict_json(raw.decode('ascii'))
+    except (ValueError, UnicodeDecodeError):
+        return 'malformed', None
+    if not (isinstance(data, dict) and set(data) == set(ARMED_KEYS) and all(isinstance(v, str) for v in data.values())
+            and BOOT_ID_RX.fullmatch(data['boot_id'])
+            and all(HEX64_RX.fullmatch(data[k]) for k in ARMED_KEYS if k != 'boot_id')):
+        return 'malformed', None
+    return 'valid', data
+
+
+def read_armed():
+    """The ARMED object when it is valid, else None (absent, malformed and unreadable all read as disarmed)."""
+    return armed_read()[1]
+
+
+def _present_fail_closed(path):
+    """An inhibiting switch (STOP, FREEZE): present when the path exists as anything at all, AND when control/ or the
+    switch cannot be inspected (a permission or metadata change, GAP 16: fail closed). Before the seed (no control/
+    folder) nothing is present."""
+    try:
+        os.lstat(path)
+        return True
+    except FileNotFoundError:
+        pass
+    except OSError:
+        return True
+    try:
+        st = os.lstat(CONTROL)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return not stat.S_ISDIR(st.st_mode) or not os.access(CONTROL, os.R_OK | os.X_OK)
+
+
+def stop_present():
+    """STOP, fail-closed (_present_fail_closed). Every admission, the watcher and Procs.run read this."""
+    return _present_fail_closed(STOP_FILE)
+
+
+def grant_present(path):
+    """A permission-granting switch (SELFDEV_ARMED, CODEBASE_HISTORY_OK; NO_SELF_QUESTIONS withdraws one): an EMPTY
+    regular file owned by this uid, not writable by group or others, opened with O_NOFOLLOW | O_NONBLOCK and checked
+    on the open descriptor. A dangling symlink, a directory, a FIFO, a non-empty or unreadable file grants nothing."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except OSError:
+        return False
+    try:
+        st = os.fstat(fd)
+        return stat.S_ISREG(st.st_mode) and st.st_uid == os.getuid() and not st.st_mode & 0o022 and st.st_size == 0
+    finally:
+        os.close(fd)
+
+
+def agy_model():
+    """The operator's agy model id from control/agy-model.txt (one line matching AGY_MODEL_RX, a regular operator file of
+    at most 128 bytes), or '' when it is absent or invalid: agent organs then wait (notice agy_model)."""
+    try:
+        text = read_owner_file(AGY_MODEL_FILE, 128).decode('ascii').strip()
+    except (OSError, UnicodeDecodeError):
+        return ''
+    return text if AGY_MODEL_RX.fullmatch(text) else ''
+
+
+def control_state(hashes=True):
+    """The operator's switches. ARMED counts only when it is valid and names THIS boot, so a reboot always comes back
+    disarmed; kit_ok, platform_ok and decisions_ok say whether the kit code, the pinned platform files and DECISIONS.md
+    still have the hashes recorded at arm (hashes=False skips them: they then read False); STOP and FREEZE are
+    fail-closed; SELFDEV_ARMED and CODEBASE_HISTORY_OK are grants (grant_present); admit is the one admission answer:
+    STOP absent, ARMED for this boot with all three hashes unchanged, FREEZE absent."""
+    armed = read_armed()
+    try:
+        this_boot = boot_id()
+    except OSError:
+        this_boot = ''
+    is_armed = bool(armed) and bool(this_boot) and armed['boot_id'] == this_boot
+
+    def same(key, fn):
+        if not (is_armed and hashes):
+            return False
+        try:
+            return armed[key] == fn()
+        except OSError:
+            return False
+    out = {'stop': stop_present(), 'freeze': _present_fail_closed(FREEZE_FILE), 'armed': is_armed,
+           'kit_ok': same('kit_sha256', kit_sha256), 'platform_ok': same('platform_sha256', platform_sha256),
+           'decisions_ok': same('decisions_sha256', decisions_sha256), 'selfdev': grant_present(SELFDEV_FILE),
+           'self_questions': not os.path.lexists(NO_SELF_QUESTIONS_FILE),
+           'history_ok': grant_present(HISTORY_OK_FILE)}
+    out['admit'] = (not out['stop'] and out['armed'] and out['kit_ok'] and out['platform_ok'] and out['decisions_ok']
+                    and not out['freeze'])
+    return out
+
+
+def host_problems():
+    """Why the host cannot take heavy local work NOW ([] = it can): load1 >= HOST_LOAD_FRACTION x cpus, io full
+    avg60 >= HOST_IO_FULL_AVG60, memory some avg60 >= HOST_MEM_SOME_AVG60, MemAvailable < HOST_MEM_FLOOR_MIB,
+    or any of them unreadable. The governor reads it every tick; launch_allowed(heavy=True) reads it again immediately
+    before every heavy the host process (watched test, confirmation, gate, clone, git fetch, page fetch) and
+    life-check.py sandboxed before candidate code."""
+    out = []
+    try:
+        with open('/proc/loadavg', encoding='ascii') as handle:
+            load1 = float(handle.read().split()[0])
+        if load1 >= HOST_LOAD_FRACTION * (os.cpu_count() or 1):
+            out.append(f'the host load1 {load1:.2f}')
+        for name, kind, limit in (('io', 'full', HOST_IO_FULL_AVG60), ('memory', 'some', HOST_MEM_SOME_AVG60)):
+            with open(f'/proc/pressure/{name}', encoding='ascii') as handle:
+                lines = [ln for ln in handle.read().splitlines() if ln.startswith(kind + ' ')]
+            m = re.search(r'\bavg60=([0-9]+(?:\.[0-9]+)?)\b', lines[0]) if len(lines) == 1 else None
+            if not m:
+                out.append(f'the host {name} pressure unreadable')
+            elif float(m.group(1)) >= limit:
+                out.append(f'the host {name} {kind} avg60 {m.group(1)}')
+        with open('/proc/meminfo', encoding='ascii') as handle:
+            avail = [int(ln.split()[1]) for ln in handle if ln.startswith('MemAvailable:')]
+        if len(avail) != 1:
+            out.append('the host MemAvailable unreadable')
+        elif avail[0] // 1024 < HOST_MEM_FLOOR_MIB:
+            out.append(f'the host MemAvailable {avail[0] // 1024} MiB < {HOST_MEM_FLOOR_MIB}')
+    except (OSError, ValueError, IndexError):
+        out.append('the host load, pressure or memory unreadable')
+    return out
+
+
+def launch_allowed(heavy=False):
+    """The final admission check made immediately before a slot action, a fetch, a gate, a watched test, a clone or
+    an agent start creates its process: control_state()['admit'], and for heavy the host work also host_problems()
+    empty and DISK_FREE_MIN free on the STATE and PROJECTS filesystems."""
+    if not control_state()['admit']:
+        return False
+    if heavy:
+        if host_problems():
+            return False
+        try:
+            if min(shutil.disk_usage(p).free for p in (STATE, PROJECTS) if os.path.isdir(p)) < DISK_FREE_MIN:
+                return False
+        except (OSError, ValueError):
+            return False
+    return True
+
+
+def heavy_allowed():
+    return launch_allowed(heavy=True)
+
+
+# ------------------------------------------------------------------------------------------- registry
+SCHEMA_VERSION = '5'
+# Every meta key LIFE writes, with its meaning; any other key is refused (Tick.set_meta).
+META_KEYS = {
+    'schema': 'registry schema version', 'seeded_at': 'seed time', 'seed_complete': '1 once the seed finished',
+    'seed_kit_sha256': 'kit hash the seed started with (a resumed seed refuses a different kit)',
+    'codebase_branch': 'the branch the codebase organ tracks (seed --branch)', 'platform_commit': 'HEAD at seed',
+    'tick_no': 'ticks run', 'canary_at': 'last canary round', 'canary_failed': 'the failed canary lines, or empty',
+    'canary_ok_ever': '1 once a round passed', 'fault_hold': 'set after FAULTS_IN_A_ROW_MAX tick faults',
+    'faults_in_a_row': 'tick faults in a row', 'backup_day': 'UTC day of the last backup',
+    'state_bytes': 'allocated bytes of STATE and the workspaces at the last walk', 'models_at': 'inventory time',
+    'models': 'JSON {node: [models]}', 'watch_state': 'JSON {test: {next, ran, fails, finding, line, occurrence}}',
+    'hold_reason': 'the first hold of the last tick', 'hold_ticks': 'ticks the same hold lasted',
+    'agenda_state': 'JSON {entry revision: last period}', 'no_capacity_ticks': 'working ticks with no node fit',
+    'migration_high': 'highest migration number ever allocated', 'store_marks': 'JSON {org table: last knowledge rowid}',
+    'store_next': 'the org table the store adapter serves first next tick (round-robin)',
+    'store_disabled': 'JSON {org table: schema sha256} of tables whose insert failed (until their schema changes)',
+    'working_tick_no': 'admitted working ticks run (division steps count these)',
+    'gate_selftest': 'kit_sha256 platform_sha256 test_id time of the last passing life-ctl gate-selftest',
+    'models_retry': '1 when a node missing from a readable inventory needed a model (re-read after MODELS_RETRY_SECONDS)',
+}
+
+
+def connect(path=None, readonly=False):
+    path = path or REGISTRY
+    if readonly:
+        conn = sqlite3.connect(f'file:{path}?mode=ro', uri=True, timeout=SQLITE_TIMEOUT, isolation_level=None)
+    else:
+        conn = sqlite3.connect(path, timeout=SQLITE_TIMEOUT, isolation_level=None)
+        conn.execute('PRAGMA journal_mode=WAL')
+        conn.execute('PRAGMA synchronous=FULL')
+    conn.execute('PRAGMA busy_timeout=5000')
+    conn.execute('PRAGMA foreign_keys=ON')
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def apply_schema(conn, sql_path):
+    with open(sql_path, encoding='utf-8') as handle:
+        conn.executescript(handle.read())
+
+
+class Tx:
+    """BEGIN IMMEDIATE ... COMMIT, or ROLLBACK on any exception. A failed COMMIT is rolled back and re-raised,
+    so no later step reuses a connection in an unknown transaction state."""
+
+    def __init__(self, conn):
+        self.conn = conn
+
+    def __enter__(self):
+        self.conn.execute('BEGIN IMMEDIATE')
+        return self.conn
+
+    def __exit__(self, kind, value, tb):
+        if kind is not None:
+            if self.conn.in_transaction:
+                self.conn.execute('ROLLBACK')
+            return False
+        try:
+            self.conn.execute('COMMIT')
+        except sqlite3.Error:
+            if self.conn.in_transaction:
+                self.conn.execute('ROLLBACK')
+            raise
+        return False
+
+
+# Every notice kind, with its subject. The operator acknowledges a notice; acknowledging never clears the condition.
+NOTICE_KINDS = {
+    'stopped': 'STOP', 'integrity': 'state | release N | kit | platform | decisions', 'contract': 'platform',
+    'canary_failed': 'canaries', 'storage': 'state | organism | backup', 'budget': '<budget column> <UTC day>',
+    'held': 'the hold reason', 'telemetry': 'node', 'overflow': '<organ> <UTC day>', 'no_capacity': 'slots',
+    'inbox_refused': 'first 16 hex of sha256(file name)', 'agenda_invalid': 'entry id or agenda.json',
+    'agenda_skipped': 'entry id', 'command_too_long': 'command id', 'command_needs_test': 'command id',
+    'command_needs_program': 'command id', 'command_database_confirm': 'command id', 'command_heartbeat': 'command id',
+    'command_immune': 'command id', 'command_none': 'command id', 'command_merged': 'command id',
+    'command_failed': 'command id', 'command_done': 'command id', 'report_truncated': 'command id',
+    'approve_needed': 'item id', 'tracked_private_data': 'codebase', 'already_passing': 'item id',
+    'watch_timeout': 'test id', 'watch_too_slow': 'test id', 'watch_error': 'test id', 'sandbox': 'landlock',
+    'finding_owner': 'item id', 'finding_failed': 'item id', 'patch_ready': 'patch id', 'patch_test_only': 'patch id',
+    'patch_repeat': 'patch id', 'proposal_ready': 'proposal id', 'review_owner': 'item id',
+    'migration_applied': 'migration id', 'migration_numbers': 'database', 'migration_recovery_required': 'migration id',
+    'migration_imported': 'migration id', 'store_table': 'org table', 'experiment_passed': 'experiment id',
+    'benchmarks_missing': 'compute', 'benchmarks_invalid': 'benchmark id or benchmarks.json', 'bench_refused': 'experiment id',
+    'job_unknown': 'job id or label', 'job_lost': 'job label', 'agy_not_ready': 'node', 'catalogue_shape': 'catalog',
+    'inventory_shape': 'inventory', 'model_absent': '<node> <program>', 'workspace': 'workspace path',
+    'quarantine': 'cell id', 'auto_released': 'cell id', 'moved': 'cell id', 'abstain_rate': 'cell id',
+    'render': 'item id', 'run_unknown': 'run id', 'policy_mismatch': 'run id', 'infra_repeat': 'item id',
+    'tick_fault': 'exception type', 'timeout_limit': 'item id', 'watch_invalid': 'watch.txt',
+
+
+[This is part 20 of 26. Do not critique yet. Reply only with the word RECEIVED.]

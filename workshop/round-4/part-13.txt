@@ -1,0 +1,307 @@
+[LIFE round-4 critique packet, part 13 of 21]
+
+    full = os.path.normpath(os.path.join(kit, path))
+    if path.startswith('/') or '..' in path.split('/') or not full.startswith(kit + '/') or os.path.islink(full):
+        bad.append(path + ' is not a kit path')
+        continue
+    try:
+        if open(full, 'rb').read() != (body + '\n').encode('utf-8'):
+            bad.append(path + ' differs')
+    except OSError:
+        bad.append(path + ' missing')
+want = set()
+for root, dirs, files in os.walk(kit):
+    rel_root = os.path.relpath(root, kit)
+    dirs[:] = [d for d in dirs if d != '__pycache__' and not (rel_root == '.' and d == 'workshop')]
+    for f in files:
+        rel = os.path.normpath(os.path.join(rel_root, f))
+        if rel not in ('LIFE.md', 'BRIEF.md'):
+            want.add(rel)
+bad += [p + ' not embedded' for p in sorted(want - seen)]
+bad += [p + ' embedded but not a kit file' for p in sorted(seen - want)]
+if bad:
+    print('\n'.join(bad))
+sys.exit(1 if bad else 0)
+PYEOF
+then pass embed "LIFE.md appendices"; else bad embed "LIFE.md appendices"; fi
+
+echo "== 10 platform contract =="
+if out="$($PY -c 'import sys; sys.path.insert(0, "/home/operator/host-checkout/docs/life/bin"); import life_common as L; p = L.contract_problems(); print("; ".join(p)); sys.exit(1 if p else 0)')"; then
+  pass contract "platform facts hold"; else bad contract "$out"; fi
+
+echo "== 11 rules (pure functions, no model) =="
+if $PY - "$KIT" <<'PYEOF'
+import ast, math, re, sqlite3, sys
+kit = sys.argv[1]
+sys.path.insert(0, kit + '/bin')
+sys.path.insert(1, '/home/operator/host-checkout')
+import life_common as L
+import symblic_autogen as A
+checks = 0
+def expect(cond, what):
+    global checks
+    checks += 1
+    if not cond:
+        raise AssertionError(what)
+g = lambda n: open(f'{kit}/genome/{n}.sym', encoding='utf-8').read()
+a = g('assign-item')
+expect(L.genome_protected_problems(a, a.replace('"the item fits the first focus better"', '"the item fits the second focus better"')),
+       'an enum description swap must be refused')
+expect(not L.genome_protected_problems(a, a.replace('"Which focus fits this item better?', '"Which of the two foci fits this item best?')),
+       'a real instruction edit of assign-item must be accepted')
+e = g('extract-source')
+expect(not L.genome_protected_problems(e, e.replace('"State one specific factual claim this text supports, in your own words."',
+                                                   '"State one specific factual claim that this text supports."')),
+       'an indented ask instruction edit must be accepted')
+expect(L.genome_protected_problems(a, a.replace(' Item: {item_text}"', '"')), 'removing a placeholder must be refused')
+expect(L.genome_protected_problems(e, e.replace('note Worker', 'note Changed worker')), 'a note edit must be refused')
+expect(L.genome_protected_problems(e, e), 'no change must be refused')
+expect(L.genome_placement_problems(a.replace('with effort=low, retries=2', 'with effort=low, retries=2, by=claude:haiku')),
+       'an ask-level by= must be refused')
+expect('review-patch' in L.SELFDEV_PROTECTED and not L.PLACEHOLDERS['program'].fullmatch('review-patch'), 'review-patch is protected')
+# migrations and snapshots
+expect(not L.migration_problems('CREATE TABLE IF NOT EXISTS org_pages (page_id TEXT, view INTEGER, note TEXT DEFAULT \'a; b\');'),
+       'a column named view and a literal holding ; must be accepted')
+expect(L.migration_problems('DROP TABLE org_x;'), 'DROP must be refused')
+expect(L.migration_problems('CREATE TABLE IF NOT EXISTS org_x (a INTEGER REFERENCES schema_migrations(migration_id));'),
+       'a reference to a non-org table must be refused')
+expect(L.migration_problems('CREATE TABLE IF NOT EXISTS org_x (a INTEGER REFERENCES [schema_migrations](migration_id));'),
+       'a quoted reference must be refused')
+expect(L.migration_problems('CREATE TABLE IF NOT EXISTS org_x (a INTEGER REFERENCES "org_y"(id));'), 'a double-quoted identifier is refused')
+expect(L.migration_problems('CREATE TABLE IF NOT EXISTS org_x (a INTEGER REFERENCES org_y (id));'),
+       'a reference to an org_ table that does not exist must be refused')
+expect(not L.migration_problems('CREATE TABLE IF NOT EXISTS org_y (id INTEGER PRIMARY KEY); CREATE TABLE IF NOT EXISTS org_x '
+                                '(a INTEGER REFERENCES org_y (id));'), 'a reference to a table created above it is accepted')
+expect(L.migration_problems('CREATE TABLE IF NOT EXISTS org_x (a);', 'CREATE TABLE org_x (a);'), 'an existing table must be refused')
+expect(L.migration_problems('CREATE TABLE IF NOT EXISTS org_x (a TEXT DEFAULT (readfile(\'/etc/passwd\')));'), 'readfile must be refused')
+expect(L.migration_problems('CREATE TABLE IF NOT EXISTS org_a (id INTEGER PRIMARY KEY AUTOINCREMENT, x TEXT);'), 'AUTOINCREMENT is refused')
+expect(L.migration_problems('CREATE TABLE IF NOT EXISTS org_a (x TEXT); /* hidden */'), 'a block comment is refused')
+expect(L.snapshot_problems("ATTACH DATABASE '/tmp/x' AS y;"), 'an ATTACH in a snapshot must be refused')
+db = sqlite3.connect(':memory:')
+for s_ in L.split_sql(open(kit + '/db/organism.sql', encoding='utf-8').read()):
+    db.execute(s_)
+for s_ in L.split_sql('CREATE TABLE IF NOT EXISTS org_papers (doi TEXT, view INTEGER); CREATE INDEX IF NOT EXISTS org_papers_doi ON org_papers (doi);'):
+    db.execute(s_)
+snap = L.snapshot_sql(db)
+expect(snap.index('CREATE TABLE org_papers') < snap.index('CREATE INDEX org_papers_doi') and not L.snapshot_problems(snap),
+       'a snapshot lists a table before its index and accepts a column named view')
+expect(not L.migration_problems('ALTER TABLE org_papers ADD COLUMN title TEXT;', snap), 'ADD COLUMN on an indexed table is accepted')
+db.execute('CREATE TABLE org_seq (id INTEGER PRIMARY KEY AUTOINCREMENT)'); db.execute('INSERT INTO org_seq DEFAULT VALUES')
+expect('sqlite_sequence' not in L.snapshot_sql(db), 'snapshots never hold sqlite_ objects')
+# credentials
+expect(not L.has_secret('Research how password hashing with argon2 compares to bcrypt'), 'the word password alone passes')
+expect(L.has_secret('password = hunter22x'), 'a password value is refused')
+expect(L.has_secret('token=abcdefghijk'), 'a token value is refused')
+expect(L.has_secret('PASSWORD: "two words here"'), 'a quoted password value is refused')
+expect(L.has_secret('https://user:pw@example.org/x'), 'URL userinfo is refused')
+# verify lines
+expect(not L.verify_line_problems('database', b'migration=0001_org_x\n', 'migration=0001_org_x'), 'exact verify line passes')
+expect(L.verify_line_problems('database', b' migration=0001_org_x\n', 'migration=0001_org_x'), 'a leading space fails')
+expect(L.verify_line_problems('database', b'migration=0001_org_x\n\n', 'migration=0001_org_x'), 'an extra line fails')
+expect(not L.verify_line_problems('selfdev', b'lesson=0123456789abcdef program=reproduce\n', 'lesson=0123456789abcdef program=reproduce'),
+       'the selfdev verify line names the lesson')
+# the gate
+expect(L.patch_problems(['bin/devcheck'], 'local_fix', '+x\n', ('bin/devcheck',)), 'a patch to bin/ is refused')
+expect(L.patch_problems(['scripts/devcheck.py'], 'local_fix', '+x\n', ('scripts/devcheck.py',)), 'a patch to scripts/ is refused')
+expect(L.patch_problems(['tests/test_x.py'], 'test_only', '-    self.assertEqual(a, b)\n+    pass\n', ('tests/test_x.py',)), 'removing an assertion is refused')
+expect(L.patch_problems(['tests/test_x.py'], 'test_only', '+    @unittest.skip("x")\n', ('tests/test_x.py',)), 'adding a skip is refused')
+expect(L.patch_problems(['tests/test_y.py'], 'test_only', '+    x = 1\n', ('tests/test_x.py',)), 'test_only touches only its own module')
+expect(L.patch_problems(['other.py'], 'local_fix', '+x\n', ('named.py',)), 'a local_fix outside the named files is refused')
+expect(not L.patch_problems(['named.py'], 'local_fix', '+x = 1\n', ('named.py',)), 'a local_fix inside the named files passes')
+expect(L.patch_problems(['README.md'], 'comment_or_doc', '+x\n'), 'a root README is not docs/**/*.md')
+expect(L.patch_problems(['docs/agents/CONTRACTS.md'], 'comment_or_doc', '+x\n'), 'agent instructions are protected')
+expect(not L.patch_problems(['docs/a/b.md'], 'comment_or_doc', '+x\n'), 'docs at any depth pass')
+expect(all(L.GATE_DENY_RX.match(f) for f, _rx, _w in L.CONTRACT), 'every CONTRACT file is protected from patches')
+expect(not L.local_fix_problems('def f(x):\n    return x\n', 'def f(x):\n    return x + 1\n', ['f']), 'a body fix passes')
+expect(L.local_fix_problems('def f(x):\n    return x\n', 'def f(x, y):\n    return x\n', ['f']), 'a signature change is refused')
+expect(L.local_fix_problems('def f(x):\n    return x\ndef g():\n    pass\n', 'def f(x):\n    return x\ndef g():\n    return 1\n', ['f']),
+       'a function the traceback does not name is refused')
+expect(L.path_class(['docs/a.md']) == 'docs' and L.path_class(['x.yaml']) == 'other' and L.path_class(['a.js']) == 'live_static'
+       and L.path_class(['a.py', 'b.js']) == 'mixed', 'path classes')
+expect(L.traceback_files('File "/w/c/server_x.py", line 3\nFile "/w/c/tests/t.py"', '/w/c') == ['server_x.py'], 'traceback files')
+expect(L.traceback_files('File "/w/c/ok/../../outside.py", line 3, in f', '/w/c') == [], 'a .. path is never a traceback file')
+expect(L.failure_fingerprint('Traceback\nAssertionError: 3 != 4') == ('AssertionError', '# != #'), 'failure fingerprint')
+expect(L.failure_fingerprint('no exception here') is None, 'no fingerprint without an exception line')
+# identities
+expect(L.parse_cell('learning.10.0123abcd')[1] == 10, 'depth 10 parses')
+for bad in ('learning.01.0123abcd', 'learning.11.0123abcd', 'learning.1.0123abcg', ' learning.1.0123abcd'):
+    try:
+        L.parse_cell(bad); expect(False, f'{bad!r} must not parse')
+    except ValueError:
+        checks += 1
+expect(L.valid_test_id('tests.test_x.Case.test_y') and not L.valid_test_id('tests.' + 'a' * 65) and not L.valid_test_id('tests.' + '.'.join(['a'] * 6)),
+       'test id bounds')
+expect(not L.payload_problems('finding', 'patch', {'test_id': 't', 'finding_text': 'f', 'base_commit': 'b', 'source': 'watch', 'wall_s': 1,
+                                                   'trace_files': [], 'trace_functions': {}, 'change_class': 'test_only'}), 'a valid payload')
+expect(L.payload_problems('finding', 'patch', {'test_id': 't'}), 'a payload missing keys is refused')
+expect(L.payload_problems('request', 'draft', {'request': 'x' * 10, 'extra': 1}), 'an unknown payload key is refused')
+expect(L.payload_problems('request', 'draft', {'request': 'x' * (L.PAYLOAD_MAX + 1)}), 'an oversize payload is refused')
+expect(L.lint_safe('as before, the last test failed earlier', 200) == 'as stated, the final test failed before', 'lint rewrites')
+# the unit and every bound
+unit = open(kit + '/units/life-tick.service', encoding='utf-8').read()
+expect(f'TimeoutStartSec={L.UNIT_TIMEOUT}' in unit and L.TICK_HARD + 300 == L.UNIT_TIMEOUT, 'unit timeout = UNIT_TIMEOUT = TICK_HARD + 300')
+expect('SuccessExitStatus=1 3 5 6' in unit and 'Restart=no' in unit and f'TasksMax={L.TICK_TASKS_MAX}' in unit
+       and 'ExecStart=/usr/bin/python3 -I -B ' in unit and 'ExecStopPost=-/usr/bin/systemctl --user stop life-*.scope' in unit, 'unit file')
+for name in ('RESEARCH_TIMEOUT', 'CALL_TIMEOUT', 'GATE_STAGE_SECONDS', 'WATCH_STAGE_SECONDS', 'CONFIRM_STAGE_SECONDS', 'CLONE_TIMEOUT',
+             'START_STAGE_SECONDS', 'APPLY_STAGE_SECONDS', 'SELFDEV_GATE_STAGE_SECONDS', 'CANARY_ROUND_SECONDS', 'FETCH_TIMEOUT'):
+    expect(getattr(L, name) + L.KILL_GRACE + L.START_MARGIN <= L.TICK_HARD, f'{name} can start in some tick')
+expect(L.GATE_DEVCHECK_TIMEOUT + L.GATE_TEST_TIMEOUT + 60 <= L.GATE_TIMEOUT, 'the gate script fits GATE_TIMEOUT')
+expect(L.RESEARCH_TIMEOUT >= L.RESEARCH_GENERATIONS * (L.RESEARCH_STEP_TIMEOUT + L.RESEARCH_STEP_POLL_EXTRA)
+       + L.RESEARCH_TOOLS * L.RESEARCH_TOOL_SECONDS, 'the research timeout covers its derived worst case')
+expect(L.BENCH_RUNS * (L.BENCH_TIMEOUT_MAX + L.BENCH_RUN_SLACK) + L.BENCH_JOB_EXTRA <= 3600, 'a benchmark job fits CMD_TIMEOUT_MAX')
+expect(L.BENCH_RUNS * (L.BENCH_OUT_BYTES + 64) <= 40000, 'a benchmark job output fits OUT_HEAD')
+expect(len(L.BENCH_ORDER) == 2 * L.BENCH_PAIRS and L.BENCH_ORDER.count('baseline') == L.BENCH_PAIRS, 'ABBA order')
+expect(L.MODEL_CALLS_PER_DAY >= L.PROGRAM_RUNS_PER_DAY * L.CALL_MAX_MODEL_CALLS, 'the model-call budget covers every reserved run')
+src = open(kit + '/bin/life-tick.py', encoding='utf-8').read()
+ns = re.search(r"NON_SEMANTIC = \(([^)]*)\)", src).group(1)
+expect(set(re.findall(r"'([A-Z_]+)'", ns)) <= set(A.FAILURE_CLASSES), 'every NON_SEMANTIC label is an autogen failure class')
+code = src + open(kit + '/bin/life_common.py', encoding='utf-8').read() + open(kit + '/bin/life-ctl.py', encoding='utf-8').read()
+kinds = set(re.findall(r"L?\.?notice\((?:self\.)?conn, '([a-z_]+)'", code)) | set(re.findall(r"notice\(conn, '([a-z_]+)'", code))
+kinds |= {'command_' + r for r in ('immune', 'none')}
+expect(kinds <= set(L.NOTICE_KINDS), 'undeclared notice kinds: ' + ', '.join(sorted(kinds - set(L.NOTICE_KINDS))))
+metas = set(re.findall(r"set_meta\((?:conn, )?'([a-z_0-9]+)'", code))
+expect(metas <= set(L.META_KEYS), 'undeclared meta keys: ' + ', '.join(sorted(metas - set(L.META_KEYS))))
+for name in ('io', 'memory'):
+    lines = open(f'/proc/pressure/{name}', encoding='ascii').read().splitlines()
+    expect(sum(1 for ln in lines if ln.startswith('full ' if name == 'io' else 'some ')) == 1, f'/proc/pressure/{name} readable')
+expect(L.limits_rows() and all(m for _n, _v, m in L.limits_rows()), 'every limits line has a meaning')
+print(f'{checks} rule cases')
+PYEOF
+then pass rules "protected lines, placement, migrations, secrets, verify, gate, local_fix, paths, ids, payloads, unit, bounds, kinds"; else bad rules "a rule case failed"; fi
+
+echo "== 12 numbers =="
+num=0
+for f in "$KIT"/bin/*.py; do
+  [ "$(basename "$f")" = life_common.py ] && continue
+  if grep -nE 'timeout=[0-9]|\b(3600|86400|1200|2700|900)\b|time_left\(\) < [0-9]|read\([0-9]{3,}\)' "$f" | grep -v '^[0-9]*:\s*#'; then
+    bad numbers "$(basename "$f") holds timing literals (move them into life_common.py)"; num=1; fi
+done
+if $PY -c 'import sys; sys.path.insert(0, sys.argv[1] + "/bin"); import life_common as L; t = open(sys.argv[1] + "/checks/devcheck-gate.sh").read(); sys.exit(0 if f"sandboxed --timeout {L.GATE_DEVCHECK_TIMEOUT} " in t and f"sandboxed --timeout {L.GATE_TEST_TIMEOUT} " in t else 1)' "$KIT"; then :; else
+  bad numbers "checks/devcheck-gate.sh timeouts differ from GATE_DEVCHECK_TIMEOUT/GATE_TEST_TIMEOUT"; num=1; fi
+[ "$num" = 0 ] && pass numbers "no timing literal outside life_common.py; gate timeouts equal"
+
+echo "== 13 generated tables =="
+if $PY - "$KIT" <<'PYEOF'
+import sys
+kit = sys.argv[1]
+sys.path.insert(0, kit + '/bin')
+import life_common as L
+text = open(kit + '/LIFE.md', encoding='utf-8').read().split('\n## Appendices', 1)[0]
+bad = [name for name, table in (('section 13 numbers', L.limits_table()), ('section 14 notice kinds', L.notices_table()),
+                                ('section 17 contract', L.contract_table())) if '\n' + table + '\n' not in text]
+if bad:
+    print('; '.join(bad))
+sys.exit(1 if bad else 0)
+PYEOF
+then pass generated "sections 13, 14 and 17 equal the tables life_common generates"; else bad generated "regenerate LIFE.md tables"; fi
+
+echo
+if [ "$fail" = 0 ]; then echo "STATIC PASS"; else echo "SOME FAILED"; fi
+exit "$fail"
+
+===== FILE: bin/life-seed.sh =====
+#!/usr/bin/env bash
+# LIFE seed (the operator runs this ONCE, on the host):  life-seed.sh [--branch NAME]   (NAME: default main)
+# It asks for START, then runs life-ctl.py seed, which: checks the platform contract and that the live checkout has the
+# branch NAME, runs VALIDATE.sh, creates /home/operator/.local/state/life (mode 0700) with the registry (schema 4), the
+# organism database and release 1, creates the three agent workspaces under /home/operator/symblicos/projects
+# (life-codebase-0-00000000 = a single-branch clone of branch NAME of host-checkout's committed history with
+# .backups/ outside its sparse checkout; life-selfdev-0-00000000 and life-database-0-00000000 = symblic-task workspaces),
+# and registers the 8 seed cells. NAME is the branch the codebase organ tracks for its whole life (life-ctl apply refuses
+# a live checkout on another branch). It starts NO run and calls NO model: nothing happens until the operator installs the
+# timer and runs life-ctl.py arm. A seed that stopped halfway is finished by running it again with the same NAME (every
+# step is idempotent; a changed kit refuses); a finished seed is never changed and seeding is never a recovery step.
+set -euo pipefail
+KIT="/home/operator/host-checkout/docs/life"
+echo "LIFE seed: creates /home/operator/.local/state/life and three workspaces; starts nothing."
+read -r -p "Type START to continue: " answer
+[ "$answer" = "START" ] || { echo "aborted"; exit 1; }
+exec /usr/bin/python3 -I -B "$KIT/bin/life-ctl.py" seed --confirm START "$@"
+
+===== FILE: bin/life-check.py =====
+#!/usr/bin/env python3
+"""LIFE acceptance checks that autogen runs as policy checks (and the canaries run), all code, no model.
+
+    life-check.py verify-line ORGAN FILE EXPECTED_WORDS...   FILE's bytes are exactly the expected line (+ one LF)
+    life-check.py migration FILE SNAPSHOT SHA256             SNAPSHOT exists with this sha256 and only CREATE
+                                                             statements; FILE is an additive org_ migration on top
+    life-check.py genome-protected NEW BASE                  only ask instructions differ between BASE and NEW
+    life-check.py registry                                   PRAGMA integrity_check and foreign_key_check (read-only)
+    life-check.py sandboxed [--timeout N] CMD [ARG...]       run CMD in the Landlock sandbox (cwd = this folder, an
+                                                             empty temporary HOME, no STATE, no TCP), under timeout
+                                                             --kill-after=10 N and prlimit --as 4 GiB, killed at N s
+                                                             (default SANDBOX_CHECK_TIMEOUT 110, inside autogen's 120 s)
+
+Exit 0 pass, 1 fail (the reason on stderr; for sandboxed: CMD failed, timed out or was killed), 2 usage, 125 the
+sandbox is unavailable. `sandboxed` starts CMD in its own process group and, on its timeout, on SIGTERM and on SIGINT,
+SIGKILLs that whole group before it exits, so nothing CMD started outlives it. Autogen runs these in its staging
+checkout on the host (cwd = the checkout), with CHECK_TIMEOUT 120 s (symblicos/autogen.py). Every file argument must be
+a regular file inside the current folder, opened component by component without following any symlink (no .., no
+absolute path). Nothing here writes a file outside a private temporary folder.
+"""
+import os
+import shutil
+import signal
+import stat
+import subprocess
+import sys
+import tempfile
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import life_common as L  # noqa: E402
+
+
+def fail(msg):
+    print(f'life-check: {msg}', file=sys.stderr)
+    return 1
+
+
+def read_inside(path, limit):
+    """The bytes of a regular file inside the current folder, opened relative to the folder's descriptor one component
+    at a time with O_NOFOLLOW (a symlink anywhere, an absolute path, an empty, . or .. component is refused), checked on
+    the open descriptor, read up to `limit` bytes. Nothing is checked and then reopened by name."""
+    parts = path.split('/')
+    if os.path.isabs(path) or any(p in ('', '.', '..') for p in parts):
+        raise OSError(f'{path} must be a relative path inside the checkout')
+    fd = os.open('.', os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for part in parts[:-1]:
+            nxt = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            os.close(fd)
+            fd = nxt
+        ffd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
+    finally:
+        os.close(fd)
+    try:
+        if not stat.S_ISREG(os.fstat(ffd).st_mode):
+            raise OSError(f'{path} is not a regular file')
+        data = b''
+        while len(data) <= limit:
+            chunk = os.read(ffd, limit + 1 - len(data))
+            if not chunk:
+                break
+            data += chunk
+    finally:
+        os.close(ffd)
+    if len(data) > limit:
+        raise OSError(f'{path} is larger than {limit} bytes')
+    return data
+
+
+def sandboxed(cmd):
+    timeout = L.SANDBOX_CHECK_TIMEOUT
+    if cmd[:1] == ['--timeout']:
+        if len(cmd) < 3 or not cmd[1].isdigit() or not 1 <= int(cmd[1]) <= L.SANDBOX_TIMEOUT_MAX:
+            return fail(f'--timeout takes 1..{L.SANDBOX_TIMEOUT_MAX} seconds')
+        timeout, cmd = int(cmd[1]), cmd[2:]
+    home = tempfile.mkdtemp(prefix='life-check-')
+    child = None
+
+    def kill_group():
+        if child is not None:
+            try:
+                os.killpg(child.pid, signal.SIGKILL)
+            except OSError:
+
+
+[This is part 13 of 21. Reply only with the word RECEIVED.]

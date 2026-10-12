@@ -1,0 +1,450 @@
+[LIFE round-4 critique packet, part 16 of 21]
+
+INBOX_DONE_KEEP_DAYS = 30     # days; inbox-done files older than this are deleted
+NOTICES_KEEP_DAYS = 90        # days; acknowledged notices older than this are deleted
+SAMPLES_KEEP_DAYS = 7         # days; samples older than this are deleted
+TMP_KEEP_SECONDS = 86400      # s; abandoned .life-tmp-*, release .tmp-* and inbox-tmp files older than this are removed
+HOLD_NOTICE_TICKS = 12        # ticks; the same hold this many ticks in a row opens notice held
+TEMP_MISSING_SAMPLES = 12     # samples; a node without a temperature this many samples in a row opens notice telemetry
+NO_CAPACITY_TICKS = 12        # ticks; armed working ticks in a row with queued slot items and no node passing node_ok open notice no_capacity
+FAULTS_IN_A_ROW_MAX = 3       # ticks; tick faults in a row before the fault hold (life-ctl clear-fault)
+REPORT_COMMANDS_PER_TICK = 20   # commands; dispatched commands examined for a report per tick (least recently examined first)
+REPORT_ITEMS_MAX = 500        # items; listed in one report (the report says when it is cut)
+REPORT_TRAVERSE_MAX = 5000    # items; a command's descendants are followed this far; past it the report waits (notice report_truncated)
+APPROVAL_STALE_DAYS = 7       # days; a lesson or request waiting for approval this long counts as ended for its command's report
+OUTPUT_KEEP_BYTES = 1 << 20   # bytes; stdout kept per process
+ERR_KEEP_BYTES = 1 << 16      # bytes; stderr kept per process
+OUTPUT_KILL_BYTES = 16 << 20  # bytes; a process writing more than this (stdout + stderr) is ended and returns OUTPUT_LIMIT_RC
+OUTPUT_LIMIT_RC = 1000        # rc; the return code Procs.run gives an output-limit kill (never a real exit code)
+HTTP_MAX_BYTES = 8 << 20      # bytes; a loopback HTTP answer
+JSON_MAX_DEPTH = 32           # levels; a loopback JSON answer nested deeper is refused
+# metabolism (LIFE.md section 10)
+LOADED_CPU = 50.0             # % busy; vitals.cpu at or above: the node is loaded in this sample
+LOADED_OWN_FRACTION = 0.5     # ratio; or LIFE kept the node busy this fraction of the interval
+FLEET_LOADED_FRACTION = 0.5   # ratio; at least max(1, ceil(this x online LIFE nodes)) loaded nodes: the fleet is loaded
+WORK_WINDOW = 3000            # s; loaded (or unobserved) seconds before the fleet must rest
+REST_SECONDS = 600            # s; consecutive observed quiet seconds that end a rest and reset the window
+NODE_WINDOW, NODE_BUSY_MAX, NODE_REST = 3600, 3000, 600   # s; per node: an action is admitted only if busy + its budget <= 3000 of the last 3600; busy >= 3000 rests it 600 idle s
+TELEMETRY_REFRESH = 120       # s; the slot phase re-reads every governor input when the sample is older than this
+HOT_C, COOL_C = 85.0, 75.0    # deg C; same thresholds as symblic_apply.THERMAL_HOT/THERMAL_COOL (hysteresis)
+TEMP_MIN_C, TEMP_MAX_C = -50.0, 150.0   # deg C; a temperature outside is unavailable (treated as hot)
+MEM_RESERVE_MIB = 2048        # MiB; a node needs memAvailMiB >= reserve + the model's size + KV_ALLOWANCE_MIB
+KV_ALLOWANCE_MIB = 1024       # MiB; context (KV cache) allowance per call on top of the model weights
+MODEL_MIB_UNKNOWN = 4096      # MiB; memory assumed for a model missing from MODEL_MIB
+HOST_LOAD_FRACTION = 0.75  # ratio; the host load1 must stay below this x os.cpu_count()
+HOST_IO_FULL_AVG60 = 10.0  # %; the host /proc/pressure/io full avg60 must stay below this
+HOST_MEM_FLOOR_MIB = 6144  # MiB; the host MemAvailable must be at least this (a 4 GiB scope + 2 GiB reserve)
+HOST_MEM_SOME_AVG60 = 10.0   # %; the host /proc/pressure/memory some avg60 must stay below this
+# units and adapter timeouts
+HOUR, DAY = 3600, 86400       # s; units
+HTTP_TIMEOUT = 30             # s; one loopback GET or POST that should answer at once (one deadline for the whole exchange)
+HTTP_SLOW_TIMEOUT = 60        # s; /api/cluster/status (it may probe), autogen get, the jobs listing, map submit
+SQLITE_TIMEOUT = 5            # s; a connection waits this long for another writer (busy_timeout 5000 ms)
+CTL_LOCK_WAIT = UNIT_TIMEOUT  # s; life-ctl waits this long for the tick's lock (a progress line every CTL_LOCK_PROGRESS s)
+CTL_LOCK_PROGRESS = 60        # s; life-ctl prints that it is waiting this often
+SEED_LOCK_WAIT = 60           # s; seed waits this long for the lock
+VALIDATE_TIMEOUT = 900        # s; seed and arm run VALIDATE.sh with this timeout
+# sizes
+PAYLOAD_MAX = 16384           # characters; an item payload (JSON); a larger one is refused before the write
+COMMAND_MAX_BYTES = 4000      # bytes; one operator command (inbox file or agenda text)
+INBOX_PER_TICK = 50           # files; inbox files taken per tick
+AGENDA_MAX = 20               # entries; agenda entries read (more: notice agenda_invalid)
+AGENDA_FILE_MAX_BYTES = 131072   # bytes; control/agenda.json
+WATCH_FILE_MAX_BYTES = 16384  # bytes; control/watch.txt
+AGENDA_HOURS_MIN, AGENDA_HOURS_MAX = 6, 720   # hours; an agenda entry's period
+
+# ------------------------------------------------------------------------------------------- small helpers
+
+
+def now():
+    return int(time.time())
+
+
+def utc_day(t=None):
+    return time.strftime('%Y-%m-%d', time.gmtime(now() if t is None else t))
+
+
+def sha(*parts):
+    """sha256 hex of the parts joined by newlines (identity parts never contain a newline: see item_id)."""
+    return hashlib.sha256('\n'.join(str(p) for p in parts).encode('utf-8')).hexdigest()
+
+
+def sha16(*parts):
+    return sha(*parts)[:16]
+
+
+def file_sha(path):
+    h = hashlib.sha256()
+    with open(path, 'rb') as handle:
+        for block in iter(lambda: handle.read(1 << 16), b''):
+            h.update(block)
+    return h.hexdigest()
+
+
+def item_id(organ, kind, *parts):
+    """<organ>:<first 16 hex of sha256(kind + "\\n" + parts joined by "\\n")>. A part holding a newline is refused,
+    so two different identities can never serialize to the same text."""
+    if any('\n' in str(p) for p in (kind, *parts)):
+        raise ValueError('an identity part contains a newline')
+    return f'{organ}:{sha16(kind, *parts)}'
+
+
+CELL_RX = re.compile(r'(command|learning|digest|codebase|immune|selfdev|compute|database)\.(0|[1-9]|10)\.([0-9a-f]{8})')
+
+
+def cell_id(organ, depth, hex8):
+    return f'{organ}.{depth}.{hex8}'
+
+
+def parse_cell(cid):
+    """(organ, depth, hex8) of a canonical cell id (depth spelled 0..10 without leading zeros)."""
+    m = CELL_RX.fullmatch(cid or '')
+    if not m:
+        raise ValueError(f'not a cell id: {cid!r}')
+    return m.group(1), int(m.group(2)), m.group(3)
+
+
+def workspace_for(cid):
+    """The one git workspace of an agent cell: PROJECTS/life-<organ>-<depth>-<hex8> (None for model cells)."""
+    organ, depth, hex8 = parse_cell(cid)
+    return f'{PROJECTS}/life-{organ}-{depth}-{hex8}' if organ in AGENT_ORGANS else None
+
+
+def request_id_for(cid, iid, attempt):
+    """life-<organ>-<depth>-<hex8>-<item 16 hex>-<attempt>: the full cell identity, so no two cells share ids."""
+    organ, depth, hex8 = parse_cell(cid)
+    return f'life-{organ}-{depth}-{hex8}-{iid.split(":")[1]}-{attempt}'
+
+
+TEST_ID_RX = re.compile(r'tests\.[A-Za-z0-9_]{1,64}(?:\.[A-Za-z0-9_]{1,64}){0,4}')
+
+
+def valid_test_id(text):
+    """tests.<module>[.<Class>[.<test>]]: at most TEST_ID_MAX characters, at most 5 components after tests, each 1..64."""
+    return isinstance(text, str) and len(text) <= TEST_ID_MAX and bool(TEST_ID_RX.fullmatch(text))
+
+
+# Credential-shaped VALUES, not words: "research password hashing" passes, "password = hunter22x" and
+# 'PASSWORD: "two words here"' do not. Every key word below is listed in LIFE.md section 11.
+SECRET_KEYWORDS = (r'api[_-]?key|access[_-]?token|auth[_-]?token|secret[_-]?key|client[_-]?secret|passw(?:or)?d|'
+                   r'token|secret|credentials?|private[_-]?key')
+SECRET_RX = re.compile(
+    r'(?i)(\b(?:' + SECRET_KEYWORDS + r')\s*[:=]\s*(?:[\'"][^\'"\n]{6,}[\'"]|[^\s\'"]{6,})|'
+    r'bearer\s+[a-z0-9._~+/-]{16,}=*|BEGIN [A-Z ]*PRIVATE KEY|'
+    r'sk-[A-Za-z0-9_-]{20,}|ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|xox[abp]-[A-Za-z0-9-]{10,}|'
+    r'AKIA[0-9A-Z]{16}|https?://[^/\s:@]+:[^/\s@]+@)')
+
+
+def has_secret(text):
+    return bool(SECRET_RX.search(text or ''))
+
+
+def redact(text):
+    """The text with every credential-shaped span replaced by [redacted] (findings keep the rest)."""
+    return SECRET_RX.sub('[redacted]', text or '')
+
+
+def one_line(text, limit):
+    """NFC, every control character and newline as one space, whitespace collapsed, backticks and
+    braces removed (they would break a statement or a template), cut to `limit` characters."""
+    text = unicodedata.normalize('NFC', str(text or ''))
+    text = ''.join(' ' if unicodedata.category(c).startswith('C') else c for c in text)
+    text = re.sub(r'[`{}]', '', text)
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text[:limit].rstrip()
+
+
+# symblic_autogen.lint warns on these back-references; a rendered statement must lint with ZERO findings
+LINT_REWRITES = ((r'\bthe previous\b', 'the prior'), (r'\bthe last\b', 'the final'), (r'\bas before\b', 'as stated'),
+                 (r'\blike above\b', 'as stated'), (r'\bearlier\b', 'before'))
+
+
+def lint_safe(text, limit):
+    """one_line plus the LINT_REWRITES (case-insensitive), so free text inside a template never trips lint."""
+    text = one_line(text, limit)
+    for rx, repl in LINT_REWRITES:
+        text = re.sub(rx, repl, text, flags=re.I)
+    return text[:limit].rstrip()
+
+
+def norm_text(text):
+    """The identity form of free text: NFC, lower case, whitespace collapsed."""
+    return re.sub(r'\s+', ' ', unicodedata.normalize('NFC', str(text or '')).lower()).strip()
+
+
+def words(text):
+    """The routing words of a text: norm_text, then every run of 4 or more letters."""
+    return set(re.findall(r'[^\W\d_]{4,}', norm_text(text)))
+
+
+def boot_id():
+    with open('/proc/sys/kernel/random/boot_id', encoding='ascii') as handle:
+        return handle.read().strip()
+
+
+KIT_CODE_DIRS = ('bin', 'checks', 'db', 'units')
+KIT_CODE_FILES = ('VALIDATE.sh',)
+
+
+def kit_sha256():
+    """sha256 over every entry under KIT/bin, checks, db and units (directories, __pycache__ included, and every
+    file of any type) plus VALIDATE.sh, in sorted relative-path order: a regular file as path, NUL, f, its mode bits,
+    its content sha256; a symlink as path, NUL, l, its target; a directory as path, NUL, d; anything else as path,
+    NUL, x. So a new symlink, a changed mode bit or a stray .pyc changes the hash. life-ctl arm records it; a tick
+    whose kit differs holds (integrity)."""
+    h = hashlib.sha256()
+
+    def add(path):
+        rel = os.path.relpath(path, KIT).encode()
+        st = os.lstat(path)
+        if stat.S_ISLNK(st.st_mode):
+            h.update(rel + b'\0l\0' + os.readlink(path).encode() + b'\n')
+        elif stat.S_ISREG(st.st_mode):
+            h.update(rel + b'\0f\0' + oct(st.st_mode & 0o7777).encode() + b'\0' + file_sha(path).encode() + b'\n')
+        elif stat.S_ISDIR(st.st_mode):
+            h.update(rel + b'\0d\n')
+        else:
+            h.update(rel + b'\0x\n')
+    for sub in KIT_CODE_DIRS:
+        base = os.path.join(KIT, sub)
+        add(base)
+        for root, dirs, files in os.walk(base):
+            dirs.sort()
+            for name in sorted(dirs + files):
+                add(os.path.join(root, name))
+    for name in KIT_CODE_FILES:
+        add(os.path.join(KIT, name))
+    return h.hexdigest()
+
+
+def decisions_sha256():
+    """sha256 of DECISIONS.md (the operator's requirements decisions); arm records it with the operator's confirmation."""
+    return file_sha(DECISIONS_FILE)
+
+
+# Platform files LIFE executes or imports outside the server process: their bytes are recorded at arm, and a
+# different byte anywhere is an integrity hold until the operator reads the change, runs VALIDATE.sh and arms again.
+PLATFORM_PINS = ('landlock_sandbox.py', 'deep_research.py', 'local_research.py', 'bin/symblic-task', 'symblic_autogen.py')
+
+
+def platform_sha256():
+    h = hashlib.sha256()
+    for rel in PLATFORM_PINS:
+        h.update(rel.encode() + b'\0' + file_sha(os.path.join(REPO, rel)).encode() + b'\n')
+    return h.hexdigest()
+
+
+def state_problems():
+    """Every STATE directory must exist as a real directory (not a symlink) owned by this uid with mode 0700."""
+    out = []
+    for path in STATE_DIRS:
+        try:
+            st = os.lstat(path)
+        except OSError as exc:
+            out.append(f'{path}: {exc.strerror}')
+            continue
+        if not stat.S_ISDIR(st.st_mode):
+            out.append(f'{path} is not a real directory')
+        elif st.st_uid != os.getuid() or st.st_mode & 0o077:
+            out.append(f'{path} must be owned by uid {os.getuid()} with mode 0700')
+    return out
+
+
+def ensure_dirs():
+    for path in STATE_DIRS:
+        os.makedirs(path, mode=0o700, exist_ok=True)
+
+
+def read_owner_file(path, limit):
+    """The bytes of an operator file (control/*, an inbox file): opened with O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC (a FIFO
+    never blocks, a symlink is refused), checked ON THE OPEN DESCRIPTOR to be a regular file owned by this uid, read
+    up to `limit` bytes. Raises OSError (FileNotFoundError when absent) on any rule failure or a larger file."""
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid():
+            raise OSError(f'{os.path.basename(path)} is not a regular file owned by the operator')
+        data = b''
+        while len(data) <= limit:
+            chunk = os.read(fd, limit + 1 - len(data))
+            if not chunk:
+                break
+            data += chunk
+    finally:
+        os.close(fd)
+    if len(data) > limit:
+        raise OSError(f'{os.path.basename(path)} is larger than {limit} bytes')
+    return data
+
+
+def write_atomic(path, data, mode=0o600):
+    """Write a new random temporary file in the same directory (O_EXCL, mode), fsync it, rename it over
+    `path`, then fsync the directory. Never follows or reuses an existing temporary path."""
+    directory = os.path.dirname(path) or '.'
+    tmp = os.path.join(directory, f'.{os.path.basename(path)}.tmp-{secrets.token_hex(8)}')
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode)
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+    fsync_dir(directory)
+
+
+def fsync_dir(directory):
+    dfd = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(dfd)
+    finally:
+        os.close(dfd)
+
+
+def publish_noreplace(src, dest):
+    """Move src to dest only if dest does not exist (os.link fails with EEXIST: never overwrites), then remove src.
+    Returns False when dest exists."""
+    try:
+        os.link(src, dest, follow_symlinks=False)
+    except FileExistsError:
+        return False
+    os.remove(src)
+    fsync_dir(os.path.dirname(dest))
+    return True
+
+
+def log(message):
+    os.makedirs(LOGS, mode=0o700, exist_ok=True)
+    path = LOGS + '/tick.log'
+    try:
+        if os.path.getsize(path) > LOG_ROTATE_BYTES:
+            for n in (2, 1):
+                if os.path.exists(f'{path}.{n}'):
+                    os.replace(f'{path}.{n}', f'{path}.{n + 1}')
+            os.replace(path, path + '.1')
+    except OSError:
+        pass
+    line = f'{time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())} {one_line(redact(str(message)), 600)}'
+    try:
+        with open(path, 'a', encoding='utf-8', opener=lambda p, f: os.open(p, f, 0o600)) as handle:
+            handle.write(line + '\n')
+    except OSError:
+        pass                                   # a full disk never blocks STOP or a tick's own handling
+    print(line, flush=True)
+
+
+# ------------------------------------------------------------------------------------------- control
+ARMED_KEYS = ('boot_id', 'kit_sha256', 'platform_sha256', 'decisions_sha256')
+
+
+def read_armed():
+    """ARMED holds one JSON object {"boot_id": <this boot>, "kit_sha256", "platform_sha256", "decisions_sha256"} (the
+    hashes at arm). Anything else (missing, unreadable, malformed, too big, not a regular operator file) reads as
+    disarmed."""
+    try:
+        raw = read_owner_file(ARMED_FILE, 1024)
+        data = json.loads(raw.decode('ascii'))
+        if isinstance(data, dict) and set(data) == set(ARMED_KEYS) and all(isinstance(v, str) for v in data.values()):
+            return data
+    except (OSError, ValueError, UnicodeDecodeError):
+        pass
+    return None
+
+
+def control_state(hashes=True):
+    """The operator's switches. ARMED counts only when it names THIS boot, so a reboot always comes back disarmed;
+    kit_ok, platform_ok and decisions_ok say whether the kit code, the pinned platform files and DECISIONS.md still
+    have the hashes recorded at arm (hashes=False skips them: they then read False); admit is the one admission
+    answer: STOP absent, ARMED for this boot with all three hashes unchanged, FREEZE absent."""
+    armed = read_armed()
+    try:
+        this_boot = boot_id()
+    except OSError:
+        this_boot = ''
+    is_armed = bool(armed) and bool(this_boot) and armed['boot_id'] == this_boot
+
+    def same(key, fn):
+        if not (is_armed and hashes):
+            return False
+        try:
+            return armed[key] == fn()
+        except OSError:
+            return False
+    out = {'stop': os.path.lexists(STOP_FILE), 'freeze': os.path.lexists(FREEZE_FILE), 'armed': is_armed,
+           'kit_ok': same('kit_sha256', kit_sha256), 'platform_ok': same('platform_sha256', platform_sha256),
+           'decisions_ok': same('decisions_sha256', decisions_sha256), 'selfdev': os.path.lexists(SELFDEV_FILE),
+           'self_questions': not os.path.lexists(NO_SELF_QUESTIONS_FILE),
+           'history_ok': os.path.lexists(HISTORY_OK_FILE)}
+    out['admit'] = (not out['stop'] and out['armed'] and out['kit_ok'] and out['platform_ok'] and out['decisions_ok']
+                    and not out['freeze'])
+    return out
+
+
+def launch_allowed():
+    """The final admission check made immediately before a slot action, a fetch, a gate, a watched test or an agent
+    start creates its process: control_state()['admit']."""
+    return control_state()['admit']
+
+
+# ------------------------------------------------------------------------------------------- registry
+SCHEMA_VERSION = '4'
+# Every meta key LIFE writes, with its meaning; any other key is refused (Tick.set_meta).
+META_KEYS = {
+    'schema': 'registry schema version', 'seeded_at': 'seed time', 'seed_complete': '1 once the seed finished',
+    'seed_kit_sha256': 'kit hash the seed started with (a resumed seed refuses a different kit)',
+    'codebase_branch': 'the branch the codebase organ tracks (seed --branch)', 'platform_commit': 'HEAD at seed',
+    'tick_no': 'ticks run', 'canary_at': 'last canary round', 'canary_failed': 'the failed canary lines, or empty',
+    'canary_ok_ever': '1 once a round passed', 'fault_hold': 'set after FAULTS_IN_A_ROW_MAX tick faults',
+    'faults_in_a_row': 'tick faults in a row', 'backup_day': 'UTC day of the last backup',
+    'state_bytes': 'allocated bytes of STATE and the workspaces at the last walk', 'models_at': 'inventory time',
+    'models': 'JSON {node: [models]}', 'watch_state': 'JSON {test: {next, ran, fails, finding, line, occurrence}}',
+    'hold_reason': 'the first hold of the last tick', 'hold_ticks': 'ticks the same hold lasted',
+    'agenda_state': 'JSON {entry revision: last period}', 'no_capacity_ticks': 'working ticks with no node fit',
+    'migration_high': 'highest migration number ever allocated', 'store_marks': 'JSON {org table: last knowledge rowid}',
+}
+
+
+def connect(path=None, readonly=False):
+    path = path or REGISTRY
+    if readonly:
+        conn = sqlite3.connect(f'file:{path}?mode=ro', uri=True, timeout=SQLITE_TIMEOUT, isolation_level=None)
+    else:
+        conn = sqlite3.connect(path, timeout=SQLITE_TIMEOUT, isolation_level=None)
+        conn.execute('PRAGMA journal_mode=WAL')
+        conn.execute('PRAGMA synchronous=FULL')
+    conn.execute('PRAGMA busy_timeout=5000')
+    conn.execute('PRAGMA foreign_keys=ON')
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def apply_schema(conn, sql_path):
+    with open(sql_path, encoding='utf-8') as handle:
+        conn.executescript(handle.read())
+
+
+class Tx:
+    """BEGIN IMMEDIATE ... COMMIT, or ROLLBACK on any exception. A failed COMMIT is rolled back and re-raised,
+    so no later step reuses a connection in an unknown transaction state."""
+
+    def __init__(self, conn):
+        self.conn = conn
+
+    def __enter__(self):
+        self.conn.execute('BEGIN IMMEDIATE')
+        return self.conn
+
+    def __exit__(self, kind, value, tb):
+        if kind is not None:
+            if self.conn.in_transaction:
+                self.conn.execute('ROLLBACK')
+            return False
+        try:
+
+
+[This is part 16 of 21. Reply only with the word RECEIVED.]

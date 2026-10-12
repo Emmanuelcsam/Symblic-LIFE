@@ -1,0 +1,387 @@
+[LIFE critique packet, part 5 of 5]
+
+
+
+===== FILE: bin/life-spawn-tick.py =====
+#!/usr/bin/env python3
+"""LIFE orchestrator tick: the only place a new cell (autogen run) is born.
+
+Reproduction is admitted by CODE, never by a model. A reproducer cell proposes a division by
+writing a SPAWN record folder under spawn/queue/ (see spawn/PROTOCOL.md). This tick, run by the
+operator's systemd user timer on the host, validates each queued record and submits the valid ones.
+It calls no model and starts no agent itself: it runs `bin/symblic-task lint`, `normalize` and
+`bin/symblic-task start` (which submits an autogen run) only after every gate passes.
+
+Gates, in order, per record:
+  1. kill switch     -- spawn/../STOP absent (else the whole tick exits 3, nothing is born)
+  2. heat gate       -- the host load/io under the fan-out thresholds (else exit 4)
+  3. budget          -- fewer than LIFE_MAX_RUNS live LIFE autogen runs
+  4. lint            -- statements.txt: zero errors AND zero warnings
+  5. normalize       -- policy.json passes symblic_autogen.normalize
+  6. lineage depth   -- depth < LIFE_MAX_DEPTH (10) and <= 64
+  7. content dedup   -- sha256(statements||policy) not already in spawn/hashes.txt
+A record that fails any gate is moved to spawn/rejected/ with a reason; a record that passes is
+moved to spawn/approved/, its hash recorded, and submitted with `bin/symblic-task start`.
+Nothing here restarts the dashboard, pushes, or touches files outside the organism workspace.
+"""
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+
+ROOT = os.environ.get('LIFE_ROOT', '/home/operator/symblicos/projects/life')
+REPO = os.environ.get('LIFE_REPO', '/home/operator/host-checkout')
+KIT = os.path.join(REPO, 'docs/life')
+TASK = os.path.join(REPO, 'bin/symblic-task')
+LIFE_MAX_RUNS = int(os.environ.get('LIFE_MAX_RUNS', '16'))
+LIFE_MAX_DEPTH = int(os.environ.get('LIFE_MAX_DEPTH', '10'))
+DASH_URL = os.environ.get('DASH_URL', 'http://127.0.0.1:8080')
+
+sys.path.insert(0, REPO)
+import symblic_autogen as A  # noqa: E402
+
+QUEUE = os.path.join(KIT, 'spawn', 'queue')
+APPROVED = os.path.join(KIT, 'spawn', 'approved')
+REJECTED = os.path.join(KIT, 'spawn', 'rejected')
+HASHES = os.path.join(KIT, 'spawn', 'hashes.txt')
+
+
+def log(msg):
+    print(f'{time.strftime("%Y-%m-%d %H:%M:%S")} life-spawn-tick: {msg}')
+
+
+def policy_flags(spec):
+    """Translate a normalized-passing policy dict into exact bin/symblic-task start flags.
+    Only keys present in the record are emitted, so server defaults fill the rest."""
+    intmap = {'candidates': '--candidates', 'regenerate': '--regenerate', 'depth': '--decompose',
+              'children': '--children', 'generations': '--handoff', 'agents_max': '--agents-max',
+              'attempt_seconds': '--attempt-seconds', 'wall_seconds': '--wall-seconds',
+              'novelty_limit': '--novelty-limit', 'saturation': '--saturation'}
+    flags = []
+    for key, flag in intmap.items():
+        if key in spec and isinstance(spec[key], int) and not isinstance(spec[key], bool):
+            flags += [flag, str(spec[key])]
+    if spec.get('perpetual'):
+        flags += ['--perpetual', str(int(spec.get('interval_seconds', 900)))]
+    if spec.get('strategies'):
+        flags += ['--strategies', ','.join(spec['strategies'])]
+    if spec.get('syntax') is False:
+        flags += ['--no-syntax']
+    if spec.get('require_change') is False:
+        flags += ['--allow-no-change']
+    if spec.get('until_done'):
+        flags += ['--until-done']
+    if spec.get('designer'):
+        flags += ['--designer']
+    if spec.get('self_split') is False:
+        flags += ['--no-self-split']
+    for idx, cmds in (spec.get('checks') or {}).items():
+        for c in cmds:
+            flags += ['--check', f'{idx}:{c}']
+    for c in spec.get('final') or []:
+        flags += ['--final', c]
+    for c in spec.get('hidden') or []:
+        flags += ['--hidden', c]
+    return flags
+
+
+def known_hashes():
+    try:
+        return set(open(HASHES, encoding='utf-8').read().split())
+    except OSError:
+        return set()
+
+
+def live_run_count():
+    try:
+        out = subprocess.run([TASK, 'autogen', 'list'], capture_output=True, text=True, timeout=60)
+        return sum(1 for ln in out.stdout.splitlines() if 'life-' in ln and ('active' in ln or 'queued' in ln))
+    except (OSError, subprocess.SubprocessError):
+        return LIFE_MAX_RUNS  # fail closed: do not spawn when we cannot read the count
+
+
+def reject(folder, reason):
+    os.makedirs(REJECTED, exist_ok=True)
+    with open(os.path.join(folder, 'REJECT.txt'), 'w', encoding='utf-8') as fh:
+        fh.write(reason + '\n')
+    shutil.move(folder, os.path.join(REJECTED, os.path.basename(folder) + f'-{int(time.time())}'))
+    log(f'rejected {os.path.basename(folder)}: {reason}')
+
+
+def main():
+    # gate 1: kill switch
+    if os.path.exists(os.path.join(ROOT, 'STOP')):
+        log('STOP present: no spawns'); return 3
+    # gate 2: heat
+    heat = subprocess.run([os.path.join(KIT, 'checks', 'heat-gate.sh')], capture_output=True, text=True)
+    if heat.returncode != 0:
+        log(f'heat HOLD: {heat.stdout.strip()}'); return 4
+    if not os.path.isdir(QUEUE):
+        log('no queue folder, nothing to do'); return 0
+    hashes = known_hashes()
+    for name in sorted(os.listdir(QUEUE)):
+        folder = os.path.join(QUEUE, name)
+        if not os.path.isdir(folder):
+            continue
+        sfile = os.path.join(folder, 'statements.txt')
+        pfile = os.path.join(folder, 'policy.json')
+        lfile = os.path.join(folder, 'lineage.json')
+        if not (os.path.isfile(sfile) and os.path.isfile(pfile) and os.path.isfile(lfile)):
+            reject(folder, 'incomplete record: need statements.txt, policy.json, lineage.json'); continue
+        # gate 3: budget
+        if live_run_count() >= LIFE_MAX_RUNS:
+            log(f'budget reached ({LIFE_MAX_RUNS} live runs): leaving {name} queued'); continue
+        # gate 4: lint (errors AND warnings must be zero)
+        lines = A.statements(open(sfile, encoding='utf-8').read())
+        findings = A.lint(lines, ROOT)
+        if findings:
+            reject(folder, 'lint: ' + '; '.join(f'{lv} line {n}: {m}' for lv, n, m in findings)[:400]); continue
+        # gate 5: normalize
+        try:
+            spec = json.load(open(pfile, encoding='utf-8'))
+            A.normalize(spec)
+        except (ValueError, OSError) as exc:
+            reject(folder, f'policy refused: {exc}'); continue
+        # gate 6: lineage depth
+        try:
+            lin = json.load(open(lfile, encoding='utf-8'))
+            depth = int(lin['depth']); cell_id = str(lin['cell_id']); organ = str(lin['organ'])
+        except (ValueError, OSError, KeyError) as exc:
+            reject(folder, f'lineage invalid: {exc}'); continue
+        if depth >= LIFE_MAX_DEPTH or depth > 64:
+            reject(folder, f'lineage depth {depth} at or above limit {LIFE_MAX_DEPTH}'); continue
+        if not re.fullmatch(r'[a-z]+\.[0-9]+\.[0-9a-f]{8}', cell_id):
+            reject(folder, f'cell_id {cell_id!r} not organ.generation.8hex'); continue
+        # gate 7: content-hash dedup
+        content = open(sfile, encoding='utf-8').read() + '\n' + open(pfile, encoding='utf-8').read()
+        chash = hashlib.sha256(content.encode()).hexdigest()
+        if chash in hashes:
+            reject(folder, f'duplicate content hash {chash[:16]}'); continue
+        # all gates passed: birth the cell
+        run_id = f'life-{organ}-{cell_id.split(".")[-1]}'
+        cmd = [TASK, 'start', '--lines', sfile, '--root', ROOT, '--cwd', ROOT,
+               '--node', str(lin.get('node', 'node-i')), '--engine', str(lin.get('engine', 'agy')),
+               '--id', run_id[:120]] + policy_flags(spec)
+        log(f'SUBMIT {run_id} node={lin.get("node", "node-i")} depth={depth}')
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        if res.returncode != 0:
+            reject(folder, f'start failed rc={res.returncode}: {res.stderr.strip()[:300]}'); continue
+        with open(HASHES, 'a', encoding='utf-8') as fh:
+            fh.write(chash + '\n')
+        hashes.add(chash)
+        os.makedirs(APPROVED, exist_ok=True)
+        with open(os.path.join(folder, 'RUN.txt'), 'w', encoding='utf-8') as fh:
+            fh.write(f'{run_id}\n{res.stdout.strip()}\n')
+        shutil.move(folder, os.path.join(APPROVED, name + f'-{int(time.time())}'))
+        log(f'born {run_id}')
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
+===== END bin/life-spawn-tick.py =====
+
+===== FILE: bin/life-status.py =====
+#!/usr/bin/env python3
+"""LIFE heartbeat (code side): print one status line per LIFE autogen run. No model, no agent.
+Reads `bin/symblic-task autogen list` and the per-organ verify.txt / ledger files. Read-only."""
+import os
+import subprocess
+import sys
+import time
+
+ROOT = os.environ.get('LIFE_ROOT', '/home/operator/symblicos/projects/life')
+REPO = os.environ.get('LIFE_REPO', '/home/operator/host-checkout')
+TASK = os.path.join(REPO, 'bin/symblic-task')
+ORGANS = ('command', 'codebase', 'learning', 'digest', 'selfdev', 'compute',
+          'metabolism', 'immune', 'heartbeat', 'database')
+
+
+def main():
+    print(f'LIFE status {time.strftime("%Y-%m-%d %H:%M:%S")}  root={ROOT}')
+    stop = os.path.join(ROOT, 'STOP')
+    print(f'  kill switch: {"STOP present (frozen)" if os.path.exists(stop) else "GO"}')
+    try:
+        out = subprocess.run([TASK, 'autogen', 'list'], capture_output=True, text=True, timeout=60)
+        for ln in out.stdout.splitlines():
+            if 'life-' in ln:
+                print('  run:', ln.strip())
+    except (OSError, subprocess.SubprocessError) as exc:
+        print('  (could not list runs:', exc, ')')
+    for organ in ORGANS:
+        d = os.path.join(ROOT, f'organ-{organ}')
+        v = os.path.join(d, 'verify.txt')
+        mark = 'verify.txt: ' + (open(v, encoding="utf-8").read().strip()[:80] if os.path.isfile(v) else 'none')
+        print(f'  organ {organ:11s} {"dir" if os.path.isdir(d) else "no-dir":6s} {mark}')
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
+===== END bin/life-status.py =====
+
+===== FILE: bin/life-seed.sh =====
+#!/usr/bin/env bash
+# LIFE seed launcher. The operator runs this ONCE to create the organism workspace and start the ten
+# seed organ runs. It is NOT run during authoring. Every command is bin/symblic-task (no model is
+# called by a start; the organism's own lanes call CLI agents and, through them, light models).
+# Read README.md first. This script warns and waits before it starts anything.
+set -euo pipefail
+
+REPO="${LIFE_REPO:-/home/operator/host-checkout}"
+KIT="$REPO/docs/life"
+ROOT="${LIFE_ROOT:-/home/operator/symblicos/projects/life}"
+TASK="$REPO/bin/symblic-task"
+export DASH_URL="${DASH_URL:-http://127.0.0.1:8080}"
+
+echo "This will create workspace $ROOT and start 10 autogen runs on the worker node cluster."
+echo "the host only orchestrates; models run on the worker nodes. Ctrl-C now to abort."
+read -r -p "Type START to continue: " ans
+[ "$ans" = "START" ] || { echo "aborted"; exit 1; }
+
+# 1. the organism workspace (git-backed; idempotent)
+"$TASK" workspace life
+
+# 2. per-organ working folders (empty; lanes fill them)
+for o in command codebase learning digest selfdev compute metabolism immune heartbeat database; do
+  mkdir -p "$ROOT/organ-$o"
+done
+mkdir -p "$ROOT/organ-command/inbox" "$ROOT/organ-codebase/findings" \
+         "$ROOT/organ-codebase/patches" "$ROOT/organ-immune" \
+         "$KIT/spawn/queue" "$KIT/spawn/approved" "$KIT/spawn/rejected"
+: > "$ROOT/organ-learning/questions.txt"
+: > "$ROOT/organ-immune/canaries.txt"
+
+# 3. copy the schema into the workspace so the database organ can apply it
+mkdir -p "$ROOT/db"; cp -n "$KIT/db/schema.sql" "$ROOT/db/schema.sql"
+
+# 4. start each organ as its OWN perpetual run, node and policy per the kit.
+#    node classes: light=node-a/node-b, mid=node-d/node-f, heavy=node-i; the host for i/o lanes.
+start() { # organ node extra-flags...
+  local organ="$1" node="$2"; shift 2
+  "$TASK" start --lines "$KIT/organs/$organ.lines.txt" --root "$ROOT" --cwd "$ROOT" \
+    --node "$node" --engine agy --id "life-$organ" "$@"
+}
+
+# perpetual organs (flags mirror policies/<organ>.json; keep the two in sync)
+start command    node-f --perpetual 120  --attempt-seconds 600  --wall-seconds 21600 --regenerate 2 --agents-max 12 --strategies fresh,feedback,other_engine --check '0:test -s verify.txt'
+start codebase   node-i --perpetual 1800 --attempt-seconds 3600 --wall-seconds 43200 --regenerate 3 --agents-max 16 --saturation 4 --strategies fresh,feedback,other_engine --check '0:test -s verify.txt'
+start learning   node-d --perpetual 1800 --attempt-seconds 3600 --wall-seconds 86400 --regenerate 2 --agents-max 24 --saturation 3 --strategies fresh,feedback,other_engine --check '0:test -s verify.txt'
+start digest     node-f --perpetual 900  --attempt-seconds 3600 --wall-seconds 86400 --regenerate 2 --agents-max 24 --saturation 3 --strategies fresh,feedback,other_engine --check '0:test -s verify.txt'
+start selfdev    node-i --perpetual 3600 --attempt-seconds 3600 --wall-seconds 86400 --regenerate 2 --agents-max 12 --saturation 4 --strategies fresh,feedback,other_engine --check '0:test -s verify.txt'
+start compute    node-i --perpetual 3600 --attempt-seconds 3600 --wall-seconds 43200 --regenerate 2 --agents-max 12 --saturation 4 --strategies fresh,feedback,other_engine --check '0:test -s verify.txt'
+start metabolism the host --perpetual 300 --attempt-seconds 600  --wall-seconds 86400 --regenerate 1 --agents-max 8  --strategies fresh,feedback --check '0:test -s verify.txt'
+start immune     node-i --perpetual 1800 --attempt-seconds 3600 --wall-seconds 86400 --regenerate 2 --agents-max 16 --saturation 6 --strategies fresh,feedback,other_engine --check '0:test -s verify.txt'
+start heartbeat  the host --perpetual 300 --attempt-seconds 600  --wall-seconds 86400 --regenerate 1 --agents-max 8  --strategies fresh,feedback --check '0:test -s verify.txt'
+
+# bounded database build (not perpetual): runs once to create life.sqlite3 and migrations
+start database   node-a --decompose 1 --children 4 --handoff 2 --regenerate 2 --agents-max 12 \
+  --attempt-seconds 3600 --wall-seconds 21600 --strategies fresh,feedback,other_engine \
+  --check '4:test -s verify.txt' --final 'bash organ-database/check_schema.sh'
+
+echo "Seeded. Watch with: $REPO/docs/life/bin/life-status.py"
+echo "Reproduction stays off until you install the spawn timer (see README)."
+===== END bin/life-seed.sh =====
+
+===== FILE: VALIDATE.sh =====
+#!/usr/bin/env bash
+# LIFE kit validator. Runs ONLY no-model, no-agent, no-network checks and prints PASS/FAIL per
+# file. It never starts a task, never calls a model, never touches anything outside this kit.
+#   - organ lines files : symblic_autogen.lint, zero errors AND zero warnings
+#   - policy JSON        : symblic_autogen.normalize
+#   - genome .sym        : bin/symblic check (no model)
+#   - shell scripts      : bash -n
+#   - python scripts     : python3 -m py_compile
+#   - db/schema.sql      : applied twice in an in-memory sqlite (idempotent); skipped if no sqlite
+# Exit 0 only when every file passes.
+set -u
+KIT="$(cd "$(dirname "$0")" && pwd)"
+REPO="${LIFE_REPO:-/home/operator/host-checkout}"
+SYMBLIC="$REPO/bin/symblic"
+PY="python3"
+fail=0
+pass() { printf 'PASS  %-10s %s\n' "$1" "$2"; }
+bad()  { printf 'FAIL  %-10s %s\n' "$1" "$2"; fail=1; }
+
+echo "== organ lines (lint: zero errors, zero warnings) =="
+for f in "$KIT"/organs/*.lines.txt; do
+  out="$("$PY" - "$f" <<'PYEOF'
+import sys
+sys.path.insert(0, __import__('os').environ.get('LIFE_REPO','/home/operator/host-checkout'))
+import symblic_autogen as A
+lines = A.statements(open(sys.argv[1], encoding='utf-8').read())
+f = A.lint(lines, '/home/operator/symblicos/projects/life')
+n = len(f)
+print(n)
+for lv, ln, m in f:
+    print(f'{lv} line {ln}: {m}')
+PYEOF
+)"
+  n="$(printf '%s\n' "$out" | head -1)"
+  if [ "$n" = "0" ]; then pass lint "$(basename "$f")"; else bad lint "$(basename "$f"): $(printf '%s' "$out" | tail -n +2 | tr '\n' ';')"; fi
+done
+
+echo "== policy JSON (normalize) =="
+for f in "$KIT"/policies/*.json; do
+  if "$PY" - "$f" <<'PYEOF'
+import sys
+sys.path.insert(0, __import__('os').environ.get('LIFE_REPO','/home/operator/host-checkout'))
+import json, symblic_autogen as A
+A.normalize(json.load(open(sys.argv[1], encoding='utf-8')))
+PYEOF
+  then pass normalize "$(basename "$f")"; else bad normalize "$(basename "$f")"; fi
+done
+
+echo "== spawn example (lint + normalize + lineage) =="
+"$PY" - "$KIT/spawn/example/statements.txt" <<'PYEOF' && pass lint "spawn/example/statements.txt" || bad lint "spawn/example/statements.txt"
+import sys
+sys.path.insert(0, __import__('os').environ.get('LIFE_REPO','/home/operator/host-checkout'))
+import symblic_autogen as A
+lines=A.statements(open(sys.argv[1],encoding='utf-8').read())
+sys.exit(1 if A.lint(lines,'/home/operator/symblicos/projects/life') else 0)
+PYEOF
+"$PY" - "$KIT/spawn/example/policy.json" <<'PYEOF' && pass normalize "spawn/example/policy.json" || bad normalize "spawn/example/policy.json"
+import sys
+sys.path.insert(0, __import__('os').environ.get('LIFE_REPO','/home/operator/host-checkout'))
+import json, symblic_autogen as A
+A.normalize(json.load(open(sys.argv[1],encoding='utf-8'))); sys.exit(0)
+PYEOF
+"$PY" -c "import json,sys; d=json.load(open('$KIT/spawn/example/lineage.json')); sys.exit(0 if 0<=d['depth']<=64 and d['cell_id'].count('.')==2 else 1)" \
+  && pass lineage "spawn/example/lineage.json" || bad lineage "spawn/example/lineage.json"
+
+echo "== genome .sym (bin/symblic check, no model) =="
+for f in "$KIT"/genome/*.sym; do
+  if "$SYMBLIC" check "$f" >/dev/null 2>&1; then pass check "$(basename "$f")"; else bad check "$(basename "$f")"; fi
+done
+
+echo "== shell scripts (bash -n) =="
+for f in "$KIT"/checks/*.sh "$KIT"/bin/*.sh "$KIT/VALIDATE.sh"; do
+  if bash -n "$f" 2>/dev/null; then pass "bash -n" "$(basename "$f")"; else bad "bash -n" "$(basename "$f")"; fi
+done
+
+echo "== python scripts (py_compile) =="
+for f in "$KIT"/bin/*.py; do
+  if "$PY" -m py_compile "$f" 2>/dev/null; then pass py "$(basename "$f")"; else bad py "$(basename "$f")"; fi
+done
+
+echo "== db/schema.sql (idempotent apply) =="
+if "$PY" - "$KIT/db/schema.sql" <<'PYEOF'
+import sys, sqlite3
+sql=open(sys.argv[1],encoding='utf-8').read()
+c=sqlite3.connect(':memory:'); c.executescript(sql); c.executescript(sql)
+need={'knowledge','lineage','metrics','commands','experiments'}
+have={r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+sys.exit(0 if need<=have else 1)
+PYEOF
+then pass sqlite "schema.sql"; else bad sqlite "schema.sql"; fi
+
+echo
+if [ "$fail" = "0" ]; then echo "ALL PASS"; else echo "SOME FAILED"; fi
+exit "$fail"
+===== END VALIDATE.sh =====
+
+[This is part 5 of 5, the last part. You now have the whole packet. Now write the full critique at maximum depth, following the critic brief in part 1 exactly: numbered findings with severity, location, the exact ambiguity or defect, and the atomic replacement text; then FINDINGS_TOTAL=<n> and UNDEFINED_DETAILS=<n> on their own lines and a final line VERDICT=<CONVERGED|CHANGES NEEDED>.]

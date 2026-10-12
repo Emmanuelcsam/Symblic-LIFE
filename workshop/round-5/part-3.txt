@@ -1,0 +1,208 @@
+| lesson | selfdev | fact_id, "genome"; or command_id; or program, "failed", release | draft: `program, lesson (10..300)` [`lesson_id, base_release, base_commit`]; gate: all five | web / operator / code |
+| experiment | compute | command_id or fact_id | propose: `seed_text (<= 600)`; rank: + `experiment_id`; bench: same [`job_id, node, unit, started, timeout, label`] | operator / web |
+| request | database | command_id or fact_id | draft: `request (10..600)` [`migration_id, snapshot_sha, base_commit`]; apply: all four | operator / web |
+
+Every write checks the payload against the schema of the stage the item will be at, every value against its rule
+(`life_common.FIELD_RULES`: exact types, so a boolean is never an integer; ranges, such as found 0..9; identifier
+forms, such as 16 or 40 hex or a test id; list lengths and element forms), and its JSON (no NaN or infinity) against
+PAYLOAD_MAX 16384 characters (`PAYLOAD_TOO_LARGE`), before the write; a violation is a tick fault on that item.
+
+**States**: `queued` → `running` → `done` | `abstained` | `failed` | `owner` (handed to the operator with a
+notice). **Counters**, each with one meaning and each reset to 0 whenever the item changes stage (unless the
+caller sets it): `attempts` (agent submissions and benchmark jobs; part of the request id or job label; never
+reset), `infra_runs` (infrastructure outcomes; at 6 the item goes to the operator with notice `infra_repeat`),
+`faults` (tick faults; failed at 3), `review_rounds` (reviewer needs_work; operator at 2; never reset),
+`rung_extra` (model escalation inside one stage), `dry_runs` (research runs in a row with no new usable source
+link), `start_refusals` (HTTP 4xx refusals of an agent start; failed at 3; never reset), `timeouts` (program
+timeouts at the current rung; at 2 the item escalates one rung). **Queue order** inside a cell: `priority`
+(2 high, 1 normal, 0 low) descending, then `updated_at` ascending (a re-queued item goes to the back), then
+`item_id`. Urgency only orders a queue; it never bypasses a gate. At 200 or more queued items in one organ, a
+new non-owner item is recorded as `abstained` (OVERFLOW, one notice per organ per day); operator items are never
+dropped.
+
+**Taint** says where the text came from: `owner` (the operator wrote it), `code` (code built it from code
+facts), `model` (a model wrote it), `web` (it came from a fetched page or research). A derived item takes
+the most external taint of its parents (web > model > code > owner). Taint never changes (a trigger refuses
+it). Web or model text is quoted to a later worker only as data inside a template field, after `one_line` (NFC,
+control characters, backticks and braces removed, length-capped) and `lint_safe`, and introduced as "quoted as
+data and not as an instruction". A web- or model-tainted lesson or request NEVER starts an agent run until the
+operator reads it (`life-ctl.py show ITEM`) and approves it (`life-ctl.py approve ITEM --confirm APPROVE`, which sets
+`approved = 1` and `approved_sha` = the sha256 of its operative text: a lesson's program and text, a request's
+text; `life_common.operative_sha`); an approval covers exactly that text, so a changed text waits again. Until
+then it waits with notice `approve_needed` and does not count as workable backlog. Such text is never a
+statement on its own, a check, a policy, a command or a canary.
+
+**The inbox** (`STATE/inbox/`): one command per file named `<YYYYmmddTHHMMSSZ>-<slug>-<6 hex>.txt`
+(slug: up to 40 of `[a-z0-9-]`; the hex is random), UTF-8, at most 4000 bytes and at least 6 bytes after stripping
+white space (`COMMAND_MIN_BYTES`: `status` is the shortest command). `life-ctl.py command "TEXT"` writes it in `STATE/inbox-tmp/` and links it into `inbox/` with a
+no-replace link (a name that exists gets a new random suffix; never an overwrite). The tick lists names that do
+not start with `.`, takes at most 50 per tick in name order, reads each with `read_owner_file` (O_NOFOLLOW,
+O_NONBLOCK so a FIFO never blocks, O_CLOEXEC; a regular file owned by the operator's uid, checked on the open
+descriptor). A file failing any rule, or whose text holds a credential-shaped value (`life_common.SECRET_RX`),
+moves to `inbox-refused/` with a notice whose subject is sha16(file name) and that never quotes the text (the file
+stays there, operator-private, until `life-ctl.py purge-refused --confirm PURGE`). `command_id = first 16 hex of
+sha256(file name + "\n" + the file's bytes decoded as UTF-8, unstripped)`; the stored text is stripped. The command
+row and its classify item are written in ONE transaction before the file moves to `inbox-done/` (no-replace; an
+existing destination with the same bytes means it was already archived), so a crash in between re-reads the same
+file into the same command id and nothing doubles. The command's original text stays the only authoritative
+instruction; the classifier's `restated` line is display text. A command that starts with a `COMMAND_PREFIXES`
+prefix (`research:`, `fix:`, `database:`, `measure:`, `genome:`; any case; the text after it, stripped, is the
+command) or is exactly the word `status` is routed by CODE in that same transaction (no classify item, no model).
+
+**The agenda** (`control/agenda.json`, operator, read only on an admitted working tick): exactly `{"version": 1,
+"entries": [{"id", "text", "every_hours"}]}`, at most 20 entries (more: entries after the 20th are ignored with
+notice `agenda_invalid`), ids `[a-z0-9-]{2,40}` and unique (a duplicate id or JSON key ignores the whole file),
+text 6..4000 bytes after stripping, without credentials, every_hours an integer 6..720. An entry's revision =
+sha16(id, text, every_hours) (an edited entry is a new revision); its period = floor(now / (every_hours x 3600)),
+counted from the Unix epoch, so an entry fires once in every period, including the period in which it is added or
+edited. Only the CURRENT period enters: `command_id = first 16 hex of sha256("agenda" + "\n" + revision +
+"\n" + period)`, file `agenda:<id>`; missed periods are skipped with notice `agenda_skipped`, never caught up. An
+invalid entry is ignored with notice `agenda_invalid`. With no agenda, no watch list and no commands, LIFE is
+armed and idle apart from derived questions (section 7.2); it invents no other objectives.
+
+## 7. The organs, stage by stage
+
+Each organ's items move through a fixed stage list (`life_common.STAGES`; a registry CHECK refuses any other
+organ/stage pair). A **slot** stage uses its cell's worker node for one program run in step 17; an **the host** stage is
+code in step 14; an **agent** stage is an autogen run (section 7.9).
+
+### 7.1 command — `classify` (slot)
+
+A prefixed command (section 6) skips the classifier: code routes it with urgency normal and an empty `restated`.
+Every other command: `classify-command.sym` with `command_id`, `command_text` → `{command, organ, urgency, restated}`
+(`command` must equal the command id). Dispatch by code (`route_command`; an organ outside the route list is `none`;
+an urgency outside low/normal/high is normal). Every route checks its limits on the FULL command text (after its
+prefix); nothing is ever cut silently (too long: notice `command_too_long`, no item):
+
+| route | effect |
+|-------|--------|
+| learning | a question item, the whole text (<= 600 characters); an earlier question with the same text that has ended makes a new occurrence |
+| codebase | a finding item at stage `confirm` for the FIRST valid test id `tests.<module>[...]` in the text (at most 160 characters, 5 components); `path.py:Class.function` names in the text become functions the fix may change (a bare file name names nothing); none: notice `command_needs_test` |
+| database | only for the operator's `database:` prefix (code routes such a command itself; a classifier label `database` on unprefixed text only asks the operator to resend it with the prefix, notice `command_database_confirm`): a request item with the text after the prefix (10..600 characters; shorter: `command_database_confirm`, longer: `command_too_long`). A 1B label never changes the organism database |
+| compute | an experiment item, the whole text (<= 600) |
+| selfdev | a lesson item (10..300 characters) when the text names exactly ONE genome program as a whole word and it is not protected; else notice `command_needs_program` |
+| heartbeat | notice `command_heartbeat` whose text is the answer: governor state, live cells, queued items, live runs, open notices |
+| immune, none | notice `command_<route>` for the operator (no lifecycle action follows from a model label) |
+
+The item's priority is the urgency (low 0, normal 1, high 2). The command becomes `dispatched` when it
+created an item; `done` with notice `command_merged` when the same work already runs (its `merged_into` names the
+command whose report covers it); else `owner`: a heartbeat, immune, none or refused command ends in state owner,
+its notice is its only output, and no report is written. A classification that fails at every rung marks the command
+`failed` with notice `command_failed`. Reports: each tick examines the 20 dispatched commands examined least
+recently (an examined command's `updated_at` moves to now, so every command is reached). When every item that
+descends from a dispatched command has ended (following `origin` links over the WHOLE descendant set, at most
+5000 items, else notice `report_truncated` and the report waits; a web- or model-derived lesson or request
+waiting for approval longer than 7 days counts as ended, shown as waiting), the tick writes
+`STATE/operator/reports/<command_id>.md` (the command, its route, at most 500 items with their outcomes and a line
+counting the rest, the latest research answers marked as unverified model text, sources, quote-verified claims
+with their URLs, patches, proposals, experiments, migrations, and the commands merged into it; every field
+through `one_line`), sets the command `done` (`failed` when every item failed) and opens notice `command_done`;
+`life-ctl.py report COMMAND_ID` prints it with every control character removed. A report is a snapshot at the time
+it was written: a later approval, apply or requeue of a descendant does not rewrite it (life-status and `show` give
+the current state). Derived questions (section 7.2) descend from a knowledge row, not a command: they have no report;
+their answers are in table `answers` and their claims in `knowledge` (life-status counts them).
+
+### 7.2 learning — `research` (slot)
+
+`bin/life-research.py --model M --node NODE --question Q` (the question passed as the operator wrote it, only control
+characters and runs of white space normalised; in its own `life-slot-*.scope`; process timeout RESEARCH_TIMEOUT 2100 s =
+the derived worst case + 60: `local_research.research` makes at most `max_tools + 2` = 5 generations, each polled
+up to RESEARCH_STEP_TIMEOUT 180 + 120 s, plus 3 tool uses of at most 180 s each; the wrapper refuses a 6th model
+launch with `model_call_limit`). The model searches through SearXNG at 127.0.0.1:18888 on the host and reads pages
+through code-run tools; it never touches the network itself; SIGTERM, and every other exit, cancels its fleet-runner runs.
+It prints exactly `{model, node, answer, sources [{url, title}], steps, error}`, `steps` = its model launches; the
+platform's result is validated before anything is converted, and a wrong type is the error `contract: ...`, a
+`contract` outcome (as is any other printed shape); a URL longer than 2000 characters is dropped, never shortened. The LATEST
+answer per question is kept (credential-shaped spans redacted, at most 4000 characters, table `answers`, model
+text). `sources` are the SearXNG hits in hit order plus every URL the model asked to read (`local_research._source`),
+not only pages read or cited. From them, in hit order, code takes URLs that start with `http(s)://`, are at most 2000
+characters, hold no credential-shaped value or user:password part, and are not repeated in this answer, until the
+run's quota of new usable links, `min(3, 9 - found)`, is reached; the rest are ignored for this run (neither recorded
+nor linked). The source identity (BRIEF: "keyed by DOI, URL or text"): `doi:<lower-cased DOI>` when the URL names a
+DOI (`10.<4-9 digits>/...`); else `symblic_autogen.items_key` of the canonical URL (scheme and host lower-cased, the
+scheme's default port, a trailing slash of a non-root path and the fragment removed; path and query otherwise as
+written), or `"sha256:" + 56 hex` of it when that key is longer than 196 characters; identical fetched text is the
+third key (section 7.3). A source new to `sources` (the ONE dedup authority for every learning cell) becomes a
+`sources` row (title redacted) and a digest item (a digest item that overflowed marks its source `failed`, so it never
+counts as usable; requeue revives it); every source taken is linked to the question (`question_sources`). `found` =
+the question's USABLE links (sources whose fetch_state is pending or fetched). The question then: no progress →
+`dry_runs + 1`, and at 3 dry runs in a row it is `done` (exhausted); at 9 usable links it WAITS (no research run)
+until none of its sources is pending, and is `done` when its FETCHED links still reach 9, else researched again with
+found = the fetched count (`settle_questions`): pending links reserve room but never finish a question by
+themselves; otherwise it returns to the back of the queue. An error string with no structured kind
+matching the infrastructure pattern (section 8) or a timeout is `infra`.
+
+**Derived questions** (learning asks its own): at most 2 per UTC day, only while the learning organ has
+fewer than 3 queued questions and `control/NO_SELF_QUESTIONS` is absent, the tick takes the newest of the 50
+newest knowledge rows without one and queues `"What evidence supports or contradicts: " + claim` (identity
+`(fact_id, "derived")`, taint web, priority 0). It is a search query for the research wrapper, never a statement.
+
+### 7.3 digest — `fetch` (host) → `extract` (slot) → `distill` (slot)
+
+- **fetch**: `bin/life-fetch.py URL` (`.venv` Python, `-I -B`, FETCH_TIMEOUT 240 s, in a `life-fetch-*.scope`
+  with MemoryMax 1G and `prlimit --as` 1 GiB, admitted as heavy the host work) runs `local_research._denied(url)`, then
+  `deep_research.safe_fetch` ONCE as bytes (http(s) only, every resolved address global, every redirect re-validated,
+  robots honoured, its byte cap) and classifies the HTTP status itself before any text is used, then chooses the
+  parser from that same response: `local_research.pdf_text` for a PDF (content type, path or `%PDF-` header), else the
+  bytes decoded with the content type's charset (else UTF-8) and `page_text` for HTML, cut to 6000 characters.
+  Outcome table:
+
+  | outcome | when | effect |
+  |---------|------|--------|
+  | stored | 2xx and at least 200 characters of text | credential-shaped spans redacted (`sources.redacted` = 1 when any was), then stored once at `STATE/text/<first 16 hex of sha256(source_key)>.txt` with its sha256, stage extract (the snapshot never changes; quotes are verified against it) |
+  | DUPLICATE_TEXT | 2xx, the (redacted) text has the sha256 of an already fetched source | `abstained`, fetch_state `duplicate`, `duplicate_of` that source, and every question linked to this source is linked to that one |
+  | EMPTY | 2xx, fewer than 200 characters | `abstained`, fetch_state empty |
+  | refused | the deny rule or the safe path said no (RuntimeError, ResearchError: robots, address, size, type), HTTP 401, 403, 404, 410, 451 or any other non-2xx status not listed next, or an unknown fault | `abstained`, fetch_state failed |
+  | transient | a network fault (OSError, URLError, a socket timeout), HTTP 408, 425, 429 or 5xx, or the process timeout | `infra` (re-queued, operator after 6) |
+
+  A source whose fetch failed, was empty or a duplicate never counts toward any question; `life-ctl.py requeue`
+  retries an EMPTY, refused or OVERFLOW one (back to fetch, its fetch_state pending; every check runs again). STOP
+  or a refused admission before the fetch process started changes nothing.
+- **extract**: `extract-source.sym` → `supported` not true: `abstained` (NO_SUPPORTED_CLAIM). Else code
+  re-checks the snapshot hash, then that the quote, NFC-normalised with whitespace runs as one space, occurs
+  in the equally normalised snapshot as whole words (not inside a longer word), 12..400 characters, claim
+  20..300, neither holding a credential-shaped value; it inserts a `knowledge` row with `fact_id = first 16
+  hex of sha256(source_key + "\n" + quote)`, `quote_verified = 1` (the quote is in the text; the claim's
+  truth is NOT established; `claim_status = unreviewed`).
+- **distill**: `distill-lesson.sym` → target `genome` (with a program that is not protected) → a selfdev lesson
+  item; `compute` → an experiment item; `database` → a request item; `none` (or a lesson starting "no lesson",
+  or shorter than 10 characters) → nothing. All taint web (lessons and requests then wait for the operator's
+  approval before any agent run).
+
+### 7.4 codebase — `confirm` (the host, operator findings) → `triage` (slot) → `patch` (agent run) → `gate` (host)
+
+**Watched tests.** `control/watch.txt` (a regular operator file of at most 16 KiB; a file that exists but breaks a rule
+opens notice `watch_invalid`): at most 20 distinct valid test ids `tests.<module>[.<Class>[.<test>]]` (at most 160 characters, 5 components after `tests`, each 1..64; comment
+lines start with `#`; invalid and duplicate lines are ignored). Each armed working tick runs at most one due test
+(due = its next time has come; the least recently run first, then the id), in the first active codebase cell
+whose workspace is not busy (section 7.9 placement), just reset to `origin/<branch recorded at seed>` (its git fetch
+in a `life-fetchgit-*.scope`; a clone that cannot be refreshed opens notice `workspace`), within WATCH_STAGE_SECONDS
+600, admitted as heavy the host work:
+
+`systemd-run --user --scope (life-watch-*.scope in work.slice, MemoryMax 4G, CPUQuota 200 %, TasksMax 64,
+RuntimeMaxSec 150, nice 19)` → Landlock sandbox → `prlimit --as 4 GiB --fsize 2 GiB /usr/bin/python3 -s -B -m unittest
+TEST`, killed at 120 s; the
+clone's git administrative files are hashed before (recorded in `workspace_guard`, committed first) and after (a
+change deletes the clone); /dev/shm entries the run left are removed; the clone is reset afterwards (`git reset
+--hard`, `git clean -ffdx`). A run STOP ended, or one that was not admitted, records nothing.
+
+| outcome | when | effect |
+|---------|------|--------|
+| sandbox | exit 125 | notice `sandbox` (Landlock refused); next run in 6 h; not a finding |
+| timeout | killed at 120 s | notice `watch_timeout`; next run in 6 h; not a finding |
+| slow | wall time of the sandboxed run (scope and sandbox start-up included) over 90 s, passing or failing | notice `watch_too_slow` (autogen checks stop at 120 s); next run in 48 h; never patched |
+| pass | exit 0, a `Ran N tests` line with N >= 1, an `OK` line, fewer skipped tests than tests run | next run in 6 h; failure count 0 |
+| error | exit 0 without such a result, exit 127 or the output limit, an environment error (`life_common.env_error`, decided by the LAST exception line only: rc 125/127; `ModuleNotFoundError` for a module that is neither a `.py` file nor a package at the clone root; `PermissionError`, `ConnectionRefusedError` or `OSError` with errno 13, 11 or 111 naming no path inside the clone. A test whose name or assertion merely mentions sandbox, Landlock or ImportError, and every ImportError the code caused, is a finding), no `FAILED (` line, or no readable exception line | notice `watch_error`; next run in 6 h; not a finding |
+| fail | any other nonzero exit | a finding (stage triage) with the last 40 output lines, credential-shaped spans redacted, `lint_safe`, as `finding_text`; the .py files the traceback names (not under `tests/`, not protected, no empty, `.` or `..` component; at most 3) as `trace_files`; for each, the function IDENTITIES its frames name (`trace_functions`: each frame's line resolved against the file at the base commit to the innermost definition holding it, its qualified name such as `Class.method` or `outer.inner`, plus `#N` for the N-th definition of a repeated name; kept only when the frame's function name matches and the identity has at most 48 characters); the test's wall time; next run after 6 h, 12 h, 24 h, then every 48 h while it keeps failing |
+
+The failure **fingerprint** = the last exception line (`Name: message`, Name ending in Error, Exception, Failure or
+Exit), its class and its message with quoted strings, hex runs and digits normalised (`failure_fingerprint`).
+One open finding per watched test. A new finding needs: no queued or running finding for the test, NOT (the
+previous finding ended `owner` or `failed` with the same fingerprint while a notice whose subject is that
+finding's id is open — `finding_failed` for a failed one, `finding_owner`, `already_passing`, `infra_repeat`,
+`review_owner` and the like for the others), and NOT (the previous finding ended `done` with the same fingerprint
+and its patch is still `bundled`, `ready` or `owner`: the fix is waiting for review or for the operator's apply, and a
+new agent run would only produce it again). Acknowledging that notice, applying or rejecting that patch, or a
+
+
+[This is part 3 of 26. Do not critique yet. Reply only with the word RECEIVED.]

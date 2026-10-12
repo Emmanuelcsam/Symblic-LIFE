@@ -1,0 +1,332 @@
+[LIFE critique packet, part 4 of 5]
+
+
+
+===== FILE: genome/reproduce.sym =====
+program LIFE reproducer decision.
+use profile=verified, context=none, determine=false, solve=false.
+note The reproducer never does the cell's task. It reads the cell's own metrics and decides whether the cell divides, keeps working, or ends. Code (the orchestrator) acts on this; the model only proposes.
+given cell_id: Text.
+given organ: Text.
+given generation: Int in 0..100000 = 0.
+given failures_in_a_row: Int in 0..100000 = 0.
+given new_items_last_generation: Int in 0..1000000 = 0.
+given lineage_depth: Int in 0..64 = 0.
+given summary: Text.
+define Verdict as one of {
+  stay: "the cell keeps its current single task and does not divide this generation",
+  divide: "the cell splits its remaining work into exactly two child foci that each do less",
+  apoptosis: "the cell stops and is retired because it cannot make progress or is no longer needed"}.
+ask verdict: Verdict "Decide the fate of cell {cell_id} in organ {organ}. Generation {generation}, {failures_in_a_row} failures in a row, {new_items_last_generation} new results last generation, lineage depth {lineage_depth}. Summary: {summary}" from summary by "ollama:qwen3:4b-instruct@node-a" with effort=low, retries=2
+ensure verdict != "divide" or failures_in_a_row = 0 else retry because "a cell that is currently failing must not divide".
+ensure verdict != "divide" or lineage_depth < 10 else retry because "a cell at lineage depth ten or more must not divide".
+ensure verdict != "stay" or failures_in_a_row < 8 else retry because "a cell failing eight generations in a row cannot simply stay".
+ask child_a: Text up to 14 words "If cell {cell_id} divides, name the first child's single specific focus in one short imperative clause." from summary, verdict by "ollama:llama3.2:1b@node-b" with effort=low
+ensure len(child_a) >= 8 and len(child_a) <= 120 else retry because "a child focus is a short clause between eight and one hundred twenty characters".
+ask child_b: Text up to 14 words "If cell {cell_id} divides, name the second child's single specific focus, different from the first, in one short imperative clause." from summary, verdict, child_a by "ollama:llama3.2:1b@node-b" with effort=low
+ensure len(child_b) >= 8 and len(child_b) <= 120 else retry because "a child focus is a short clause between eight and one hundred twenty characters".
+ensure child_a != child_b else retry because "the two children must have different foci".
+let plan = {cell: cell_id, organ: organ, verdict: verdict, generation: generation, child_a: child_a, child_b: child_b}.
+return plan.
+===== END genome/reproduce.sym =====
+
+===== FILE: genome/review-patch.sym =====
+program LIFE patch review.
+use profile=verified, context=none, determine=false, solve=false.
+note The immune cell is the second agent of a codebase cell. It reviews a patch summary adversarially and returns a verdict. Code requires both this accept and the passing checks before Work to Apply; a model accept alone never promotes anything.
+given patch_id: Text.
+given change_class: Text.
+given diff_summary: Text.
+given checks_passed: Bool = false.
+define Verdict as one of {
+  accept: "the change is safe, in scope and matches its stated class",
+  reject: "the change is unsafe, out of scope, or does not match its stated class",
+  needs_work: "the change is close but a named fix is required before it is safe"}.
+ask verdict: Verdict "Review this patch adversarially. Stated class: {change_class}. Summary of the diff: {diff_summary}" from change_class, diff_summary by "ollama:qwen2.5-coder:3b@node-f" with effort=medium, votes=3, retries=2
+ask reason: Text up to 30 words "State the single most important reason for your verdict." from diff_summary, verdict by "ollama:qwen3:4b-instruct@node-f" with effort=low
+ensure len(reason) >= 10 and len(reason) <= 240 else retry because "the reason is between ten and two hundred forty characters".
+ensure verdict != "accept" or checks_passed else retry because "a patch whose automated checks did not pass cannot be accepted".
+let review = {patch: patch_id, verdict: verdict, checks_passed: checks_passed, reason: reason}.
+return review.
+===== END genome/review-patch.sym =====
+
+===== FILE: genome/triage-error.sym =====
+program LIFE error triage.
+use profile=verified, context=none, determine=false, solve=false.
+note The codebase cell gives one failing check or traceback line to a light coder model, which classifies the change class. Promotion is allowed only for the classes the master script permits; code enforces that, not the model.
+given finding_id: Text.
+given finding_text: Text.
+define ChangeClass as one of {
+  test_only: "a change confined to files under a tests directory",
+  comment_or_doc: "a change only to comments, docstrings or markdown",
+  local_fix: "a bounded fix inside one function body with no signature change",
+  signature_change: "a change to a function or class signature or public interface",
+  restart_gated: "a change to server python or an api handler that needs a dashboard restart",
+  unknown: "the finding cannot be classified from this text alone"}.
+ask change_class: ChangeClass "Classify the smallest change that would resolve this finding. Finding: {finding_text}" from finding_text by "ollama:qwen2.5-coder:3b@node-a" with effort=medium, votes=3, retries=2
+ask confident: Bool "Is this classification well supported by the finding text alone?" from finding_text, change_class by "ollama:llama3.2:1b@node-b" with effort=low
+let triage = {finding: finding_id, change_class: change_class, confident: confident}.
+return triage.
+===== END genome/triage-error.sym =====
+
+===== FILE: checks/devcheck-gate.sh =====
+#!/usr/bin/env bash
+# LIFE codebase gate: the codebase organ worker runs this inside its OWN checkout before it
+# writes a patch as accepted. It runs the repo's own bin/devcheck plus one focused test file the
+# worker names. It never restarts anything and never pushes. Exit 0 only when both pass.
+# Calls no model and no agent (bin/devcheck itself runs linters/tests, not models).
+set -eu
+checkout="${1:?usage: devcheck-gate.sh CHECKOUT_DIR FOCUSED_TEST}"
+focused="${2:?name one focused test, e.g. tests/test_security_gate.py}"
+cd "$checkout"
+./bin/devcheck
+.venv/bin/python -m unittest "$focused" -v 2>/dev/null || python3 -m unittest "$focused" -v
+echo "devcheck-gate: PASS for $focused"
+===== END checks/devcheck-gate.sh =====
+
+===== FILE: checks/heat-gate.sh =====
+#!/usr/bin/env bash
+# LIFE metabolism heat gate (code side). Reads the host load and IO pressure locally and prints
+# ALLOW or HOLD for cluster fan-out. Thresholds from docs/fleet-power.md and the operator heat rule.
+# ALLOW (exit 0): 1-minute load average < 4.0 AND io pressure full avg10 < 40.0.
+# HOLD  (exit 4): otherwise. Calls no model, no agent, no network.
+set -eu
+load1="$(awk '{print $1}' /proc/loadavg)"
+io="$(awk -F'=' '/full/{split($0,a," "); for(i in a) if(a[i] ~ /avg10/){split(a[i],b,"="); print b[2]}}' /proc/pressure/io 2>/dev/null || echo 0)"
+awk -v l="$load1" -v p="${io:-0}" 'BEGIN{
+  if (l+0 < 4.0 && p+0 < 40.0) { printf "ALLOW load=%s io_full_avg10=%s\n", l, p; exit 0 }
+  printf "HOLD load=%s io_full_avg10=%s\n", l, p; exit 4
+}'
+===== END checks/heat-gate.sh =====
+
+===== FILE: checks/kill-switch.sh =====
+#!/usr/bin/env bash
+# LIFE kill switch probe. Prints STOP and exits 3 when the stop file exists, else prints GO
+# and exits 0. The orchestrator (bin/life-spawn-tick) runs this before every spawn; the operator
+# creates the stop file to freeze reproduction. Lanes already running finish their generation.
+# Calls no model, no agent, no network.
+set -eu
+root="${1:-/home/operator/symblicos/projects/life}"
+if [ -e "$root/STOP" ]; then
+  echo "STOP ($root/STOP present): no new spawns, lanes finish and rest"
+  exit 3
+fi
+echo "GO ($root/STOP absent)"
+exit 0
+===== END checks/kill-switch.sh =====
+
+===== FILE: checks/verify-format.sh =====
+#!/usr/bin/env bash
+# LIFE check: a verify.txt exists in the current working folder and is non-empty.
+# Used as the autogen check for perpetual organ lanes (policy checks index "0").
+# Exit 0 pass, 1 fail. Calls no model, no agent, no network.
+set -eu
+f="${1:-verify.txt}"
+if [ -s "$f" ]; then
+  echo "verify-format: $f present, $(wc -c <"$f") bytes"
+  exit 0
+fi
+echo "verify-format: $f missing or empty" >&2
+exit 1
+===== END checks/verify-format.sh =====
+
+===== FILE: spawn/PROTOCOL.md =====
+# LIFE spawn protocol (reproduction, admitted by code)
+
+A cell divides only by writing a **spawn record** into `spawn/queue/<name>/`. A reproducer cell
+(the second agent of a subtask, running `genome/reproduce.sym` on a lightweight model) proposes
+the division; the **orchestrator** `bin/life-spawn-tick.py` (code on the host, run by the operator's
+timer, calling no model) is the only thing that admits it and starts the new autogen run. Models
+propose; code decides.
+
+## Record layout (exact)
+
+```
+spawn/queue/<name>/
+  statements.txt   one or more statement lines for the child lane (the child's genome)
+  policy.json      the child's autogen policy (a superset of a normalize()-valid object)
+  lineage.json     who the child is and where it runs
+  reason.txt       prose: why this division (not read by the orchestrator; for the operator/immune)
+```
+
+`<name>` is any `^[a-z0-9][a-z0-9_-]{0,63}$` slug (the orchestrator timestamps it on admission).
+
+### statements.txt
+- Each nonblank line is one statement. Must pass `symblic_autogen.lint(lines, ROOT)` with
+  **zero errors and zero warnings**: 20-1500 chars, first word in `VERBS`, an absolute
+  `/home/operator/symblicos/projects/life/...` folder named on every line, no pronoun start,
+  `keeping every existing part` on any edit verb, no reference to earlier lines, and the file
+  as a whole has a verify line (a line containing both `verif` and a `.txt` name).
+- At most 64 lines (`MAX_LINES`), 60000 chars total (`MAX_CHARS`).
+
+### policy.json
+- Must pass `symblic_autogen.normalize`. Perpetual lanes: `perpetual true`, `candidates 1`,
+  `depth 0`, an `interval_seconds` and a `wall_seconds` cap (the heat rule; never 0/unlimited for
+  a child), `strategies` drawn from `fresh,feedback,other_engine` (never `other_node`: that can
+  place a child on the host or the ARM node).
+
+### lineage.json (exact keys)
+```json
+{
+  "cell_id": "<organ>.<generation>.<8hex>",   // e.g. learning.3.a1b2c3d4
+  "organ": "<one of the ten organ names>",
+  "parent_id": "<parent cell_id or null for a seed>",
+  "depth": <int 0..64>,                         // parent depth + 1
+  "focus": "<8..120 char clause from reproduce.sym>",
+  "spawn_reason": "divide|seed|replan",
+  "node": "node-a|node-b|node-d|node-f|node-h|node-i",  // never the host/node-arm for a model lane
+  "engine": "agy"                               // CLI engine for the lane's attempts
+}
+```
+
+## Admission gates (bin/life-spawn-tick.py, in order)
+
+1. **kill switch** - `spawn/../STOP` (that is `/home/operator/symblicos/projects/life/STOP`) absent,
+   else the tick exits 3 and nothing is born.
+2. **heat gate** - `checks/heat-gate.sh` returns ALLOW (the host load < 4.0 and io full avg10 < 40.0),
+   else exit 4.
+3. **budget** - fewer than `LIFE_MAX_RUNS` (default 16) live `life-*` autogen runs; else the
+   record stays queued.
+4. **lint** - `statements.txt` has zero lint errors and zero warnings.
+5. **normalize** - `policy.json` passes `symblic_autogen.normalize`.
+6. **lineage depth** - `depth < LIFE_MAX_DEPTH` (default 10) and `<= 64`; `cell_id` matches
+   `organ.generation.8hex`.
+7. **content dedup** - `sha256(statements || "\n" || policy)` is not already in `spawn/hashes.txt`.
+   (A reproducer that re-proposes identical work is a no-op; this is the self-replication brake.)
+
+A record that fails any gate is moved to `spawn/rejected/<name>-<epoch>/` with a `REJECT.txt`
+reason. A record that passes is submitted with `bin/symblic-task start --lines statements.txt
+--root ROOT --cwd ROOT --node <node> --engine <engine> --id life-<organ>-<8hex>` plus the flags
+`policy_flags()` derives from `policy.json`, its hash is appended to `spawn/hashes.txt`, and the
+record moves to `spawn/approved/<name>-<epoch>/` with a `RUN.txt` naming the run.
+
+## Apoptosis
+
+A reproducer verdict of `apoptosis` writes **no** queue record; instead it appends the cell_id to
+`spawn/retired.txt`. The operator (or the immune organ) cancels the run with
+`bin/symblic-task autogen cancel <run_id>` and sets `retired_at` in the `lineage` table. A lane
+that a reproducer retires is never re-spawned (its content hash stays in `hashes.txt`).
+===== END spawn/PROTOCOL.md =====
+
+===== FILE: spawn/example/lineage.json =====
+{
+  "cell_id": "learning.3.a1b2c3d4",
+  "organ": "learning",
+  "parent_id": "learning.2.00000000",
+  "depth": 3,
+  "focus": "research porous ceramic porosity sources",
+  "spawn_reason": "divide",
+  "node": "node-d",
+  "engine": "agy"
+}
+===== END spawn/example/lineage.json =====
+
+===== FILE: spawn/example/policy.json =====
+{
+  "version": 1,
+  "perpetual": true,
+  "interval_seconds": 1800,
+  "attempt_seconds": 3600,
+  "wall_seconds": 86400,
+  "candidates": 1,
+  "regenerate": 2,
+  "agents_max": 24,
+  "saturation": 3,
+  "strategies": ["fresh", "feedback", "other_engine"],
+  "syntax": true,
+  "require_change": true,
+  "checks": {"0": ["test -s verify.txt"]},
+  "final": []
+}
+===== END spawn/example/policy.json =====
+
+===== FILE: spawn/example/reason.txt =====
+Parent learning.2.00000000 reached saturation on its broad question set but its reproducer
+(genome/reproduce.sym on qwen3:4b-instruct@node-a) returned verdict=divide because new sources
+kept arriving for the porosity sub-topic while the rest of the queue went stale. Child A (this
+record) takes the porosity sub-topic on its own node and index; child B keeps the remainder.
+This record was written by the reproducer cell; the orchestrator (bin/life-spawn-tick.py) admits
+it only after lint + normalize + budget + depth + content-hash dedup all pass.
+===== END spawn/example/reason.txt =====
+
+===== FILE: spawn/example/statements.txt =====
+Research the question in the file /home/operator/symblicos/projects/life/organ-learning/questions.txt about porous ceramic porosity, find three sources with a DOI or URL not already in the index, append one JSON line per source to the file /home/operator/symblicos/projects/life/organ-learning-c1/sources.jsonl, and verify this batch by writing the three new source keys to the file verify.txt.
+===== END spawn/example/statements.txt =====
+
+===== FILE: db/schema.sql =====
+-- LIFE v1 organism database schema.
+-- One SQLite file: /home/operator/symblicos/projects/life/db/life.sqlite3
+-- Every table uses CREATE TABLE IF NOT EXISTS so re-applying is a no-op and never drops rows.
+-- Times are integer Unix seconds (strftime('%s')). Ids are text. No credentials or private
+-- store values are ever written here; only organism metadata, provenance and public sources.
+
+-- knowledge: one checked fact per row, produced by the digest organ from a fetched source.
+CREATE TABLE IF NOT EXISTS knowledge (
+  id           TEXT PRIMARY KEY,        -- items_key form: doi:/url:/text: (<=200 chars)
+  claim        TEXT NOT NULL,           -- model wording of the fact, 20..300 chars
+  quote        TEXT NOT NULL,           -- span copied verbatim from the source (kernel-checked)
+  source_id    TEXT NOT NULL,           -- id of the source row in sources.jsonl
+  source_url   TEXT NOT NULL,           -- http(s) url or DOI the quote came from
+  organ        TEXT NOT NULL DEFAULT 'digest',
+  created_at   INTEGER NOT NULL,
+  verified     INTEGER NOT NULL DEFAULT 0  -- 1 only when quotes() passed at extraction time
+);
+CREATE INDEX IF NOT EXISTS knowledge_source ON knowledge (source_id);
+
+-- lineage: the family tree of cells. Each spawn writes one row. Append-only.
+CREATE TABLE IF NOT EXISTS lineage (
+  cell_id      TEXT PRIMARY KEY,        -- organ '.' generation '.' 8hex  e.g. learning.3.a1b2c3d4
+  organ        TEXT NOT NULL,
+  parent_id    TEXT,                    -- NULL for a seed cell
+  depth        INTEGER NOT NULL DEFAULT 0,  -- 0..64, parent depth + 1
+  focus        TEXT NOT NULL,           -- the child's single specific focus (8..120 chars)
+  spawn_reason TEXT NOT NULL,           -- divide | seed | replan
+  content_hash TEXT NOT NULL,           -- sha256 of (statements_file || policy_json) for dedup
+  run_id       TEXT,                    -- the autogen run id once the orchestrator submits it
+  created_at   INTEGER NOT NULL,
+  retired_at   INTEGER                  -- set on apoptosis / quarantine
+);
+CREATE INDEX IF NOT EXISTS lineage_parent ON lineage (parent_id);
+CREATE UNIQUE INDEX IF NOT EXISTS lineage_hash ON lineage (content_hash);
+
+-- metrics: one row per organ generation, written by heartbeat from the run records.
+CREATE TABLE IF NOT EXISTS metrics (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  organ        TEXT NOT NULL,
+  run_id       TEXT NOT NULL,
+  generation   INTEGER NOT NULL DEFAULT 0,
+  new_items    INTEGER NOT NULL DEFAULT 0,  -- new index keys this generation
+  failures     INTEGER NOT NULL DEFAULT 0,  -- trailing failed generations
+  node         TEXT,                        -- node the generation ran on
+  at           INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS metrics_organ ON metrics (organ, at);
+
+-- commands: operator commands taken by the command inbox, with their route.
+CREATE TABLE IF NOT EXISTS commands (
+  id           TEXT PRIMARY KEY,        -- sha256[:16] of the command text + arrival time
+  text         TEXT NOT NULL,
+  organ        TEXT NOT NULL,           -- routed organ, or 'none'
+  urgency      TEXT NOT NULL DEFAULT 'normal',  -- low | normal | high
+  restated     TEXT NOT NULL,
+  status       TEXT NOT NULL DEFAULT 'routed',  -- routed | accepted | done | rejected
+  created_at   INTEGER NOT NULL
+);
+
+-- experiments: compute/storage R&D proposals and their measured results.
+CREATE TABLE IF NOT EXISTS experiments (
+  id           TEXT PRIMARY KEY,
+  hypothesis   TEXT NOT NULL,
+  measurement  TEXT NOT NULL,           -- the exact shell command that produces a number
+  threshold    TEXT NOT NULL,           -- the comparison that counts as success, e.g. '< 1.0'
+  score        INTEGER NOT NULL DEFAULT 0,   -- 0..100 ranking from rank-experiment.sym
+  node         TEXT,                    -- node the benchmark ran on
+  measured     TEXT,                    -- the number produced, as text; NULL until run
+  passed       INTEGER,                 -- 1 pass, 0 fail, NULL not run
+  created_at   INTEGER NOT NULL,
+  ran_at       INTEGER
+);
+CREATE INDEX IF NOT EXISTS experiments_score ON experiments (score DESC);
+===== END db/schema.sql =====
+
+[This is part 4 of 5 of the LIFE critique packet. Do not critique yet. Reply only with the word RECEIVED.]

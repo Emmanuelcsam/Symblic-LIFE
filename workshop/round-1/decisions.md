@@ -1,0 +1,44 @@
+# Round 1 decisions: findings not applied as written
+
+One line per finding that was rejected, or applied only in part, with the reason. Every other finding
+in critique-cloud.md (C), critique-local.md (Lo) and critique-chatgpt.md (G) was applied in LIFE v2 or
+removed together with the v1 mechanism it described (see LOG.md, Round 1). Platform facts cited here
+were read in the live checkout on 2026-10-11.
+
+- C1 (fix `--cwd ROOT/organ-<name>`): rejected as written: symblicos/autogen.py AutogenManager.submit refuses a cwd without its own `.git`; applied instead as one git workspace per agent cell (Lo4's variant), and model organs no longer use autogen at all.
+- C8 (move lanes to keep per-worker node duty <= 0.5 by interval arithmetic): superseded: the tick's governor (3000 s work window, 600 s rest, one program run per worker node per tick) bounds load directly; no perpetual lane remains to place.
+- C35 (`git clone --depth 50 <origin>` into ROOT/organ-codebase/checkout): rejected: a nested repository inside a promoted workspace would itself be promoted; each codebase cell owns a separate clone workspace `life-codebase-<8hex>`.
+- C36 (an apply tick that applies accepted patches to the live checkout automatically): rejected: the live checkout holds others' uncommitted work and Python changes are restart-gated; patches are bundled, gated and reviewed, and only the operator applies them (`life-ctl.py apply`, conflict-checked, before/after hashes, revert).
+- C46 (store 20000 characters of source text): changed to 6000: the existing `local_research.read_page` default and the 4B models' context; a longer text is cut by that function, not by LIFE.
+- C52 (a LIFE-specific source-key normalisation): rejected: the engine's own `symblic_autogen.items_key` is used, so LIFE and autogen can never disagree on a key.
+- C54 ("tail the dashboard error log" as a findings source): rejected: logs can hold private data and must not enter prompts; findings come only from the operator's watch list of unittest ids and operator commands.
+- C59 / Lo46 (high-power mode request rows for the operator): rejected: LIFE never needs high-power mode (its governor rests instead of boosting), so it writes no request; a passed experiment is an `experiment_passed` notice and any lease stays the operator's own action.
+- C61 (run model-authored measurement scripts under unshare/ulimit with a word deny-list): rejected: a deny-list does not make model-written shell safe; only operator-written benchmark templates run, and the model chooses a parameter that must match the template's `param_rx` (Lo21, G167).
+- C70 ("`--by` overrides every in-file `by`"): rejected: wrong: `symblic_run.Run._apps` uses an ask-level `by` before `opts['by']`; the genome asks now carry no `by`, so the tick's `--by` decides.
+- C81 (squash the workspace's git history daily): rejected: rewriting history is destructive; growth is bounded by 12 agent runs a day and one run per workspace.
+- C86 (`LIFE_ALLOW_CLOUD=1` switch for cloud CLIs): rejected: agy is the only engine and is itself a cloud CLI named by the brief; spend is bounded by AGENT_RUNS_PER_DAY = 12 x 3 agents, and other_engine is never in a strategy list.
+- C87 (exit 5 when any start failed): rejected: per-item start failures are recorded on the item and in notices; exit codes are reserved for tick-level states (STOP 3, integrity/contract hold 5, unseeded 6).
+- Lo2 (renew stuck perpetual lanes while ARMED): superseded: no perpetual lane remains; ARMED was adopted as the operator's standing consent for new work, scoped to the current boot.
+- Lo15(a) ("`--engine local --model M` makes a cell a bare local model"): rejected: since 2026-10-11 the autogen local engine accepts only spec sheets and refuses perpetual lanes (AutogenManager.submit); light models run as genome programs from the tick instead (GAP 2).
+- Lo17 (PERMITTED = {test_only, comment_or_doc} only): partly: local_fix patches are also written, because nothing is applied without the operator; signature_change, unknown and confident=false go to the operator, and `path_class` (code) marks restart-gated paths at apply time.
+- Lo28 (a 45-minute window with every LIFE worker node busy): replaced by G46's numbers (3000 s, 600 s rest, short gaps never reset) and "3 or more online LIFE worker nodes at cpu >= 50 %", which also counts the operator's non-LIFE load.
+- Lo35 (one fixed model per node): rejected: programs need different model sizes; instead one program run per node per tick, the fleet runner's one-model cap, and per-cell ladders.
+- Lo53 (put an inefficient organ to rest automatically): partly: an organ under 0.2 efficiency may not divide (and its cells still retire when idle); resting it entirely would stop command intake, which the operator must decide.
+- G1 (an immutable hash manifest of platform files that blocks startup): partly: hash pinning would hold LIFE on every unrelated commit to this busy checkout; the tick instead checks the specific platform facts it relies on (`contract_problems`) every tick, and the release manifest pins LIFE's own genome, organs and policies.
+- G25 (verify coordinator executables against a release manifest): partly: genome, organs and policies are pinned per release and checked every tick; bin/ and checks/ are operator kit material that no worker can reach (STATE and the kit are outside every workspace).
+- G26 (block launch unless a sandbox capability is proven): partly: agent runs use the hub's registered launch path and its sandbox (BRIEF: use the admitted paths); LIFE cannot probe that sandbox per launch and adds its own limits (fixed policy, own workspace, code-only acceptance).
+- G35 (256 MiB per cell, 1024 pending records): partly: the total cap (10 GiB) and a 5 GiB free-disk floor are enforced; a per-cell cap and a record cap have no meaning without a file queue.
+- G42 (per-job CPU/memory/process limits including descendants): partly: model jobs are bounded by the fleet runner and the 900 s process-group kill, the tick unit by MemoryMax=1G/TasksMax=128, benchmarks by `timeout` and `nice`; per-job cgroups on the worker nodes are platform features LIFE cannot set.
+- G43 (per-task operator authorisation for every cloud tool loop): rejected: it would make the organism non-autonomous; the operator's authorisation is ARMED (per boot) plus SELFDEV_ARMED plus the daily agent budget.
+- G47 (a signed governor snapshot): partly: one writer process and one governor row are used; signing adds nothing when writer and reader are the same program under one lock.
+- G48 (telemetry older than 15 s is inadmissible): changed to 180 s: `/api/cluster/status` serves a cached probe; 15 s would hold LIFE permanently.
+- G56 (a 30-second tick budget): rejected: program runs take minutes on CPU worker nodes; the tick has TICK_DEADLINE 1200 s, TimeoutStartSec 1500, and the next tick starts 300 s after it ends.
+- G57 (restricted writable paths in the unit): partly: MemoryMax and TasksMax are set; ProtectSystem/ReadWritePaths are not, because the tick must run git in workspaces and bin/symblic, whose write sets are the platform's.
+- G99 (running descendants of a quarantined parent may not commit until revalidated): partly: quarantine moves queued items to siblings at once; a run already live finishes and is collected under its own acceptance checks.
+- G112 / G199 (deterministic admission tests with stubbed models before enabling): deferred: this workflow may run only lint, check, normalize and syntax checks, so no test could be run; recorded as GAP 8 and GAP 9 and required before arming.
+- G119 (store quote start/end offsets): rejected: code re-verifies quote membership against the immutable stored snapshot (hash-checked); offsets would add a second representation that can drift.
+- G125 (closed-schema JSON command envelopes): rejected: a command is one free-text field; plain UTF-8 files named by UTC time, written atomically by life-ctl, carry the same guarantees.
+- G131 / G133 (question records with exclusions and source requirements; source rows with final URL, MIME and parser version): partly: the operator's original text is the question; `read_page` returns text only, so sources keep URL, title, key, text path and text sha256.
+- G140 (bounded retrieval of knowledge into every later task): partly: the learning loop is fact -> distill -> lesson/experiment/request; a general retrieval step for planning is not in v2.
+- G162 (a measured improvement contract before any selfdev change): partly: proposals are protected-line checked, kernel-checked, model-reviewed and operator-adopted; a measured objective needs recorded program fixtures first (GAP 9).
+- G48: corrected in round 2 (round-2/decisions.md, last section): the status route re-probes after 2 s and its ts is the answer time, so v2.1 holds on a slow or failed answer instead of a ts age.

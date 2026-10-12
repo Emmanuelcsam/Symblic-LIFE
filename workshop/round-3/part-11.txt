@@ -1,0 +1,461 @@
+[LIFE round-3 critique packet, part 11 of 14]
+
+INFRA_RUNS_MAX = 6            # infra outcomes of one item before it goes to the operator (notice infra_repeat)
+FAULTS_MAX = 3                # tick faults (Tick.guard) on one item before it fails
+START_ATTEMPTS_MAX = 3        # not-submitted agent starts before the item fails
+NODE_HOLD_SECONDS = 1800      # a node that answered infra is skipped for at least the next tick
+MODELS_REFRESH_SECONDS = 86400  # the installed-model inventory (bin/local-research --list) is re-read daily
+# population and reproduction
+LIFE_MAX_CELLS = 16           # cells in state active, dividing or quarantined, all organs
+ORGAN_CELL_CAP = 3            # such cells per organ
+NODE_CELL_CAP = 4             # such cells per node
+MAX_DEPTH = 10                # a child's depth is at most 10; a parent may divide only at depth < 10
+DIVIDE_SUSTAIN = 3            # consecutive armed ticks with workable backlog >= the organ's divide_backlog
+DIVISION_COOLDOWN = 21600     # seconds after an aborted division before that parent may try again
+DIVISIONS_OPEN_MAX = 1        # division transactions open at once, fleet-wide (also a unique index)
+DIVISION_MAX_SECONDS = 10800  # an open division older than this aborts
+APOPTOSIS_IDLE_SECONDS = 86400  # an empty, idle cell with an active sibling retires after this long
+QUARANTINE_FAILURES = 8       # consecutive failed items
+EFFICIENCY_FLOOR = 0.2        # (done + abstained) / (program runs + 3 x agent runs) an organ needs to divide
+EFFICIENCY_MIN_RUNS = 20      # below this many cost units over the two prior UTC days, efficiency is not judged
+LAST_CELL_AUTO_RELEASE = 86400  # an organ's only cell, quarantined, is released once after this long
+REQUARANTINE_WINDOW = 7 * 86400  # a second quarantine within this window waits for the operator
+NODE_OFFLINE_MOVE = 21600     # a cell whose node has been offline this long moves to another node
+WORKSPACE_FAILURES_MAX = 3    # failed workspace re-creations before the cell retires (end_reason workspace)
+ABSTAIN_WINDOW, ABSTAIN_RATE = 20, 0.9   # notice abstain_rate when >= 90 % of a cell's last 20 endings abstained
+QUEUE_CAP_PER_ORGAN = 200     # queued items per organ; beyond it new web/code items end abstained (OVERFLOW)
+# agent runs
+AGENT_RUNS_LIVE_MAX = 2       # LIFE autogen runs submitting/live/submit_unknown at once, fleet-wide (1 per cell)
+AGENT_RUN_KILL_SECONDS = 4500 # the tick cancels a LIFE run still live this long after submission (a failure)
+RUN_UNKNOWN_NOTICE = 900      # a run LIFE cannot confirm for this long opens notice run_unknown
+START_TIMEOUT = 180           # bin/symblic-task start
+CANCEL_TIMEOUT = 60           # bin/symblic-task autogen cancel
+CATALOG_TIMEOUT = 60          # bin/symblic-task catalog --json
+NEEDS_WORK_MAX = 2            # reviewer needs_work rounds per finding before it goes to the operator
+# UTC-day budgets; a spent budget holds that class of work until 00:00 UTC
+PROGRAM_RUNS_PER_DAY = 1200
+MODEL_CALLS_PER_DAY = 9000
+AGENT_RUNS_PER_DAY = 12
+BENCH_JOBS_PER_DAY = 12
+BIRTHS_PER_DAY = 8
+SELF_QUESTIONS_PER_DAY = 2
+# learning and digest
+QUESTION_DRY_LIMIT = 3        # research runs in a row with zero new sources before a question is exhausted
+QUESTION_SOURCE_LIMIT = 9     # sources (new or already known) per question before it is done
+NEW_SOURCES_PER_RUN = 3       # at most min(3, 9 - found) sources are recorded from one research run
+SELF_QUESTION_QUEUE_MAX = 3   # derived questions are made only while learning has fewer queued questions
+SOURCE_TEXT_CHARS = 6000      # text kept per source (local_research.read_page chars; its marker is stripped)
+SOURCE_TEXT_MIN = 200         # shorter text is EMPTY (abstained)
+SOURCE_KEY_MAX = 200
+FETCHES_PER_TICK = 4
+FETCH_TIMEOUT = 90
+# codebase
+WATCH_MAX = 20                # watch.txt lines
+WATCH_TIMEOUT = 120           # one watched-test run (= symblicos/autogen.py CHECK_TIMEOUT)
+WATCH_SLOW = 90               # a watched test slower than this is never patched (notice watch_too_slow)
+WATCH_BACKOFF = (21600, 43200, 86400, 172800)   # 6 h, 12 h, 24 h, then 48 h between runs of a failing test
+TAIL_LINES = 40
+GATE_TIMEOUT = 900            # checks/devcheck-gate.sh
+DIFF_MAX_BYTES = 262144       # larger diffs are refused at the gate
+DIFF_REVIEW_BYTES = 6000      # a diff larger than this is not model-reviewed: it goes to the operator
+LOCAL_FIX_FILES_MAX = 3
+GIT_TIMEOUT = 120
+GIT_FETCH_TIMEOUT = 300
+CLONE_TIMEOUT = 600
+# compute
+BENCH_PAIRS = 3               # baseline/candidate pairs per experiment, alternating, baseline first
+BENCH_TIMEOUT_MIN, BENCH_TIMEOUT_MAX = 30, 300   # per run, operator template field
+BENCH_GRACE = 300             # a job past its timeout + this is cancelled
+JOB_CANCEL_TIMEOUT = 30
+JOBS_PAGE, JOBS_PAGES_MAX = 200, 5
+BENCH_AS_BYTES = 4 * 1024 ** 3   # prlimit --as for benchmark jobs
+BENCH_FSIZE_BYTES = 2 * 1024 ** 3
+BENCH_NOFILE = 256
+PARAM_RX = re.compile(r'[A-Za-z0-9._:+-]{1,64}')   # every benchmark parameter and baseline (fullmatch)
+# database
+MIGRATION_MAX_BYTES = 16384
+MIGRATION_STATEMENTS_MAX = 24
+SNAPSHOT_MAX_BYTES = 262144
+MIGRATION_NUMBER_MAX = 9999
+# upkeep, storage, observability
+CANARY_EVERY_SECONDS = 3600   # canary round period (the first armed or disarmed tick runs one at once)
+CANARY_TIMEOUT = 60           # per canary line
+CANARY_ROUND_SECONDS = 600    # the whole round
+STATE_MAX_BYTES = 10 * 1024 ** 3   # STATE plus every LIFE workspace under PROJECTS
+STORAGE_EVERY_TICKS = 12      # the storage walk runs on ticks 1, 13, 25, ... (the free-disk check every tick)
+DISK_FREE_MIN = 5 * 1024 ** 3
+LOG_ROTATE_BYTES = 5 * 1024 ** 2   # tick.log plus three archives tick.log.1..3
+BACKUP_KEEP = 7               # daily backup files per database
+PREMIGRATION_KEEP = 10        # organism-before-<id> copies
+CALLS_KEEP_DAYS = 14          # STATE/calls/<id>/ of ended items older than this are deleted at the daily backup
+SAMPLES_KEEP_DAYS = 7
+HOLD_NOTICE_TICKS = 12        # the same hold for this many ticks opens notice held
+TEMP_MISSING_SAMPLES = 12     # a node without a temperature for this many samples opens notice telemetry
+FAULTS_IN_A_ROW_MAX = 3       # tick faults in a row before the fault hold (life-ctl clear-fault)
+REPORT_COMMANDS_PER_TICK = 20
+OUTPUT_KEEP_BYTES = 1 << 20   # stdout kept per process; stderr keeps 1 << 16
+OUTPUT_KILL_BYTES = 16 << 20  # a process writing more than this is killed
+HTTP_MAX_BYTES = 8 << 20
+# metabolism (LIFE.md section 10)
+LOADED_CPU = 50.0             # vitals.cpu (% busy) at or above: the node is loaded in this sample
+LOADED_OWN_FRACTION = 0.5     # or LIFE kept the node busy this fraction of the interval
+FLEET_LOADED_NODES = 3        # at least this many online LIFE nodes loaded: the fleet is loaded
+WORK_WINDOW = 3000            # loaded seconds before the fleet must rest
+REST_SECONDS = 600            # consecutive quiet seconds that end a rest and reset the window
+NODE_WINDOW, NODE_BUSY_MAX, NODE_REST = 3600, 3000, 600   # per node: busy >= 3000 s of the last 3600 s rests it
+TELEMETRY_REFRESH = 120       # the slot phase re-reads /api/cluster/status when the sample is older than this
+HOT_C, COOL_C = 85.0, 75.0    # same thresholds as symblic_apply.THERMAL_HOT/THERMAL_COOL
+MEM_RESERVE_MIB = 2048        # a node needs memAvailMiB >= reserve + the model's size + KV_ALLOWANCE_MIB
+KV_ALLOWANCE_MIB = 1024       # context (KV cache) allowance per call on top of the model weights
+HOST_LOAD_FRACTION = 0.75  # the host load1 must stay below this x os.cpu_count()
+HOST_IO_FULL_AVG60 = 10.0  # the host /proc/pressure/io full avg60 must stay below this
+# units and adapter timeouts
+HOUR, DAY = 3600, 86400
+HTTP_TIMEOUT = 30             # a loopback GET or POST that should answer at once
+HTTP_SLOW_TIMEOUT = 60        # /api/cluster/status (it may probe), autogen get, the jobs listing, map submit
+MODEL_MIB_UNKNOWN = 4096      # memory assumed for a model missing from MODEL_MIB
+REPORT_ITEMS_MAX = 500        # items a command report follows through origin links
+SQLITE_TIMEOUT = 5            # seconds a connection waits for another writer (busy_timeout 5000 ms)
+# sizes
+PAYLOAD_MAX = 16384
+COMMAND_MAX_BYTES = 4000
+INBOX_PER_TICK = 50
+
+# ------------------------------------------------------------------------------------------- small helpers
+
+
+def now():
+    return int(time.time())
+
+
+def utc_day(t=None):
+    return time.strftime('%Y-%m-%d', time.gmtime(now() if t is None else t))
+
+
+def sha(*parts):
+    """sha256 hex of the parts joined by newlines (identity parts never contain a newline: see item_id)."""
+    return hashlib.sha256('\n'.join(str(p) for p in parts).encode('utf-8')).hexdigest()
+
+
+def sha16(*parts):
+    return sha(*parts)[:16]
+
+
+def file_sha(path):
+    h = hashlib.sha256()
+    with open(path, 'rb') as handle:
+        for block in iter(lambda: handle.read(1 << 16), b''):
+            h.update(block)
+    return h.hexdigest()
+
+
+def item_id(organ, kind, *parts):
+    """<organ>:<first 16 hex of sha256(kind + "\\n" + parts joined by "\\n")>. A part holding a newline is refused,
+    so two different identities can never serialize to the same text."""
+    if any('\n' in str(p) for p in (kind, *parts)):
+        raise ValueError('an identity part contains a newline')
+    return f'{organ}:{sha16(kind, *parts)}'
+
+
+CELL_RX = re.compile(r'(command|learning|digest|codebase|immune|selfdev|compute|database)\.(0|[1-9]|10)\.([0-9a-f]{8})')
+
+
+def cell_id(organ, depth, hex8):
+    return f'{organ}.{depth}.{hex8}'
+
+
+def parse_cell(cid):
+    """(organ, depth, hex8) of a canonical cell id (depth spelled 0..10 without leading zeros)."""
+    m = CELL_RX.fullmatch(cid or '')
+    if not m:
+        raise ValueError(f'not a cell id: {cid!r}')
+    return m.group(1), int(m.group(2)), m.group(3)
+
+
+def workspace_for(cid):
+    """The one git workspace of an agent cell: PROJECTS/life-<organ>-<depth>-<hex8> (None for model cells)."""
+    organ, depth, hex8 = parse_cell(cid)
+    return f'{PROJECTS}/life-{organ}-{depth}-{hex8}' if organ in AGENT_ORGANS else None
+
+
+def request_id_for(cid, iid, attempt):
+    """life-<organ>-<depth>-<hex8>-<item 16 hex>-<attempt>: the full cell identity, so no two cells share ids."""
+    organ, depth, hex8 = parse_cell(cid)
+    return f'life-{organ}-{depth}-{hex8}-{iid.split(":")[1]}-{attempt}'
+
+
+# Credential-shaped VALUES, not words: "research password hashing" passes, "password = hunter22x" does not.
+SECRET_RX = re.compile(
+    r'(?i)((api[_-]?key|access[_-]?token|auth[_-]?token|secret[_-]?key|client[_-]?secret|passw(?:or)?d)'
+    r'\s*[:=]\s*[\'"]?[^\s\'"]{6,}|bearer\s+[a-z0-9._~+/-]{16,}=*|BEGIN [A-Z ]*PRIVATE KEY|'
+    r'sk-[A-Za-z0-9_-]{20,}|ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|xox[abp]-[A-Za-z0-9-]{10,}|'
+    r'AKIA[0-9A-Z]{16}|https?://[^/\s:@]+:[^/\s@]+@)')
+
+
+def has_secret(text):
+    return bool(SECRET_RX.search(text or ''))
+
+
+def redact(text):
+    """The text with every credential-shaped span replaced by [redacted] (findings keep the rest)."""
+    return SECRET_RX.sub('[redacted]', text or '')
+
+
+def one_line(text, limit):
+    """NFC, every control character and newline as one space, whitespace collapsed, backticks and
+    braces removed (they would break a statement or a template), cut to `limit` characters."""
+    text = unicodedata.normalize('NFC', str(text or ''))
+    text = ''.join(' ' if unicodedata.category(c).startswith('C') else c for c in text)
+    text = re.sub(r'[`{}]', '', text)
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text[:limit].rstrip()
+
+
+# symblic_autogen.lint warns on these back-references; a rendered statement must lint with ZERO findings
+LINT_REWRITES = ((r'\bthe previous\b', 'the prior'), (r'\bthe last\b', 'the final'), (r'\bas before\b', 'as stated'),
+                 (r'\blike above\b', 'as stated'), (r'\bearlier\b', 'before'))
+
+
+def lint_safe(text, limit):
+    """one_line plus the LINT_REWRITES (case-insensitive), so free text inside a template never trips lint."""
+    text = one_line(text, limit)
+    for rx, repl in LINT_REWRITES:
+        text = re.sub(rx, repl, text, flags=re.I)
+    return text[:limit].rstrip()
+
+
+def norm_text(text):
+    """The identity form of free text: NFC, lower case, whitespace collapsed."""
+    return re.sub(r'\s+', ' ', unicodedata.normalize('NFC', str(text or '')).lower()).strip()
+
+
+def words(text):
+    """The routing words of a text: norm_text, then every run of 4 or more letters."""
+    return set(re.findall(r'[^\W\d_]{4,}', norm_text(text)))
+
+
+def boot_id():
+    with open('/proc/sys/kernel/random/boot_id', encoding='ascii') as handle:
+        return handle.read().strip()
+
+
+KIT_CODE_DIRS = ('bin', 'checks', 'db', 'units')
+
+
+def kit_sha256():
+    """sha256 over every regular file under KIT/bin, checks, db and units (sorted relative paths, each as path,
+    NUL, content sha256, newline). life-ctl arm records it; a tick whose kit differs holds (integrity)."""
+    h = hashlib.sha256()
+    for sub in KIT_CODE_DIRS:
+        base = os.path.join(KIT, sub)
+        for root, dirs, files in os.walk(base):
+            dirs[:] = sorted(d for d in dirs if d != '__pycache__')
+            for name in sorted(files):
+                path = os.path.join(root, name)
+                if os.path.isfile(path) and not os.path.islink(path):
+                    h.update(os.path.relpath(path, KIT).encode() + b'\0' + file_sha(path).encode() + b'\n')
+    return h.hexdigest()
+
+
+def state_problems():
+    """STATE and CONTROL must be real directories owned by this uid with no group/other access."""
+    out = []
+    for path in (STATE, CONTROL):
+        try:
+            st = os.lstat(path)
+        except OSError as exc:
+            out.append(f'{path}: {exc.strerror}')
+            continue
+        if not os.path.isdir(path) or os.path.islink(path):
+            out.append(f'{path} is not a directory')
+        elif st.st_uid != os.getuid() or st.st_mode & 0o077:
+            out.append(f'{path} must be owned by uid {os.getuid()} with mode 0700')
+    return out
+
+
+def ensure_dirs():
+    for path in STATE_DIRS:
+        os.makedirs(path, mode=0o700, exist_ok=True)
+
+
+def write_atomic(path, data, mode=0o600):
+    """Write a new random temporary file in the same directory (O_EXCL, mode), fsync it, rename it over
+    `path`, then fsync the directory. Never follows or reuses an existing temporary path."""
+    directory = os.path.dirname(path) or '.'
+    tmp = os.path.join(directory, f'.{os.path.basename(path)}.tmp-{secrets.token_hex(8)}')
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode)
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+    dfd = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(dfd)
+    finally:
+        os.close(dfd)
+
+
+def log(message):
+    os.makedirs(LOGS, mode=0o700, exist_ok=True)
+    path = LOGS + '/tick.log'
+    try:
+        if os.path.getsize(path) > LOG_ROTATE_BYTES:
+            for n in (2, 1):
+                if os.path.exists(f'{path}.{n}'):
+                    os.replace(f'{path}.{n}', f'{path}.{n + 1}')
+            os.replace(path, path + '.1')
+    except OSError:
+        pass
+    line = f'{time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())} {one_line(message, 600)}'
+    try:
+        with open(path, 'a', encoding='utf-8', opener=lambda p, f: os.open(p, f, 0o600)) as handle:
+            handle.write(line + '\n')
+    except OSError:
+        pass                                   # a full disk never blocks STOP or a tick's own handling
+    print(line, flush=True)
+
+
+# ------------------------------------------------------------------------------------------- control
+
+
+def read_armed():
+    """ARMED holds one JSON object {"boot_id": <this boot>, "kit_sha256": <kit_sha256() at arm>}. Anything else
+    (missing, unreadable, malformed, too big) reads as disarmed."""
+    try:
+        with open(ARMED_FILE, 'rb') as handle:
+            raw = handle.read(1025)
+        data = json.loads(raw.decode('ascii')) if len(raw) <= 1024 else None
+        if isinstance(data, dict) and set(data) == {'boot_id', 'kit_sha256'} and all(isinstance(v, str) for v in data.values()):
+            return data
+    except (OSError, ValueError, UnicodeDecodeError):
+        pass
+    return None
+
+
+def control_state():
+    """The operator's switches. ARMED counts only when it names THIS boot, so a reboot always comes back disarmed;
+    kit_ok says whether the kit code still has the hash it had at arm."""
+    armed = read_armed()
+    try:
+        this_boot = boot_id()
+    except OSError:
+        this_boot = ''
+    is_armed = bool(armed) and bool(this_boot) and armed['boot_id'] == this_boot
+    return {'stop': os.path.lexists(STOP_FILE), 'freeze': os.path.lexists(FREEZE_FILE), 'armed': is_armed,
+            'kit_ok': is_armed and armed['kit_sha256'] == kit_sha256(), 'selfdev': os.path.lexists(SELFDEV_FILE),
+            'self_questions': not os.path.lexists(NO_SELF_QUESTIONS_FILE),
+            'history_ok': os.path.lexists(HISTORY_OK_FILE)}
+
+
+# ------------------------------------------------------------------------------------------- registry
+SCHEMA_VERSION = '3'
+
+
+def connect(path=None, readonly=False):
+    path = path or REGISTRY
+    if readonly:
+        conn = sqlite3.connect(f'file:{path}?mode=ro', uri=True, timeout=SQLITE_TIMEOUT, isolation_level=None)
+    else:
+        conn = sqlite3.connect(path, timeout=SQLITE_TIMEOUT, isolation_level=None)
+        conn.execute('PRAGMA journal_mode=WAL')
+        conn.execute('PRAGMA synchronous=FULL')
+    conn.execute('PRAGMA busy_timeout=5000')
+    conn.execute('PRAGMA foreign_keys=ON')
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def apply_schema(conn, sql_path):
+    with open(sql_path, encoding='utf-8') as handle:
+        conn.executescript(handle.read())
+
+
+class Tx:
+    """BEGIN IMMEDIATE ... COMMIT, or ROLLBACK on any exception. A failed COMMIT is rolled back and re-raised,
+    so no later step reuses a connection in an unknown transaction state."""
+
+    def __init__(self, conn):
+        self.conn = conn
+
+    def __enter__(self):
+        self.conn.execute('BEGIN IMMEDIATE')
+        return self.conn
+
+    def __exit__(self, kind, value, tb):
+        if kind is not None:
+            if self.conn.in_transaction:
+                self.conn.execute('ROLLBACK')
+            return False
+        try:
+            self.conn.execute('COMMIT')
+        except sqlite3.Error:
+            if self.conn.in_transaction:
+                self.conn.execute('ROLLBACK')
+            raise
+        return False
+
+
+def notice(conn, kind, subject, text):
+    """Open an operator notice, or, when one with this kind and subject is already open, count the repeat
+    (count + 1, last_at, text = the newest text). notice_id = first 12 hex of sha256(kind, subject, at, 8 random
+    hex): unique per occurrence; (kind, subject) is the condition key."""
+    subject, text = one_line(subject, 120), one_line(text, 600)
+    t = now()
+    if conn.execute("UPDATE notices SET count=count+1, last_at=?, text=? WHERE kind=? AND subject=? AND state='open'",
+                    (t, text, kind, subject)).rowcount:
+        return
+    conn.execute("INSERT INTO notices (notice_id, kind, subject, text, state, at, last_at, count) VALUES (?, ?, ?, ?, 'open', ?, ?, 1)",
+                 (sha(kind, subject, t, secrets.token_hex(4))[:12], kind, subject, text, t, t))
+
+
+BUDGET_COLUMNS = ('program_runs', 'model_calls', 'agent_runs', 'bench_jobs', 'births', 'self_questions')
+METRIC_COLUMNS = ('items_done', 'items_failed', 'items_abstained', 'program_runs', 'agent_runs')
+
+
+def budget_row(conn, day=None):
+    day = day or utc_day()
+    conn.execute('INSERT OR IGNORE INTO budget (day) VALUES (?)', (day,))
+    return conn.execute('SELECT * FROM budget WHERE day=?', (day,)).fetchone()
+
+
+def budget_add(conn, column, n=1, day=None):
+    """Add n (an int >= 0) to one budget counter of `day` (the UTC day captured once by the caller)."""
+    if column not in BUDGET_COLUMNS or type(n) is not int or n < 0:
+        raise ValueError(f'budget_add {column} {n!r}')
+    day = day or utc_day()
+    budget_row(conn, day)
+    conn.execute(f'UPDATE budget SET {column}={column}+? WHERE day=?', (n, day))
+
+
+def metric_add(conn, organ, column, n=1, day=None):
+    if column not in METRIC_COLUMNS or organ not in ORGANS or type(n) is not int or n < 0:
+        raise ValueError(f'metric_add {organ} {column} {n!r}')
+    day = day or utc_day()
+    conn.execute('INSERT OR IGNORE INTO metrics (organ, day) VALUES (?, ?)', (organ, day))
+    conn.execute(f'UPDATE metrics SET {column}={column}+? WHERE organ=? AND day=?', (n, organ, day))
+
+
+def live_cells(conn, organ=None, node=None):
+    sql = "SELECT * FROM cells WHERE state IN ('active','dividing','quarantined')"
+    args = []
+    if organ:
+        sql += ' AND organ=?'
+        args.append(organ)
+    if node:
+        sql += ' AND node=?'
+        args.append(node)
+    return conn.execute(sql + ' ORDER BY cell_id', args).fetchall()
+
+
+def active_release(conn):
+
+
+[This is part 11 of 14. Reply only with the word RECEIVED.]

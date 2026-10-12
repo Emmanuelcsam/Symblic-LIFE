@@ -1,0 +1,233 @@
+[LIFE round-3 critique packet, part 1 of 14]
+
+# LIFE round-3 critique packet (ChatGPT web, highest effort)
+
+## Critic brief
+You critique LIFE, a Symblic script kit meant to turn a home cluster into a perpetually living self-improving system (cells = worker + reproducer agent pairs on lightweight local models; autogen lanes; reproduction admitted only by code). The kit is under /home/operator/host-checkout/docs/life (read LIFE.md fully, then the organs, policies, genome, checks, spawn protocol, db schema, README). All of their full text is in this packet (the two largest implementations, bin/life-tick.py and bin/life-ctl.py, are omitted for size; LIFE.md sections 4-15 specify their behaviour). This is round 3: rounds 1 and 2 were already applied, so judge the text as it stands now. Highest effort. Your job: find EVERY detail that is not atomically defined (any threshold, file, schema, interval, model, engine, node, check, exit code, failure path, race, ordering, budget, unit or ownership that a lightweight model or a fresh agent could interpret in two ways), every contradiction with the platform facts in /home/operator/host-checkout/docs/life/BRIEF.md, every unsafe or unbounded behaviour (runaway spawning, resource exhaustion, heat, secrets, writes outside the workspace, live-code damage, restart loops), and every missing organ or path the operator's brief requires. Output numbered findings: severity (high/medium/low), location (file and section or line number), the exact ambiguity or defect, and the atomic definition or fix to adopt (write the replacement text where possible). End with two integers on their own lines: FINDINGS_TOTAL=<n> and UNDEFINED_DETAILS=<n> (the count of findings that are undefined or ambiguous details), and a final line VERDICT=<CONVERGED|CHANGES NEEDED>.
+
+===== FILE: BRIEF.md =====
+# LIFE: the operator's brief (verbatim intent, 2026-10-11)
+
+"I talked about making perpetual 'life' and I want you to write up an extremely exhaustively extensively
+meticulously detailed symblic script built to make that perpetually living system turning my cluster into a
+self improving system that continuously takes commands, optimizes the codebase, fixes errors, learns from the
+internet, develops itself based on things it learns, creates databases, figures out new ways to compute and
+store data and LIVES (reproduces and learns efficiently). Make this symblic script that will bring my cluster to
+life but don't run it. Workshop this symblic script with ChatGPT (web) at its highest effort and Claude cloud at
+its highest effort until every minor detail in this symblic script is atomically defined, since the subagents
+running the intricate script are expected to be extremely lightweight models to keep processing power low, but
+each subline has two focuses, maybe two agents per subtask: one to perform an extremely specific task and the
+other to reproduce, just like how cells come with different functions but they need to subdivide to keep the
+whole system going."
+
+Earlier operator words that bind this design (10 Oct): one agent per line by default; agents regenerate until their
+task is complete or they split off what they cannot do; no time cap while they try new things; the master
+coordinator may spawn as many agents as needed; research lanes must avoid duplicate sources and may run for days;
+"a living breathing cluster"; the Symblic program is the gcode and an agent is the 3D printer; model/agent work
+runs on the worker nodes, the host only orchestrates; keep continuous all-worker node load under about an hour before resting;
+models propose, code decides; no credentials in shared documents; guest internet off; nothing restarts itself.
+
+# What exists that the script must use (facts, verify in the code before relying on a detail)
+
+- Statement scripts: `bin/symblic-task` lines (one statement per line, 20-1500 chars, at most 64 per task,
+  verbs from `symblic_autogen.VERBS`, absolute folder named, "keeping every existing part" on edits, a verify
+  line writing verify.txt). Autogen policy fields: candidates, regenerate, depth, children, generations,
+  agents_max, attempt_seconds, wall_seconds, interval_seconds, feedback_chars, strategies, perpetual, checks,
+  final, hidden, syntax, require_change, until_done, novelty_limit, self_split, designer, saturation
+  (`symblic_autogen.LIMITS/DEFAULTS`). Perpetual lanes: one generation per interval, checkpoint
+  AUTOGEN-CHECKPOINT.json {version, done, left, files, items}, HANDOFF.md, dedup index AUTOGEN-INDEX.jsonl keyed
+  by DOI/URL/text; saturation stop. Until-done: no caps; stall split; self-split (AUTOGEN-SPLIT.txt); designer
+  (AUTOGEN-TESTS.sh, sandboxed); stuck + resume (+extend). Contracts: docs/symblic/AUTOGEN.md, RECURSION.md.
+- Engines for autogen attempts: CLI agents only (agy, claude, codex, mistral, copilot), placed on a node by the
+  Agents hub; verification at home in a staging checkout; promotion = commit -> apply. Local Ollama models are
+  reached through the formal language (`bin/symblic run F.sym --by ollama:qwen3:4b-instruct`), English
+  statements, delegate templates, spec sheets, `bin/local-research` (SearXNG web research with local models) and
+  the `local` task engine (cli-agent over Ollama; refuses long inputs).
+- Cluster: the host (serves the site, orchestrates only), node-arm (ARM board, manager), node-a/b/d/f (~15.5 GB),
+  node-h (~28 GB), node-i (~31 GB); CLI logins exist on the host; worker nodes run agents through the hub's registered
+  launch path (no SSH shortcuts, no worker node tunnel to :8080). Capacity/heat: docs/fleet-power.md; high-power mode leases
+  are bounded; rest after long load.
+- Safety invariants (CLAUDE.md): private stores never in prompts/docs; no new SSH bypass; service worker/CSP rules;
+  Python/API changes are restart-gated and warned; never restart slices or the busy browser daemon; tests isolate
+  every store; code decides acceptance; `bin/devcheck` before commits; preserve others' work.
+
+===== FILE: LIFE.md (header and sections 1-18 in full; the appendices only repeat the files below verbatim) =====
+# LIFE v2.1 — the master Symblic script that brings the cluster to life
+
+**Status: written, not run.** Nothing in this kit has been started, installed, armed or called. v2 was
+the round-1 rewrite (349 findings in `workshop/round-1/`); v2.1 folds in round 2 (350 findings from
+ChatGPT web, Claude cloud and a local reviewer in `workshop/round-2/`, decisions in
+`workshop/round-2/decisions.md`). Round 2 found, among others, that selfdev could never pass its own
+check, that the heat governor could not see LIFE's own load, that killing a program left its model
+running on the worker node, that agent-written code ran unsandboxed on the host, that the kill switch depended
+on the release loading, and that web text reached agent statements; each is fixed below. Every platform
+fact was read in the live checkout on 2026-10-11 and is re-checked by code at every tick (section 17).
+Every number has one definition, in `bin/life_common.py`; section 13 is generated from it. `VALIDATE.sh`
+(section 16) checks every file statically; the appendices hold every file verbatim and `VALIDATE.sh`
+proves it.
+
+Design stance, from the operator's brief (`BRIEF.md`): a living, breathing cluster that continuously
+takes commands, optimises its codebase, fixes errors, learns from the internet, develops itself from
+what it learns, creates databases, finds new ways to compute and store data, and reproduces and learns
+efficiently, on extremely light models, each subline with two agents: one does one exact task, the
+other reproduces. The Symblic program is the gcode; the agent is the printer. Models propose; code
+decides. The host only orchestrates. Nothing restarts itself.
+
+**Precedence of the operator's words.** The 10 Oct words ("regenerate until complete or split", "no time
+cap while they try new things", "spawn as many agents as needed", "research lanes may run for days")
+are met by perpetual availability built from bounded, resumable units: an item retries across ticks and
+days (re-queues, rung escalation, research re-runs, needs_work rounds), the organism grows by division
+to 16 cells, and nothing ends because a clock ran out except one attempt. Where those words meet the
+later binding rules ("keep continuous all-worker node load under about an hour before resting", "models propose,
+code decides", "nothing restarts itself", "the host only orchestrates"), the later rules win: every
+admitted unit has a wall time, every day has budgets, and every cap is a number in section 13 that the
+operator can raise by editing `bin/life_common.py` (which changes the kit hash, so LIFE disarms until the
+operator re-runs `VALIDATE.sh` and `life-ctl.py arm`). No individual run and no population is unbounded.
+This is a requirements decision for the operator to sign off (`workshop/round-2/decisions.md`).
+
+---
+
+## 1. The cell: one subline, two agents
+
+A **cell** is one row in the registry `cells` table: an organ, a focus (8..120 characters), a worker node, a
+queue of **items** (units of work), and two agents.
+
+- **WORKER** — performs one exact task on one item per turn and nothing else. For the five model
+  organs it is a **genome program** (`genome/*.sym`, a typed Symblic program) run on a light model
+  on the cell's own worker node: `bin/symblic run genome/P.sym --by ollama:MODEL@NODE` (or
+  `bin/life-research.py` for research). The kernel checks every answer (type, range, enum, verbatim quote,
+  record fields); code checks it again, including that the record names the subject it was asked about.
+  For the three agent organs (codebase, selfdev, database) one stage needs a full read-edit-run tool loop:
+  that stage is a **bounded autogen run** of a two-line statement script (`organs/<organ>.lines.txt`) on
+  `agy`, in the cell's own git workspace, accepted only by code checks.
+- **REPRODUCER** — never does the task and never decides *whether* to divide. Code decides that from
+  the cell's own counters (section 9). When code says divide, the reproducer names two narrower foci
+  (`genome/reproduce.sym`) and sorts queued items between them (`genome/assign-item.sym`, the tiniest
+  rung: a two-way closed choice). Code commits the division only if both sides are nonempty. After the
+  division, new items go to the sibling whose focus shares the most words with them (section 9), so the
+  two children keep different functions.
+
+A third role exists for changes: the **reviewer** (`genome/review-patch.sym`, run by an immune cell) reads
+the actual diff of every patch and genome proposal next to the objective it was made for. Worker,
+reproducer and reviewer are separate calls with separate inputs; none can start, stop or admit anything.
+
+Why code decides and models only propose: the operator's rule for Symblic is determinism from weak
+models (kernel, spec and record do the deciding). A 1B model asked "should you divide?" is a coin;
+"the cell had 12 or more workable queued items for 3 ticks, 0 failures, depth under 10, and a second
+worker node is free" is a fact. The model's job is the part code cannot do: naming the split and sorting by
+meaning.
+
+**Roles cannot be impersonated, and what each role can reach.**
+- A model call has no tools: it receives typed inputs and returns a typed record.
+- An agent run works on a worker node in its own checkout of its cell's workspace (the hub's placement and
+  provisioning; LIFE adds no access: no SSH to the host, no worker node tunnel to :8080).
+- Agent-written code that LIFE or autogen executes on the host (codebase check 0, the codebase gate, every
+  watched test) runs ONLY inside the repository's Landlock launcher (`life_common.sandbox_argv`,
+  `landlock_sandbox.py --require`): the system read-only, the checkout and an empty temporary HOME the only
+  writable places, the rest of `/home/operator` (STATE, `~/.ssh`, `~/.config`, the live checkout, `.env`)
+  absent, no TCP except port 1 (so 127.0.0.1:8080 is unreachable), no unix sockets, an environment built
+  from nothing. A missing Landlock refuses (exit 125): there is no unsandboxed fallback.
+- So no worker can reach `~/.local/state/life` (STATE), the registry, the control files or the loopback
+  API that starts runs. Role identity is assigned by the coordinator when it builds the call.
+
+## 2. The organism: ten organs
+
+| # | organ | kind | seed cell (node) | worker program(s) | item | output |
+|---|-------|------|------------------|-------------------|------|--------|
+| 1 | command | model | command.0.00000000 (node-f) | classify-command | command | a route; a new item in the target organ, an operator notice, or a heartbeat answer; later a report |
+| 2 | learning | model | learning.0.00000000 (node-d) | bin/life-research.py | question | an answer and 0..3 sources per run (global dedup), each new source a digest item |
+| 3 | digest | model | digest.0.00000000 (node-b) | (fetch: code) extract-source, distill-lesson | source | a quote-verified knowledge row; at most one lesson, experiment or request item |
+| 4 | codebase | agent | codebase.0.00000000 (node-i) | (confirm: code) triage-error, then an agy run, (gate: code) | finding | a gated patch bundle for review |
+| 5 | immune | model | immune.0.00000000 (node-f) | review-patch | patch, proposal | accept / reject / needs_work; canaries (code) |
+| 6 | selfdev | agent | selfdev.0.00000000 (node-a) | an agy run, (gate: code) | lesson | a protected-line-checked genome proposal for review |
+| 7 | compute | model | compute.0.00000000 (node-a) | propose-experiment, rank-experiment, then a benchmark job | experiment | a measured result vs a baseline |
+| 8 | database | agent | database.0.00000000 (node-b) | an agy run, (apply: code) | request | an additive migration applied to organism.sqlite3 |
+| 9 | metabolism | code | — (in the tick) | none | — | the governor (section 10) |
+| 10 | heartbeat | code | — (in the tick) | none | — | STATE/operator/status.json, reports, metrics, notices (section 14) |
+
+Metabolism and heartbeat are code steps of the tick on the host, not cells: they need no model, and an
+agent on the host every 300 s would break "the host only orchestrates". At most 4 seed or child cells
+share a worker node (`NODE_CELL_CAP`); the seed placement puts 2 on node-f, node-b and node-a and 1 on
+node-d and node-i. LIFE never places work on the host, node-arm (the ARM node), node-c, node-e (not in the
+brief's cluster list) or node-h (it hosts the protected service stack: `cluster_engine.TENANT_STACKS`, pinned by the
+contract). node-d and node-i carry unmeasured co-tenants (`cluster_engine.UNMEASURED_TENANTS`); the
+governor's CPU and memory rules see their load like any other.
+
+**Optimising the codebase (decision).** In v2.1 "optimises the codebase" means: the compute organ measures
+operator-approved benchmark templates (the operator may write templates that time repository functions), a
+passed experiment opens a notice with its numbers, and turning a measured gain into a code change is an
+operator command naming a test (the codebase path). LIFE writes no performance patch on its own; a
+`perf_fix` change class gated by a benchmark is GAP 12 for the operator to decide.
+
+## 3. Where everything lives, and who writes it
+
+| path | what | written by |
+|------|------|------------|
+| `/home/operator/host-checkout/docs/life/` (KIT) | program material: this kit | the operator only; LIFE reads it (its code is hashed at arm) |
+| `/home/operator/.local/state/life/` (STATE, mode 0700) | all runtime state | the tick and life-ctl only |
+| `STATE/life.sqlite3` | the registry (`db/life.sql`, schema 3) | the tick and life-ctl, one at a time (`STATE/tick.lock`) |
+| `STATE/organism.sqlite3` | the database the organism grows (`db/organism.sql` + migrations) | the tick's database apply stage only |
+| `STATE/control/{STOP,FREEZE,ARMED,SELFDEV_ARMED,NO_SELF_QUESTIONS,CODEBASE_HISTORY_OK}` | operator switches | the operator (life-ctl or by hand) |
+| `STATE/control/{watch.txt,benchmarks.json,agenda.json}` | operator lists | the operator |
+| `STATE/inbox-tmp/` → `STATE/inbox/` → `inbox-done/` or `inbox-refused/` | operator command files | life-ctl writes inbox-tmp and renames into inbox; the tick moves them |
+| `STATE/release/<n>/{genome,organs,policies}/` | immutable releases; exactly one active | life-ctl seed, adopt, new-release (built in `.tmp-*`, then renamed) |
+| `STATE/calls/<call_id>/` | each program run's record (`bin/symblic run --dir`) | bin/symblic; deleted 14 days after its item ended |
+| `STATE/text/<16hex of source_key>.txt` | fetched source text snapshots (at most 6000 characters) | the tick |
+| `STATE/runs/<request_id>/` | the exact statements and policy of each agent run | the tick |
+| `STATE/bundles/{patches,proposals,migrations}/` | gated patches, proposals, applied migration texts | the tick |
+| `STATE/applied/<patch_id>/` | before-bytes and the apply journal of every operator apply | life-ctl apply |
+| `STATE/backups/` | daily registry and organism copies (7 per database) and pre-migration copies (newest 10) | the tick |
+| `STATE/operator/status.json`, `STATE/operator/reports/<command_id>.md`, `STATE/logs/tick.log` | status, command reports, log (5 MiB, plus 3 archives) | the tick |
+| `STATE/retired/<cell_id>.json` | last commit of a removed codebase clone | the tick |
+| `/home/operator/symblicos/projects/life-<organ>-<depth>-<8hex>/` | one git workspace per agent cell (unique) | seed or division (clone), the tick (reset, sync), autogen promotion |
+
+`host-checkout` itself is never written by LIFE, except by `life-ctl.py apply`, which the operator
+runs. Research runs go through `bin/life-research.py`, which writes no report (the operator's own
+`bin/local-research` keeps writing to `host-checkout/local_research_data/`; LIFE never runs it except
+`--list`). No STATE file is ever carried to a worker node: STATE is not a git workspace, and the agent
+workspaces never contain STATE paths. The storage rule (section 12) counts STATE and every
+`PROJECTS/life-*` workspace together.
+
+## 4. The coordinator tick (`bin/life-tick.py`)
+
+Run by the user timer `units/life-tick.timer`: 10 min after boot, then 300 s after each tick **ends**
+(`OnUnitInactiveSec=300`). The service (`units/life-tick.service`) runs in `work.slice` with
+`TimeoutStartSec=3000`, `TimeoutStopSec=60`, `KillMode=control-group`, `SuccessExitStatus=1 3 5 6`,
+`Restart=no`, `MemoryMax=1G`, `Nice=10`, `ConditionPathIsDirectory=STATE`. Times inside a tick, from its
+start: no new the host-stage work, agent start or division commit begins after `TICK_DEADLINE` 1200 s; a
+process starts only when `elapsed + its timeout + KILL_GRACE + 60 <= TICK_HARD` 2700 s; systemd's limit is
+3000 s. One tick, in this exact order:
+
+1. **lock** — `flock(STATE/tick.lock, LOCK_EX|LOCK_NB)`; held: print and exit 0.
+   From here to the end, a watcher thread checks `control/STOP` every 1 s and, when it exists, ends every
+   LIFE process group (SIGTERM, SIGKILL 30 s later). A SIGTERM to the tick itself (systemd stop or
+   `TimeoutStartSec`) does the same and exits 1.
+2. **stop** — the registry schema must be 3 (else exit 5). `control/STOP` exists: `stop_everything`
+   (section 5; it needs only the registry, never the release) and exit 3.
+3. **integrity** — STATE and control are 0700 directories owned by the operator; the active release loads
+   and its folder holds exactly its manifest's files with their hashes; when armed, the kit code still
+   has the hash recorded at arm; the platform contract (section 17) holds and, when armed, the running
+   server's autogen defaults equal LIFE's; the last canary round passed; no fault hold. Any failure: a
+   notice and a hold.
+4. **metabolism** — sample `/api/cluster/status` and `/api/cluster/highpower/state`, the host's load and io
+   pressure, and LIFE's own per-node load ledger; update the governor and per-node rests (section 10);
+   compute the nodes available for new work.
+5. **runs** — poll every LIFE autogen run (`GET /api/symblicos/autogen/get?id=RUN_ID`), confirm new runs'
+   policy sha256, cancel runs older than 4500 s (a failure), collect ended runs. Poll benchmark jobs
+   through the paged `GET /api/cluster/jobs?kind=map&limit=200&offset=N` (at most 5 pages), by job id or
+   by label; score finished ones.
+6. **inbox** — take at most 50 command files, oldest name first (section 6), then due agenda entries.
+   Always, even disarmed.
+7. **upkeep** — canaries (hourly, and at once while no round has ever passed; skipped when fewer than
+   600 s of the deadline remain); the daily backup and retention at the first tick of each UTC day; the
+   storage walk (ticks 1, 13, 25, ...; the free-disk check every tick); command reports; hold notices.
+8. If STOP appeared meanwhile: `stop_everything` and exit 3. If not ARMED for this boot, kit changed,
+   FROZEN, no release, or any hold: write status and exit (0, or 5 for an integrity or contract hold).
+   **Observe-only ends here**: it never runs watched tests, fetches, gates, applies, models, agents or
+   benchmarks.
+9. **findings** — run one due watched test, sandboxed, in a codebase clone (section 7.4).
+10. **dispatch** — free items stranded on retired or quarantined cells; give each unassigned queued item
+    to the best-matching active cell of its organ (section 9).
+
+
+[This is part 1 of 14. Reply only with the word RECEIVED.]

@@ -1,0 +1,224 @@
+[LIFE round-4 critique packet, part 5 of 21]
+
+deciding anything about itself. "done" means the answer was well-formed and passed code's checks; whether it was
+right is what review, gates, quote checks and the operator decide downstream.
+
+## 9. Reproduction
+
+The full protocol is `spawn/PROTOCOL.md`. Summary: code decides eligibility (active, 0 terminal failures in a row,
+depth < 10, workable backlog >= the organ's `divide_backlog` for 3 consecutive armed WORKING ticks — any
+observe-only tick resets the count —, organ + 1 <= 3 live cells, organism + 1 <= 16, births + 2 <= 8 a day, no open
+division fleet-wide, 6 h after an abort, organ efficiency >= 0.2, a second worker node available, the cell's workspace not
+busy); the reproducer names two foci (a failed answer retries once at the next rung, then the division aborts);
+assign-item sorts up to 16 items (4 per slot; the rest, and every failed answer, by the parity of sha256(item_id));
+a division step takes its parent node's slot at most every 2nd armed tick. Then code alone: agent organs pass a
+`workspaces` stage that creates one child workspace per tick; the commit (in `lifecycle`, never in a node slot)
+re-checks the organism-wide rules and the workspace rule, then one transaction births both children (child a on the
+parent's worker node, child b on another), moves the queued items (except gate, apply and confirm items, which stay with
+the parent's workspace) and retires the parent (`divided`).
+`cell_id = <organ>.<depth>.<first 8 hex of sha256(parent + "\n" + letter + "\n" + focus)>`; seeds are
+`<organ>.0.00000000`, revived cells `<organ>.0.<8 random-derived hex>`. A repeated lineage key aborts the division;
+a division counted in more than 12 armed working ticks, or whose release changed, aborts; and every tick, even while
+held, a division older than 24 h aborts. Endings: apoptosis after 86400 s empty and idle when a sibling remains;
+quarantine after 8 terminal failed items in a row (the operator releases; an organ's only live cell is released
+automatically after 24 h at the top rung, at most once per cell in any rolling 7 days); operator retire; a workspace
+that cannot be re-created 3 times (the organ's last live cell is quarantined instead). A cell whose worker node has been
+reported offline (from a readable status, at least 6 samples reaching back the whole 6 h) for 6 h moves to another.
+`life-ctl.py revive ORGAN NODE` gives an organ with no live cell a new first cell.
+
+**Dispatch keeps the children different.** Every unassigned queued item goes to the active cell of its organ
+whose focus shares the most routing words with the item's label (words of 4 or more letters after `norm_text`;
+at least one shared word), else, and on ties, to the cell with the fewest queued-or-running items, then the
+lowest cell id. The label is: command → the command text; question → the question; source → the URL; finding →
+the test id and the first sentence of its text; lesson → the lesson; request → the request; experiment → the seed
+text; patch and proposal → their origin's label. So a "research porous ceramic structure questions" child keeps
+receiving ceramic foams questions. The organism therefore grows where workable work piles up, shrinks where it is idle,
+never below one cell per organ unless the operator retires it (then `revive`), and never past the heat, budget and
+placement limits.
+
+## 10. Metabolism (the governor)
+
+Every tick reads `GET /api/cluster/status` (60 s, one deadline for the whole exchange; per node `id`, `online` (must
+be the boolean true), `vitals.cpu` = percent busy, a finite 0..100, `vitals.temp` °C, a finite -50..150,
+`vitals.memavail` a non-negative integer number of bytes not above `vitals.memtotal` when that is given; a value
+that is missing, of the wrong type or out of range is unavailable, never zero; a node listed twice is a hold) and
+`GET /api/cluster/highpower/state` (`enabled`, `phase`, `restUntil` integer Unix seconds, 0 when no rest is pending,
+`cool.phase`), with bin/symblic-task's request shape (loopback, no proxy, no redirect, Host 127.0.0.1:8080). Every
+answer is strict JSON (no duplicate key, no NaN or infinite number, nesting at most 32 deep). The status `ts` is the
+answer time (the route re-probes when its 2 s cache is old), so staleness is not judged from it: an answer that
+does not come within 60 s is a hold. A sample row per LIFE node is written only from a READABLE status list.
+
+- **Hold** (no new work at all) when: the status or high-power mode state cannot be read or has no status list;
+  `cool` is not an object with `phase` exactly `off` and no error; `enabled` is not exactly false (a high-power mode
+  lease is running); the high-power mode `phase` is not exactly `off` (applying, active, partial, restoring or
+  restore_pending: worker nodes may still be at maximum performance); `restUntil` is not integer seconds or is later than now
+  (the lease's rest; never spare capacity for LIFE); the host `load1 >= 0.75 x os.cpu_count()`; the host
+  `/proc/pressure/io` full avg60 >= 10.0; the host `/proc/pressure/memory` some avg60 >= 10.0; the host `MemAvailable`
+  (`/proc/meminfo`) below 6144 MiB (a 4 GiB scope plus a 2 GiB reserve: the host's history is three oomd kills); any of
+  these unreadable. A hold never resets the load window: the counters below keep running.
+- **LIFE's own load ledger**: `busy(node, t0, t1)` = seconds of [t0, t1] covered by the union of that node's
+  `calls` intervals (program runs, research runs, division steps, benchmark jobs; a running benchmark to now), its
+  agent runs (`submitted_at` to `ended_at`; a run with no end — live, submitting or submit_unknown — to now; a
+  not_submitted run zero) and, while it is held for an unknown or lost job, the whole interval.
+- **Fleet loaded** in an interval (`dt` = seconds since the previous sample, 0..3000; a negative clock step
+  counts 0): at least `max(1, ceil(0.5 x online LIFE worker nodes))` of the online LIFE worker nodes each with `cpu >= 50` at the
+  sample OR `busy(node, previous sample, now) >= 0.5 x dt`. An interval WITHOUT a readable status list is
+  unobserved and counts as loaded (it never adds quiet seconds and never ends a rest). Loaded: `continuous += dt`,
+  `quiet = 0`. Not loaded: `quiet += dt`; when `quiet >= 600`, `continuous = 0`. **Rest** when `continuous >= 3000`
+  and until `quiet >= 600`. The fleet's own non-LIFE load counts too. This implements "continuous all-worker node load under
+  about an hour, then rest".
+- **Per node duty cycle**: an action (a program run, a research run, a division step, a benchmark job) is admitted
+  on a node only when `busy(node, now − 3600, now) + its worst-case seconds <= 3000` (a 2100 s research run needs at
+  most 900 s of LIFE work on that node in the last hour; a benchmark job, its full 7-run timeout); a node with
+  `busy(node, now − 3600, now) >= 3000` rests (no new LIFE action, agent runs included) until `busy(node, now − 600,
+  now) == 0` and 600 s have passed (`governor.node_rest`). So no one worker node runs LIFE work for more than about 50
+  minutes of any hour. An agent run is not reserved this way (its worker node load is its tool loop; it is bounded by its
+  attempt and wall seconds and LIFE's cancel request at 4500 s: GAP 4).
+- **Per node heat and space**: hot at `temp >= 85` and cool again below 75 (hysteresis; the same numbers as
+  `symblic_apply.THERMAL_HOT/THERMAL_COOL`); a missing temperature counts as hot, and 12 samples in a row without
+  one open notice `telemetry`. A hot, offline, held, resting or benchmarking node takes no new LIFE action;
+  a node also needs the memory of section 8 for a program run.
+- Before the slot phase, when the last sample is older than 120 s, EVERY governor input is read again (status,
+  high-power mode, the host load, pressure and memory): any hold reason empties the available list, and a node now
+  offline, hot or without a memory reading leaves it.
+- The governor row (`governor` table: state, continuous and quiet seconds, hot nodes, hold reasons, node rests)
+  is the single truth both scheduling and status read. The same hold for 12 ticks in a row opens notice `held`;
+  12 working ticks in a row with queued slot items and no node that could take one open notice `no_capacity`.
+
+Resource limits per job: model calls are bounded by the fleet runner (each run is its own systemd unit with MemoryMax,
+CPUQuota and RuntimeMaxSec); agent runs by the hub and the policy's attempt and wall seconds; benchmark jobs by
+`timeout` (whole process group), `nice 15`, `prlimit` (address space 4 GiB, file size 2 GiB, 256 open files, each
+per process) and `head -c 4096` per run, written by LIFE into the job's command. `prlimit --nproc` is not used: it
+counts every process of the user on the worker node, not the job's; a job-wide cgroup on the worker node is a platform change
+(GAP 7). Local heavy work on the host runs in `life-*.scope` units (section 4).
+
+## 11. Immunity and safety
+
+- Review: section 7.5. Canaries: section 7.5. Quarantine: section 9.
+- Integrity: release manifests (exact inventory: genome/, organs/, policies/ and their regular files, nothing
+  else) every tick; the kit hash (every entry of bin, checks, db, units and VALIDATE.sh, with type and mode bits, so
+  a new symlink or a stray .pyc counts), the pinned platform files (`PLATFORM_PINS`: landlock_sandbox.py,
+  deep_research.py, local_research.py, bin/symblic-task, symblic_autogen.py) and DECISIONS.md against ARMED every
+  tick; every STATE directory every tick; the platform contract and the server's autogen defaults every tick
+  (section 17).
+- **Sandbox**: agent-written code that runs on the host runs only in the Landlock sandbox (section 1); the gate's
+  judge (`bin/devcheck`, its scripts, rules and baseline) cannot be changed by a patch (deny list), the module check
+  imports nothing, and every trusted git command in a workspace runs with `GIT_SAFE`, its configuration hashed
+  around every sandboxed run. `life-ctl.py arm` and `gate-selftest` run the sandbox probe (`SANDBOX_PROBE`: STATE,
+  `~/.ssh` and the live checkout unreadable, 127.0.0.1:8080 and the user bus unreachable). The tick's own process
+  starts from `python3 -I`, so no PYTHON* variable or user site changes what it imports. Fetching and parsing of
+  untrusted pages runs in its own scope (MemoryMax 1G, prlimit 1 GiB) with the platform's safe-fetch path, NOT in
+  the Landlock sandbox (it needs the network and the .venv; by decision).
+- **Protected paths**: `life_common.GATE_DENY_RX` (section 7.4) is the one list the gate and `life-ctl.py apply`
+  both enforce; VALIDATE proves every CONTRACT file matches it.
+- **Secrets**: the credential screen (`SECRET_RX`) matches credential-shaped VALUES — one of the key words api_key,
+  access_token, auth_token, secret_key, client_secret, password/passwd, token, secret, credential(s), private_key
+  (`-` or `_` or nothing between the parts, any case) followed by `:` or `=` and either a quoted value of 6 or more
+  characters or an unquoted run of 6 or more non-space characters; bearer tokens; private-key headers;
+  sk-/ghp_/github_pat_/xox*/AKIA tokens; URLs with a user:password part — not words, so "research password hashing"
+  passes. It runs on: inbox text and agenda entries (refused), finding text (matching spans redacted), every
+  rendered template value (refused), research URLs (skipped), research answers, source titles, the classifier's
+  restated line, review reasons and hypotheses (redacted), fetched page text (abstained, nothing stored), extracted
+  quotes and claims (abstained), division foci (refused), patch diffs (refused), every notice text and log line
+  (redacted). It is a heuristic, not a proof: private data is kept out structurally (LIFE reads no `.env`, no
+  `easy_config.json`, no private store, no log; subprocesses get a fixed environment; candidate code runs with STATE
+  and HOME unreadable). Call folders (`STATE/calls/`, the raw model traces) are operator-private evidence: never
+  copied into a report, prompt, bundle or shared document.
+- Web text: section 6 (taint, approval). Model processes have no network; research and fetches go through the
+  existing safe-fetch path; guest internet is untouched.
+- Rollback: `life-ctl.py revert` restores the recorded pre-apply bytes only when every touched file holds its
+  post-apply or already its pre-apply bytes; any other content stops it before any change. Its journal says
+  `reverting` before the first file changes and `reverted` after, so an interrupted revert is simply run again. An
+  apply records its journal (`intent`, then `done`) before and after changing files; an interrupted apply is undone
+  by `life-ctl.py recover-apply PATCH --confirm RECOVER` (it recomputes the patched bytes from the before-bytes in a
+  private folder, then restores only files that hold before- or patched bytes; anything else stops it).
+  `git checkout --` is never used on the live tree. `apply` refuses when the live checkout is on another branch than
+  the one LIFE tracks (unless `--moved-base`).
+- On the worker nodes, an agent's confinement is the hub's (platform) and is not attested to LIFE (GAP 10).
+- LIFE renders nothing in a web page in v2.2; any later dashboard view must escape every string and pass the CSP
+  and service-worker rules. Reports are Markdown files of one_line text; `life-ctl.py report` removes every control
+  character before printing.
+
+## 12. Databases
+
+- **Registry** `STATE/life.sqlite3` (`db/life.sql`, schema 4): WAL, `synchronous=FULL`, `busy_timeout=5000`,
+  `foreign_keys=ON`; one writer at a time under `STATE/tick.lock`. CHECK constraints, triggers and indexes encode:
+  every enum and range; integer TYPES (`typeof`) for depths, counters, priorities and budgets; NOT NULL ids;
+  canonical cell ids (rebuilt from organ, depth and 8 hex), canonical item ids (organ + 16 hex); the organ/kind and
+  organ/stage pairs of items; an item belongs only to a cell of its own organ (trigger); a child has its parent's
+  organ and depth parent + 1 (trigger); birth facts and an item's identity and taint never change (triggers); one
+  workspace per cell; at most one active release (code refuses zero); at most one open division fleet-wide
+  (`divisions_one_open`, stages foci, assign and workspaces); foreign keys from runs, calls, patches, proposals,
+  experiments and migrations to their items; non-negative budgets and metrics; quote_verified = 1. Times are UTC Unix
+  seconds from `int(time.time())`. The tick refuses a registry whose `meta.schema` is not 4. Every meta key LIFE
+  writes is one of `life_common.META_KEYS`.
+- **Organism** `STATE/organism.sqlite3` (`db/organism.sql`): starts with `schema_migrations` only; grows only by
+  section 7.8 migrations; holds rows only from the store adapter or the operator.
+- **Backups**: the first tick of each UTC day (unless storage holds, and only when the filesystem has the source size
+  + 64 MiB free; else notice `storage` and a retry next tick) copies both through the SQLite backup API to
+  `STATE/backups/{life,organism}-YYYY-MM-DD.sqlite3` (written as `.partial`, then renamed; mode 0600; the newest 7
+  files per database kept); every migration first copies the organism database to `organism-before-<id>.sqlite3`
+  (mode 0600; the newest 10 kept). Releases and bundles are immutable and never deleted, so a restored registry
+  finds every file it names. Retention at the same tick: section 13, last paragraph.
+- **Restore** (operator): `life-ctl.py stop`; `systemctl --user stop life-tick.timer` and wait until
+  `systemctl --user is-active life-tick.service` is not active; `life-ctl.py restore registry|organism
+  STATE/backups/<file> --confirm RESTORE` (it refuses without STOP or with a running tick, holds the lock from the
+  first move to the integrity check, moves the current file and its -wal/-shm into `STATE/backups/replaced-<UTC
+  time>/`, copies the backup, `chmod 600`, and checks integrity, foreign keys and the schema); then cancel every run
+  whose request id starts with `life-` that the restored registry does not know (`bin/symblic-task autogen list`) and
+  every running job whose `meta.label` starts with `life-` that it does not know (`/api/cluster/jobs?kind=map`); wait
+  ORPHAN_HOLD_SECONDS for orphaned model runs; `systemctl --user start life-tick.timer`; `life-ctl.py unstop`; arm.
+  The next tick's reconciliation compares the two migration ledgers (section 7.8).
+- Python's `sqlite3` module is used everywhere (`sqlite3` CLI is not installed on the host).
+
+## 13. Every number
+
+Generated from the limits block of `bin/life_common.py` by `life_common.limits_rows()` (the one definition; this
+table is its copy and VALIDATE.sh check 13 compares them). Each meaning gives the unit, what the number bounds and
+who enforces it.
+
+| name | value | meaning |
+|------|-------|---------|
+| TICK_SECONDS | 300 | s; units/life-tick.timer OnUnitInactiveSec: the next tick starts this long after the previous one ENDS |
+| TICK_DEADLINE | 1200 | s from tick start; no new the host stage, agent start, division step or slot action begins after it (Tick.can_start) |
+| TICK_HARD | 2700 | s from tick start; every admitted stage or process must be able to end (its budget + KILL_GRACE + START_MARGIN) by it |
+| UNIT_TIMEOUT | 3000 | s; units/life-tick.service TimeoutStartSec (= TICK_HARD + 300; VALIDATE compares) |
+| KILL_GRACE | 30 | s; SIGTERM to a process group, then SIGKILL to the whole group this long later (Procs.end) |
+| START_MARGIN | 60 | s; slack every admission keeps before TICK_HARD (Tick.can_start) |
+| STOP_POLL | 1 | s; the tick's watcher thread re-reads control/STOP (and FREEZE, ARMED) this often |
+| SLOT_WAIT_EXTRA | 30 | s; the slot phase ends a thread still alive this long after its timeout + KILL_GRACE |
+| SLOT_ACTIONS_MAX | 4 | actions; one node takes at most this many slot actions per tick, each after the previous ended |
+| TICK_TASKS_MAX | 192 | tasks; units/life-tick.service TasksMax = 8 (tick threads) + 5 nodes x 32 (one bin/symblic run each) + 24 helpers |
+| SCOPE_TASKS_MAX | 64 | tasks; TasksMax of every transient scope LIFE starts (scope_argv) |
+| CALL_TIMEOUT | 900 | s; one bin/symblic run process (its process group gets SIGTERM, then SIGKILL) |
+| CALL_MAX_MODEL_CALLS | 12 | model calls; --max-calls of every genome program run, reserved from the day's budget before launch |
+| OLLAMA_LIMITS | num_predict 320, timeout_seconds 240 | per model call; generation cap (a cut answer fails its type check) and wall |
+| RESEARCH_TOOLS | 3 | tool uses; per research run (searches plus page reads), passed to local_research.research |
+| RESEARCH_GENERATIONS | 5 | model calls; local_research.research loops max_tools + 2 times (pinned); the wrapper enforces it |
+| RESEARCH_STEP_TIMEOUT | 180 | s; one research generation (overrides local_research.STEP_TIMEOUT in the wrapper) |
+| RESEARCH_STEP_POLL_EXTRA | 120 | s; local_research.generate polls a generation up to STEP_TIMEOUT + 120 (pinned) |
+| RESEARCH_TOOL_SECONDS | 180 | s; one tool use at most: a SearXNG search (30 s) or a page read (safe_fetch: 5 hops x (10 + 25) s) |
+| RESEARCH_TIMEOUT | 2100 | s; one bin/life-research.py process (the derived worst case + 60) |
+| ASSIGN_PER_SLOT | 4 | runs; assign-item.sym runs one division makes in one node slot |
+| ASSIGN_TIMEOUT | 225 | s; one assign-item.sym run |
+| ASSIGN_MAX | 16 | items; snapshot items a division sends to assign-item at most (the rest go by parity) |
+| SAMPLE_LABELS | 12 | labels; queued item labels shown to reproduce.sym |
+| SAMPLE_CHARS | 1600 | characters; the joined labels are cut to this |
+| INFRA_RUNS_MAX | 6 | outcomes; infrastructure outcomes of one item stage before it goes to the operator (notice infra_repeat) |
+| FAULTS_MAX | 3 | faults; tick faults (Tick.guard) on one item stage before it fails |
+| START_ATTEMPTS_MAX | 3 | refusals; HTTP 4xx refusals of bin/symblic-task start for one item before it fails (items.start_refusals) |
+| RUN_RESENDS_MAX | 3 | re-sends; identical start re-sends of one submit_unknown run before notice run_unknown hands it to the operator |
+| TIMEOUTS_ESCALATE | 2 | timeouts; program timeouts of one item at one rung before it escalates one rung (items.timeouts) |
+| NODE_HOLD_SECONDS | 1800 | s; a node that answered infra is skipped this long (node_holds) |
+| ORPHAN_HOLD_SECONDS | 1200 | s; after a crashed tick, the node of every model item it left running is held this long |
+| MODELS_REFRESH_SECONDS | 86400 | s; the installed-model inventory (bin/local-research --list) is re-read this often |
+| LIFE_MAX_CELLS | 16 | cells; cells in state active, dividing or quarantined, all organs |
+| ORGAN_CELL_CAP | 3 | cells; such cells per organ |
+| NODE_CELL_CAP | 4 | cells; such cells per node |
+| MAX_DEPTH | 10 | depth; a child's depth is at most this; a parent divides only below it |
+| DIVIDE_SUSTAIN | 3 | ticks; consecutive armed working ticks with workable backlog >= the organ's divide_backlog |
+| DIVISION_COOLDOWN | 21600 | s; after an aborted division before that parent may try again |
+| DIVISIONS_OPEN_MAX | 1 | divisions; open at once, fleet-wide (also the unique index divisions_one_open) |
+
+
+[This is part 5 of 21. Reply only with the word RECEIVED.]

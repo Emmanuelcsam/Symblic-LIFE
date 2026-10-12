@@ -1,0 +1,73 @@
+-- LIFE v1 organism database schema.
+-- One SQLite file: /home/operator/symblicos/projects/life/db/life.sqlite3
+-- Every table uses CREATE TABLE IF NOT EXISTS so re-applying is a no-op and never drops rows.
+-- Times are integer Unix seconds (strftime('%s')). Ids are text. No credentials or private
+-- store values are ever written here; only organism metadata, provenance and public sources.
+
+-- knowledge: one checked fact per row, produced by the digest organ from a fetched source.
+CREATE TABLE IF NOT EXISTS knowledge (
+  id           TEXT PRIMARY KEY,        -- items_key form: doi:/url:/text: (<=200 chars)
+  claim        TEXT NOT NULL,           -- model wording of the fact, 20..300 chars
+  quote        TEXT NOT NULL,           -- span copied verbatim from the source (kernel-checked)
+  source_id    TEXT NOT NULL,           -- id of the source row in sources.jsonl
+  source_url   TEXT NOT NULL,           -- http(s) url or DOI the quote came from
+  organ        TEXT NOT NULL DEFAULT 'digest',
+  created_at   INTEGER NOT NULL,
+  verified     INTEGER NOT NULL DEFAULT 0  -- 1 only when quotes() passed at extraction time
+);
+CREATE INDEX IF NOT EXISTS knowledge_source ON knowledge (source_id);
+
+-- lineage: the family tree of cells. Each spawn writes one row. Append-only.
+CREATE TABLE IF NOT EXISTS lineage (
+  cell_id      TEXT PRIMARY KEY,        -- organ '.' generation '.' 8hex  e.g. learning.3.a1b2c3d4
+  organ        TEXT NOT NULL,
+  parent_id    TEXT,                    -- NULL for a seed cell
+  depth        INTEGER NOT NULL DEFAULT 0,  -- 0..64, parent depth + 1
+  focus        TEXT NOT NULL,           -- the child's single specific focus (8..120 chars)
+  spawn_reason TEXT NOT NULL,           -- divide | seed | replan
+  content_hash TEXT NOT NULL,           -- sha256 of (statements_file || policy_json) for dedup
+  run_id       TEXT,                    -- the autogen run id once the orchestrator submits it
+  created_at   INTEGER NOT NULL,
+  retired_at   INTEGER                  -- set on apoptosis / quarantine
+);
+CREATE INDEX IF NOT EXISTS lineage_parent ON lineage (parent_id);
+CREATE UNIQUE INDEX IF NOT EXISTS lineage_hash ON lineage (content_hash);
+
+-- metrics: one row per organ generation, written by heartbeat from the run records.
+CREATE TABLE IF NOT EXISTS metrics (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  organ        TEXT NOT NULL,
+  run_id       TEXT NOT NULL,
+  generation   INTEGER NOT NULL DEFAULT 0,
+  new_items    INTEGER NOT NULL DEFAULT 0,  -- new index keys this generation
+  failures     INTEGER NOT NULL DEFAULT 0,  -- trailing failed generations
+  node         TEXT,                        -- node the generation ran on
+  at           INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS metrics_organ ON metrics (organ, at);
+
+-- commands: operator commands taken by the command inbox, with their route.
+CREATE TABLE IF NOT EXISTS commands (
+  id           TEXT PRIMARY KEY,        -- sha256[:16] of the command text + arrival time
+  text         TEXT NOT NULL,
+  organ        TEXT NOT NULL,           -- routed organ, or 'none'
+  urgency      TEXT NOT NULL DEFAULT 'normal',  -- low | normal | high
+  restated     TEXT NOT NULL,
+  status       TEXT NOT NULL DEFAULT 'routed',  -- routed | accepted | done | rejected
+  created_at   INTEGER NOT NULL
+);
+
+-- experiments: compute/storage R&D proposals and their measured results.
+CREATE TABLE IF NOT EXISTS experiments (
+  id           TEXT PRIMARY KEY,
+  hypothesis   TEXT NOT NULL,
+  measurement  TEXT NOT NULL,           -- the exact shell command that produces a number
+  threshold    TEXT NOT NULL,           -- the comparison that counts as success, e.g. '< 1.0'
+  score        INTEGER NOT NULL DEFAULT 0,   -- 0..100 ranking from rank-experiment.sym
+  node         TEXT,                    -- node the benchmark ran on
+  measured     TEXT,                    -- the number produced, as text; NULL until run
+  passed       INTEGER,                 -- 1 pass, 0 fail, NULL not run
+  created_at   INTEGER NOT NULL,
+  ran_at       INTEGER
+);
+CREATE INDEX IF NOT EXISTS experiments_score ON experiments (score DESC);

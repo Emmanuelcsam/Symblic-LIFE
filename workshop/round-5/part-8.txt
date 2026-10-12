@@ -1,0 +1,245 @@
+| APPROVAL_STALE_DAYS | 7 | days; a lesson or request waiting for approval this long counts as ended for its command's report |
+| OUTPUT_KEEP_BYTES | 1048576 | bytes; stdout kept per process |
+| ERR_KEEP_BYTES | 65536 | bytes; stderr kept per process |
+| OUTPUT_KILL_BYTES | 16777216 | bytes; a process writing more than this (stdout + stderr) is ended and returns OUTPUT_LIMIT_RC |
+| OUTPUT_LIMIT_RC | 1000 | rc; the return code Procs.run gives an output-limit kill (never a real exit code) |
+| STOPPED_RC | 1001 | rc; the return code Procs.run gives a process STOP ended (never counted as a failure, infra or fault) |
+| NOT_ADMITTED_RC | 1002 | rc; the return code Procs.run gives when admission refused before any process existed (nothing counts) |
+| HTTP_MAX_BYTES | 8388608 | bytes; a loopback HTTP answer |
+| HTTP_OUTSTANDING_MAX | 4 | exchanges; loopback exchanges still open past their deadline; at this many a new one is refused (Telemetry) |
+| GIT_META_MAX_ENTRIES | 50000 | entries; .git administrative entries git_meta_sha256 visits; more is a workspace problem |
+| GIT_META_MAX_BYTES | 16777216 | bytes; content git_meta_sha256 hashes; more is a workspace problem |
+| JSON_MAX_DEPTH | 32 | levels; a loopback JSON answer nested deeper is refused |
+| FLEET_LOAD5_PER_CPU | 0.5 | ratio; vitals.load[1] (5-minute load average) / vitals.cpus at or above: the node is loaded in this sample |
+| LOADED_OWN_FRACTION | 0.5 | ratio; or LIFE kept the node busy this fraction of the interval |
+| FLEET_LOADED_FRACTION | 0.5 | ratio; at least max(1, ceil(this x online LIFE nodes)) loaded nodes: the fleet is loaded |
+| WORK_WINDOW | 3000 | s; loaded (or unobserved) seconds before the fleet must rest |
+| REST_SECONDS | 600 | s; consecutive observed quiet seconds that end a rest and reset the window |
+| NODE_WINDOW, NODE_BUSY_MAX, NODE_REST | 3600 / 3000 / 1800 | s; per node: an action is admitted only if busy + its budget <= 3000 of the last 3600; busy >= 3000 rests it 1800 idle s |
+| NODE_BUSY_PER_DAY | 21600 | s; LIFE busy seconds per node per UTC day; over it the node takes no LIFE action until 00:00 UTC |
+| TELEMETRY_REFRESH | 120 | s; the slot phase re-reads every governor input when the sample is older than this |
+| HOT_C, COOL_C | 85.0 / 75.0 | deg C; same thresholds as symblic_apply.THERMAL_HOT/THERMAL_COOL (hysteresis) |
+| TEMP_MIN_C, TEMP_MAX_C | -50.0 / 150.0 | deg C; a temperature outside is unavailable (treated as hot) |
+| MEM_RESERVE_MIB | 2048 | MiB; a node needs memAvailMiB >= reserve + the model's size + KV_ALLOWANCE_MIB (+ AGENT_RUN_MIB with a live agent run) |
+| KV_CTX_TOKENS | 4096 | tokens; the worker node context bucket every LIFE prompt reaches (fleet_runner: num_ctx = smallest bucket >= chars // 3 + 256 + num_predict) |
+| PROMPT_CHARS_MAX | 9000 | characters; the largest LIFE program prompt (a 6000-character source or diff plus the instruction and fields); VALIDATE: it fits KV_CTX_TOKENS |
+| KV_ALLOWANCE_MIB | 819 | MiB; fleet_runner._kv_bytes for a 4B model at KV_CTX_TOKENS (KV_BYTES_PER_TOKEN_B 36000, pinned) + OLLAMA_OVERHEAD 256 MiB |
+| MODEL_MIB_UNKNOWN | 4096 | MiB; memory assumed for a model missing from MODEL_MIB |
+| HOST_LOAD_FRACTION | 0.75 | ratio; the host load1 must stay below this x os.cpu_count() |
+| HOST_IO_FULL_AVG60 | 10.0 | %; the host /proc/pressure/io full avg60 must stay below this |
+| HOST_MEM_FLOOR_MIB | 6144 | MiB; the host MemAvailable must be at least this (a 4 GiB scope + 2 GiB reserve) |
+| HOST_MEM_SOME_AVG60 | 10.0 | %; the host /proc/pressure/memory some avg60 must stay below this |
+| HOUR, DAY | 3600 / 86400 | s; units |
+| HTTP_TIMEOUT | 30 | s; one loopback GET or POST that should answer at once (one deadline for the whole exchange) |
+| HTTP_SLOW_TIMEOUT | 60 | s; /api/cluster/status (it may probe), autogen get, the jobs listing, map submit |
+| SQLITE_TIMEOUT | 5 | s; a connection waits this long for another writer (busy_timeout 5000 ms) |
+| CTL_LOCK_WAIT | 3000 | s; life-ctl waits this long for the tick's lock (a progress line every CTL_LOCK_PROGRESS s) |
+| CTL_LOCK_PROGRESS | 60 | s; life-ctl prints that it is waiting this often |
+| SEED_LOCK_WAIT | 60 | s; seed waits this long for the lock |
+| VALIDATE_TIMEOUT | 900 | s; seed and arm run VALIDATE.sh with this timeout |
+| PAYLOAD_MAX | 16384 | characters; an item payload (JSON); a larger one is refused before the write |
+| COMMAND_MIN_BYTES | 6 | bytes; one operator command after stripping (status is the shortest), inbox, life-ctl command and agenda alike |
+| COMMAND_MAX_BYTES | 4000 | bytes; one operator command (inbox file or agenda text) |
+| INBOX_PER_TICK | 50 | files; inbox files taken per tick |
+| AGENDA_MAX | 20 | entries; agenda entries read (more: notice agenda_invalid) |
+| AGENDA_FILE_MAX_BYTES | 131072 | bytes; control/agenda.json |
+| WATCH_FILE_MAX_BYTES | 16384 | bytes; control/watch.txt |
+| AGENDA_HOURS_MIN, AGENDA_HOURS_MAX | 6 / 720 | hours; an agenda entry's period |
+
+A spent daily budget holds that class of work until 00:00 UTC with one `budget` notice. Budgets are charged
+before the work starts (a program run and its 12 model calls when it is planned, a research run with 5, a division
+step with 12 per run, an agent run before submit, a benchmark job before its POST) and never refunded; the calls
+rows record the actual model calls. Storage over its limit holds all new work and intake. **Deleted automatically**
+(at the daily retention): backups beyond the kept counts, rotated logs beyond 3, call folders 14 days after their
+call ended (unless its item is still queued or running), calls rows 90 days after they ended, run folders 14 days
+after a collected run ended, inbox-done files after 30 days, acknowledged notices after 90 days, samples after 7
+days, abandoned `.life-tmp-*` workspaces, release `.tmp-*` folders and inbox-tmp files after 1 day, pre-migration
+copies beyond 10 files or 2 GiB, a retired codebase cell's clone with its `.agents` sibling, and (through the hub's
+discard route) every agent checkout of a collected run. Nothing else (items, knowledge, sources, releases, bundles
+and cell rows are kept). STATE_MAX_BYTES (about 19.8 GB) is the sum of its parts: three codebase clones (1.6 GB each,
+measured), two live runs of four agent checkouts (0.8 GB each), 2 GiB of state, the organism with its seven backups
+(512 MiB each) and 2 GiB of pre-migration copies.
+
+## 14. Observability
+
+`bin/life-status.py` (read-only; exactly no argument or `--json`, anything else is usage exit 2; one read transaction for the registry and a separate read of the control files,
+each with its own time, `registry_sampled_at` and `control_sampled_at`, re-read once when ARMED, STOP or FREEZE
+changed meanwhile; `--json`): control switches (including whether the kit, platform files or decisions changed
+since arm), the tracked branch, release, fault and canary holds, governor (with node rests), today's budget, every
+live cell with its queue, live runs, open notices with their repeat counts; it prints UNKNOWN and exits 1 when the
+registry cannot be read, the seed did not finish, the schema is not 5, there is not exactly one active release, or
+ARMED is malformed or unreadable (an unknown grant is never shown as an ordinary disarm); every registry string is
+printed through `one_line`, and the governor's JSON columns are decoded first (`--json` keeps them as JSON).
+`STATE/operator/status.json` is the tick's projection with `tick_started_at`, `tick_finished_at`, `working_tick`,
+`runs_cancel_requested` and `disposition` (`worked`, `observe:<first hold>`, `integrity`, `stop`, `fault`,
+`killed`), written on every exit after step 2. Notices stay open until acknowledged; while one is open, a repeat of
+its kind and its subject KEY only raises its `count` and `last_at` (the key is the full subject when it has at most
+120 characters, else its first 103, `~` and 16 hex of its sha256: two long subjects never merge) (acknowledging never clears the condition itself; a condition that
+persists opens a new notice at its next occurrence). Every kind, with its subject (code refuses any other kind;
+VALIDATE proves every kind the code writes is listed):
+
+| kind | subject |
+|------|---------|
+| stopped | STOP |
+| integrity | state &#124; release N &#124; kit &#124; platform &#124; decisions |
+| contract | platform |
+| canary_failed | canaries |
+| storage | state &#124; organism &#124; backup |
+| budget | &lt;budget column&gt; &lt;UTC day&gt; |
+| held | the hold reason |
+| telemetry | node |
+| overflow | &lt;organ&gt; &lt;UTC day&gt; |
+| no_capacity | slots |
+| inbox_refused | first 16 hex of sha256(file name) |
+| agenda_invalid | entry id or agenda.json |
+| agenda_skipped | entry id |
+| command_too_long | command id |
+| command_needs_test | command id |
+| command_needs_program | command id |
+| command_database_confirm | command id |
+| command_heartbeat | command id |
+| command_immune | command id |
+| command_none | command id |
+| command_merged | command id |
+| command_failed | command id |
+| command_done | command id |
+| report_truncated | command id |
+| approve_needed | item id |
+| tracked_private_data | codebase |
+| already_passing | item id |
+| watch_timeout | test id |
+| watch_too_slow | test id |
+| watch_error | test id |
+| sandbox | landlock |
+| finding_owner | item id |
+| finding_failed | item id |
+| patch_ready | patch id |
+| patch_test_only | patch id |
+| patch_repeat | patch id |
+| proposal_ready | proposal id |
+| review_owner | item id |
+| migration_applied | migration id |
+| migration_numbers | database |
+| migration_recovery_required | migration id |
+| migration_imported | migration id |
+| store_table | org table |
+| experiment_passed | experiment id |
+| benchmarks_missing | compute |
+| benchmarks_invalid | benchmark id or benchmarks.json |
+| bench_refused | experiment id |
+| job_unknown | job id or label |
+| job_lost | job label |
+| agy_not_ready | node |
+| catalogue_shape | catalog |
+| inventory_shape | inventory |
+| model_absent | &lt;node&gt; &lt;program&gt; |
+| workspace | workspace path |
+| quarantine | cell id |
+| auto_released | cell id |
+| moved | cell id |
+| abstain_rate | cell id |
+| render | item id |
+| run_unknown | run id |
+| policy_mismatch | run id |
+| infra_repeat | item id |
+| tick_fault | exception type |
+| timeout_limit | item id |
+| watch_invalid | watch.txt |
+| agy_model | agy-model.txt |
+| agy_quota | node |
+| gate_unproven | codebase |
+| store_failed | org table |
+| node_cleanup | node |
+| source_duplicate | source key |
+| job_ambiguous | job label |
+| question_waiting | item id |
+| clock | governor |
+
+`metrics` holds per organ per UTC day: items done, failed, abstained, program runs (reproduction included), agent
+runs. Command reports: section 7.1.
+
+## 15. Operator operations (`bin/life-ctl.py`)
+
+| command | lock | refuses when | effect |
+|---------|------|--------------|--------|
+| `seed --confirm START [--branch NAME]` | yes (60 s) | STOP present; the live checkout has no branch NAME (default main); the contract or VALIDATE.sh fails; already seeded; a resumed seed with another kit or branch | creates or finishes creating everything; NAME is recorded as the tracked branch; `meta.seed_complete` last |
+| `arm --confirm ARM-UNTESTED --decisions HEX16` | control lock (publication only) | STOP present; seed not finished; HEX16 is not the start of DECISIONS.md's sha256; contract or STATE problems; VALIDATE.sh fails; the loaded units differ from the kit's; the sandbox probe fails or is inconclusive; a STOP happened while it validated | ARMED = {boot id, kit, platform and decisions hashes} |
+| `disarm`, `freeze`, `thaw`, `selfdev-arm`, `selfdev-disarm` | no | — | the switch file |
+| `unstop` | control lock | — | STOP removed (LIFE stays disarmed) |
+| `stop` | control lock (not the tick's) | the registry cannot be read (prints how to cancel by hand) | section 5; STOP_GENERATION + 1, STOP written, ARMED removed |
+| `clear-fault` | yes | — | fault hold and fault count cleared |
+| `command "TEXT"` | no | not 6..4000 bytes of text after stripping, credential-shaped | one inbox file (no-replace) |
+| `notices`, `show ITEM`, `report COMMAND` | no | unknown id | prints (report without control characters) |
+| `ack NOTICE` | yes | not open | acknowledged |
+| `approve ITEM --confirm APPROVE` | yes | not a queued web/model lesson or request | approved = 1, approved_sha = its operative text's sha256; taint unchanged |
+| `apply PATCH --confirm APPLY [--unreviewed] [--moved-base]` | yes | STOP present; not eligible (without `--unreviewed` only `ready`; with it only `owner`, a patch that passed every code gate; rejected, bundled, applied and reverted-final states never); an apply record exists; the live checkout is on another branch (unless --moved-base); diff hash differs; a protected path; a touched path with a symlinked parent, a hardlink or not a regular file; `git apply --summary` shows a mode change, symlink or submodule; a touched live file's blob differs from the patch base's (unless --moved-base); `git apply --check` fails | before-bytes, modes and journal, `git apply` (no staging, no commit), after-hashes; prints the restart-gated / live-static warning, "run bin/devcheck before you commit", and UNVERIFIED for a moved base. `--unreviewed` waives the model review only, never a code check |
+| `recover-apply PATCH --confirm RECOVER` | yes | no record; the record is not intent or reverting; a touched file holds neither its before- nor its patched bytes | every touched file back to its before-bytes; the patch back to its pre-apply state; the record moved to history |
+| `revert PATCH --confirm REVERT` | yes | no record; the record is not done or reverting; a touched file holds neither its before- nor its after-bytes | before-bytes and modes restored (journal reverting, then reverted); the patch back to its pre-apply state and the record moved to history, so it may be applied again |
+| `adopt PROPOSAL --confirm ADOPT [--unreviewed]` | yes | STOP present; not ready; a protected program; the active release is not the proposal's base (then `stale`); the bundle differs from the reviewed text; the protected-line or placement rule; the new release fails `check_release` | a new active release |
+| `new-release --confirm RELEASE` | yes | STOP present; `check_release` fails | the kit's genome/organs/policies as a new active release |
+| `release-cell CELL` | yes | not quarantined | active, failure streak 0, rungs kept |
+| `retire CELL [--force]` | yes | last active cell or a live run, without --force | its open division aborts; a live run is abandoned as `abandon-run` does; retired; queued items (not gate/apply) return to the organ |
+| `revive ORGAN NODE` | yes | the organ has a live cell; the node is full; the organism has 16 live cells; the day's births are spent | a new depth-0 cell with the seed focus (event `revived`; births + 1) |
+| `requeue ITEM --confirm REQUEUE` | yes | the item did not end owner or failed and is not an OVERFLOW, EMPTY or refused-fetch abstention | queued again with infra_runs, faults, start_refusals, timeouts and rung_extra 0, without a cell; a gate or apply item goes back to its agent stage; a source back to fetch (fetch_state pending) |
+| `abandon-run RUN_ID --confirm ABANDON` | yes | not a LIFE run in submitting, live or submit_unknown | its cancel requested; the row ends `unknown`, collected, cancel_cause owner; its item goes to the operator; the workspace reset; a result that appears later is ignored |
+| `move CELL NODE` | yes | not active/quarantined (a dividing cell never moves), same node, node full, the node not online in the latest sample, a live run, a running item, or a gate/apply item | the cell's node changes (agy readiness is not checked: the cell waits there like any cell on an unavailable node) |
+| `release-hold NODE` | yes | — | every hold of the node is removed (an unknown or lost job included) |
+| `canaries` | yes | STOP present | a canary round now; hold set or cleared |
+| `gate-selftest TEST_ID` | yes | STOP present; no active codebase cell has an idle clone; the test does not resolve | the sandbox probe, then the gate twice on the lowest active codebase cell's idle clone (never only the seed clone, which retires at its first division): a harmless comment must PASS with at least one file checked, a line that does not parse must fail at devcheck (exit 4); PASS only when all three hold, and a PASS records meta `gate_selftest` (kit and platform hashes, test, time), without which codebase gates wait |
+| `restore registry\|organism FILE --confirm RESTORE` | yes (held throughout) | STOP absent; the tick unit running; FILE not a backup of that database in STATE/backups | section 12; an organism restore clears every store mark |
+| `forget-migration ID --confirm FORGET` | yes | not an applied migration | refused, "forgotten after a restore" (section 7.8) |
+| `purge-refused --confirm PURGE` | no | — | deletes refused inbox files |
+| `contract` | no | — | prints the contract problems or "contract holds" |
+
+`check_release` is the ONE release validator (seed, adopt, new-release; VALIDATE.sh runs it on the kit too):
+organs.json schema, `bin/symblic check` and the placement rule on every program, the distill-lesson enum naming no
+protected program, every raw template linting with zero findings and starting each line with a `symblic_autogen`
+verb, every agent template rendered with `organs/fixtures.json` AND with the largest legal values
+(`life_common.worst_values`) into two lint-clean statements within 1480 characters, the fixed policy, and
+`policy_flags()` round-tripped through bin/symblic-task's own parser to the same sha256. A
+release is built in `STATE/release/.tmp-*`, validated, renamed into place, then activated in one registry
+transaction (the old one deactivated in the same transaction). Registry-changing commands take the tick's lock,
+waiting up to CTL_LOCK_WAIT 3000 s (a tick may hold it up to 2700 s) and printing a line every 60 s. Exit codes:
+0 done, 1 refused (the reason is printed), 2 usage (unknown arguments fail before any change).
+
+## 16. Validation
+
+`VALIDATE.sh` runs only static checks (no model, agent, network or task): (1) inventory and executable bits;
+(2) `bin/symblic check` and the placement rule on the nine programs; (3) the organs.json closed schema; (4) each raw
+agent template linted with zero findings and no root and starting each line with a `symblic_autogen` verb, each
+template rendered with `organs/fixtures.json` into exactly two statements with zero lint findings, its policy equal
+to the fixed policy with the organ's exact checks and accepted by `normalize`, `policy_flags()` round-tripped through
+bin/symblic-task's own parser to the same sha256, the largest legal values (`worst_values`, each field checked to be
+at its maximum: a 160-character test id, a depth-10 workspace, a 240-character review note, three 80-character paths
+with three 48-character function names) still rendering within 1480 characters, and `check_release` accepting the
+kit; (5) `bash -n`, `ast.parse` and JSON parsing on every file; (6) both schemas applied twice in memory with 28 bad
+rows refused; (7) the exact canary list; (8) the example benchmarks through the tick's own rules, a backtracking
+param_rx refused, and the generated run wrapper run under sh on a printf command (framing, exit status, truncation;
+no model, no network, a private temporary folder); (9) this document's appendices against the files, byte for byte,
+with no duplicate or extra block; (10) the platform contract; (11) 161 pure-function cases (protected lines,
+placement, the genome enums and ask lines, migrations and snapshots with the column grammar, both credential tiers,
+verify lines, the gate's path, mode and typechange rules, local_fix with nested signatures, duplicate definitions and
+traceback identities, environment errors, path classes, cell and test ids, payload schemas and values, failure
+fingerprints, notice keys, lint rewrites, the unit file, every stage budget fitting a tick, the derived limits —
+research, benchmarks, model-call walls, the KV context, division ticks, agent runs against the duty window, storage —,
+protocol limits equal in code, SQL and regexes, the gate's --no-tests, every CONTRACT file protected, every notice
+kind and meta key declared, the pressure files); (12) no timing literal in any program but `life_common.py`, and the gate
+script's timeouts equal to `GATE_DEVCHECK_TIMEOUT` and `GATE_TEST_TIMEOUT`; (13) sections 13, 14 and 17 of this
+document equal to the tables `life_common` generates. It ends **STATIC PASS**. It is not an admission test (GAP 8).
+
+## 17. Platform facts LIFE relies on (verified 2026-10-11; re-checked every tick by `contract_problems`)
+
+Each row below is one `life_common.CONTRACT` entry: a regular expression that must match the named file. A
+regex pins the reviewed text, not behaviour; behaviour is what the admission tests (GAP 8) would check. Every
+file named here is also on the gate deny list.
+
+| file | fact |
+|------|------|
+| `symblicos/autogen.py` | run id derivation |
+| `symblicos/autogen.py` | a repeated start with the same request id and the same statements and policy returns the existing run |
+| `symblicos/autogen.py` | agy admitted for autogen |
+| `symblicos/autogen.py` | terminal run states |
+| `symblicos/autogen.py` | cwd must be a git workspace |
+
+
+[This is part 8 of 26. Do not critique yet. Reply only with the word RECEIVED.]

@@ -1,0 +1,429 @@
+[LIFE round-4 critique packet, part 19 of 21]
+
+        statements = split_sql(sql_text)
+    except ValueError as exc:
+        return [str(exc)]
+    if not 1 <= len(statements) <= MIGRATION_STATEMENTS_MAX:
+        out.append(f'a migration has 1..{MIGRATION_STATEMENTS_MAX} statements')
+    for s in statements:
+        code = code_text(s)
+        if MIGRATION_HEAD_DENY_RX.match(s) or FUNCTION_DENY_RX.search(code) or WORD_DENY_RX.search(code):
+            out.append(f'denied statement, word or function in: {s[:80]}')
+        elif re.search(r'["`\[\]]', code):
+            out.append(f'identifiers are never quoted (no " [ ] or ` outside \'...\' literals): {s[:80]}')
+        elif not MIGRATION_RX.fullmatch(s):
+            out.append(f'not an allowed additive form: {s[:80]}')
+        elif len(REFERENCES_RX.findall(code)) != len(REFERENCE_NAME_RX.findall(code)):
+            out.append(f'every REFERENCES names an unquoted org_ table followed by (column): {s[:80]}')
+    if out:
+        return out
+    if snapshot_sql_text:
+        problems = snapshot_problems(snapshot_sql_text)
+        if problems:
+            return problems
+    db = sqlite3.connect(':memory:')
+    db.set_progress_handler(deadline_handler(MIGRATION_SECONDS), 10000)
+    try:
+        if db_path and os.path.getsize(db_path) <= ORGANISM_VALIDATE_MAX_BYTES:
+            src = sqlite3.connect(f'file:{db_path}?mode=ro', uri=True)
+            try:
+                src.backup(db)
+            finally:
+                src.close()
+        elif snapshot_sql_text:
+            for s in split_sql(snapshot_sql_text):
+                db.execute(s)
+        existing = {r[0] for r in db.execute("SELECT name FROM sqlite_master")}
+        cols = {}
+        for s in statements:
+            m = MIGRATION_RX.fullmatch(s)
+            name = m.group(2) or m.group(4)
+            if name and name in existing:
+                out.append(f'{name} already exists: a migration creates new names only')
+            for ref in REFERENCE_NAME_RX.findall(code_text(s)):
+                if ref not in existing and ref != m.group(2):
+                    out.append(f'REFERENCES {ref}: no such org_ table in the snapshot or earlier in this migration')
+            if m.group(4) and m.group(5) not in existing:
+                out.append(f'index {m.group(4)} is on {m.group(5)}, which does not exist')
+            if m.group(6):
+                table = m.group(6)
+                if table not in existing:
+                    out.append(f'ALTER TABLE {table}: no such table')
+                have = cols.setdefault(table, {r[1] for r in db.execute(f'PRAGMA table_info("{table}")')}
+                                       if table in existing else set())
+                if m.group(7) in have:
+                    out.append(f'{table}.{m.group(7)} already exists')
+                have.add(m.group(7))
+            if name:
+                existing.add(name)
+        if out:
+            return out
+        schemas = []
+        for _ in (1, 2):
+            for s in statements:
+                try:
+                    db.execute(s)
+                except sqlite3.OperationalError as exc:
+                    if s.startswith('ALTER TABLE') and 'duplicate column' in str(exc) and schemas:
+                        continue                  # the second application of an ADD COLUMN
+                    raise
+            schemas.append(sorted(tuple(r) for r in db.execute('SELECT type, name, sql FROM sqlite_master')))
+        if schemas[0] != schemas[1]:
+            out.append('a second application changed the schema')
+        if db.execute("SELECT 1 FROM sqlite_master WHERE name='sqlite_sequence'").fetchone():
+            out.append('the migration created the internal sqlite_sequence table (AUTOINCREMENT)')
+    except sqlite3.Error as exc:
+        out.append(f'sqlite refused: {exc}')
+    finally:
+        db.close()
+    return out
+
+
+# ------------------------------------------------------------------------------------------- genome rules
+
+# The instruction is the LAST top-level quoted string before " from ": the type may hold quoted enum descriptions.
+ASK_RX = re.compile(r'(?P<indent>[ \t]*)ask (?P<name>[a-z_][a-z0-9_]*): (?P<type>.*) "(?P<instr>(?:[^"\\]|\\.)*)" '
+                    r'(?P<tail>from [^"]*)')
+NOTE_RX = re.compile(r'[ \t]*note ')
+
+
+def genome_protected_problems(old_text, new_text):
+    """A selfdev proposal may change only the quoted instruction of ask lines. Every other line (notes, blank lines
+    and indentation included), and every ask's indentation, name, type (enum descriptions included) and trailing
+    from/with clause stay byte-identical and in order; each changed instruction keeps exactly the same {name}
+    placeholders; at least one instruction changes."""
+    old = (old_text or '').splitlines(True)
+    new = (new_text or '').splitlines(True)
+    if len(old) != len(new):
+        return ['the number of lines changed']
+    out, changed = [], 0
+    for n, (a, b) in enumerate(zip(old, new, strict=True), 1):
+        if a == b:
+            continue
+        ma, mb = ASK_RX.fullmatch(a.rstrip('\n')), ASK_RX.fullmatch(b.rstrip('\n'))
+        if a.endswith('\n') != b.endswith('\n') or not (ma and mb) or any(
+                ma.group(k) != mb.group(k) for k in ('indent', 'name', 'type', 'tail')):
+            out.append(f'line {n}: only the quoted instruction of an ask line may change')
+        elif sorted(FIELD_RX.findall(ma.group('instr'))) != sorted(FIELD_RX.findall(mb.group('instr'))):
+            out.append(f'line {n}: the instruction must keep exactly the same {{placeholders}}')
+        else:
+            changed += 1
+    if not out and changed == 0:
+        out.append('no ask instruction changed')
+    return out
+
+
+PLACEMENT_RX = re.compile(r'\b(by|applicator|model|node|engine)\s*=')
+
+
+def genome_placement_problems(text):
+    """A genome program never chooses its own model, node or engine: outside quoted strings, no `by=`, `applicator=`,
+    `model=`, `node=` or `engine=` option (an ask-level by would win over the tick's --by). check_release refuses it."""
+    bare = re.sub(r'"(?:[^"\\]|\\.)*"', '""', text or '')
+    return [f'line {n}: a placement option ({m.group(1)}=) is not allowed in a genome program'
+            for n, line in enumerate(bare.splitlines(), 1) for m in PLACEMENT_RX.finditer(line)]
+
+
+VERIFY_LINES = {
+    'codebase': re.compile(r'finding=[0-9a-f]{16} test=tests\.[A-Za-z0-9_.]+'),
+    'selfdev': re.compile(r'lesson=[0-9a-f]{16} program=[a-z-]+'),
+    'database': re.compile(r'migration=[0-9]{4}_[a-z0-9_]{1,40}'),
+}
+
+
+def verify_line_problems(organ, data, expected):
+    """verify.txt must be exactly the expected line, optionally followed by one LF: no BOM, CR, spaces or other
+    lines. `data` is the file's bytes."""
+    if isinstance(data, str):
+        data = data.encode('utf-8')
+    if not VERIFY_LINES[organ].fullmatch(expected):
+        return ['the expected verify line has the wrong form']
+    if data not in (expected.encode('ascii'), expected.encode('ascii') + b'\n'):
+        return ['verify.txt must be exactly the line ' + expected]
+    return []
+
+
+# ------------------------------------------------------------------------------------------- loopback adapter
+
+
+class Telemetry(Exception):
+    def __init__(self, message, status=None):
+        super().__init__(message)
+        self.status = status                    # the HTTP status code, or None when there was no HTTP answer
+
+
+def _finite_float(text):
+    value = float(text)
+    if not math.isfinite(value):
+        raise ValueError(f'a non-finite number {text[:20]}')
+    return value
+
+
+def _depth_ok(value, depth=0):
+    if depth > JSON_MAX_DEPTH:
+        return False
+    if isinstance(value, dict):
+        return all(_depth_ok(v, depth + 1) for v in value.values())
+    if isinstance(value, list):
+        return all(_depth_ok(v, depth + 1) for v in value)
+    return True
+
+
+def strict_json(raw):
+    """JSON as LIFE accepts it from any platform answer: duplicate keys, NaN/Infinity, numbers that overflow to an
+    infinite float and nesting deeper than JSON_MAX_DEPTH are refused (ValueError)."""
+    try:
+        value = json.loads(raw, object_pairs_hook=_no_dup_keys, parse_float=_finite_float,
+                           parse_constant=lambda c: (_ for _ in ()).throw(ValueError(c)))
+    except RecursionError:
+        raise ValueError('JSON nested too deeply') from None
+    if not _depth_ok(value):
+        raise ValueError(f'JSON nested deeper than {JSON_MAX_DEPTH}')
+    return value
+
+
+def _http_once(path, body, timeout):
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *args, **kwargs):
+            return None
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+    data = None if body is None else json.dumps(body).encode('utf-8')
+    req = urllib.request.Request(DASH + path, data=data, method='GET' if body is None else 'POST')
+    req.add_header('Host', '127.0.0.1:8080')
+    req.add_header('Accept', 'application/json')
+    req.add_header('User-Agent', 'life-tick')
+    if data is not None:
+        req.add_header('Content-Type', 'application/json')
+    try:
+        with opener.open(req, timeout=timeout) as res:
+            raw = res.read(HTTP_MAX_BYTES + 1)
+        if len(raw) > HTTP_MAX_BYTES:
+            raise Telemetry(f'{path}: answer larger than {HTTP_MAX_BYTES} bytes')
+        value = strict_json(raw.decode('utf-8'))
+    except urllib.error.HTTPError as exc:
+        raise Telemetry(f'{path}: HTTP {exc.code}', exc.code) from None
+    except (urllib.error.URLError, OSError, ValueError, TimeoutError) as exc:
+        raise Telemetry(f'{path}: {type(exc).__name__}: {str(exc)[:200]}') from None
+    if not isinstance(value, dict):
+        raise Telemetry(f'{path}: answer is not a JSON object')
+    return value
+
+
+def http_json(path, body=None, timeout=HTTP_TIMEOUT):
+    """GET (body None) or POST JSON to the loopback dashboard with bin/symblic-task's header shape: no proxy,
+    no redirect, Host 127.0.0.1:8080. ONE deadline of `timeout` seconds covers connecting, the headers, the body and
+    decoding: the exchange runs in a helper thread and a caller never waits longer (a trickling answer is abandoned;
+    the helper ends at its own socket timeout). Any HTTP error (status kept), oversize answer (> HTTP_MAX_BYTES),
+    strict_json refusal, non-object answer or the deadline raises Telemetry."""
+    box = {}
+
+    def work():
+        try:
+            box['value'] = _http_once(path, body, timeout)
+        except Telemetry as exc:
+            box['error'] = exc
+        except Exception as exc:  # noqa: BLE001 - any other failure is a Telemetry failure
+            box['error'] = Telemetry(f'{path}: {type(exc).__name__}: {str(exc)[:200]}')
+    t = threading.Thread(target=work, daemon=True)
+    t.start()
+    t.join(timeout)
+    if t.is_alive():
+        raise Telemetry(f'{path}: no complete answer within {timeout} s')
+    if 'error' in box:
+        raise box['error']
+    return box['value']
+
+
+# ------------------------------------------------------------------------------------------- processes
+
+
+class Procs:
+    """Every subprocess LIFE starts, so STOP (or a timeout) ends them the same way: SIGTERM to the process group,
+    then SIGKILL to the whole group KILL_GRACE seconds later, whether or not the leader already exited. Output goes to
+    temporary files (memory stays bounded); a process that writes more than OUTPUT_KILL_BYTES is ended and returns
+    OUTPUT_LIMIT_RC (checked while it runs AND after it exits). A process is registered in `live` the instant it
+    exists, so STOP always sees it. `tracked=False` is for the cancel calls STOP itself makes and the agent start
+    (which must not be killed half-way); `admit` is the final admission callable checked immediately before the
+    process is created (launch_allowed for new work)."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.live = {}
+
+    def run(self, argv, timeout, cwd=None, env=None, tracked=True, admit=None):
+        """Returns (rc, stdout, stderr): rc None = timeout, OUTPUT_LIMIT_RC = output limit, 127 = could not start or
+        not admitted, negative = signal."""
+        if tracked and os.path.lexists(STOP_FILE):
+            return 127, '', 'STOP present: not started'
+        if admit is not None and not admit():
+            return 127, '', 'not admitted: STOP, FREEZE, disarm or a kit/platform/decisions change'
+        if timeout <= 0:
+            return None, '', 'no time left in this stage'
+        with tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
+            with self.lock:
+                try:
+                    proc = subprocess.Popen(argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=out, stderr=err,
+                                            start_new_session=True, close_fds=True)
+                except (OSError, ValueError) as exc:
+                    return 127, '', f'could not start {argv[0] if argv else "?"}: {type(exc).__name__}: {exc}'
+                if tracked:
+                    self.live[proc.pid] = proc
+            end, rc = time.monotonic() + timeout, None
+
+            def size():
+                return os.fstat(out.fileno()).st_size + os.fstat(err.fileno()).st_size
+            try:
+                while True:
+                    try:
+                        rc = proc.wait(timeout=1)
+                        break
+                    except subprocess.TimeoutExpired:
+                        pass
+                    if size() > OUTPUT_KILL_BYTES:
+                        self.end([proc])
+                        rc = OUTPUT_LIMIT_RC
+                        break
+                    if time.monotonic() >= end:
+                        self.end([proc])
+                        rc = None
+                        break
+                if rc not in (None, OUTPUT_LIMIT_RC):
+                    self.end([proc], leader_done=True)     # descendants still in the group end too
+                    if size() > OUTPUT_KILL_BYTES:
+                        rc = OUTPUT_LIMIT_RC
+            finally:
+                if tracked:
+                    with self.lock:
+                        self.live.pop(proc.pid, None)
+            out.seek(0)
+            err.seek(0)
+            return rc, out.read(OUTPUT_KEEP_BYTES).decode('utf-8', 'replace'), err.read(ERR_KEEP_BYTES).decode('utf-8', 'replace')
+
+    @staticmethod
+    def end(procs, leader_done=False):
+        """SIGTERM every group, wait up to KILL_GRACE for the leaders, then SIGKILL every group (a group whose members
+        are all gone answers ESRCH, which is ignored), reap the leaders for at most 5 s. leader_done: the leader
+        already exited normally; only a SIGKILL to its group follows (no grace: nothing should remain)."""
+        if not leader_done:
+            for proc in procs:
+                try:
+                    os.killpg(proc.pid, signal.SIGTERM)
+                except OSError:
+                    pass
+            deadline = time.monotonic() + KILL_GRACE
+            for proc in procs:
+                try:
+                    proc.wait(timeout=max(0.1, deadline - time.monotonic()))
+                except subprocess.TimeoutExpired:
+                    pass
+        for proc in procs:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except OSError:
+                pass
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+
+    def kill_all(self):
+        with self.lock:
+            procs = list(self.live.values())
+        if procs:
+            self.end(procs)
+        return len(procs)
+
+
+_RUNNER = Procs()
+
+
+def run_bounded(argv, *, timeout, cwd=None, env=None, tracked=True):
+    """One process through the shared runner (life-ctl, life-check and the cancel calls)."""
+    return _RUNNER.run(argv, timeout, cwd=cwd, env=env, tracked=tracked)
+
+
+PROTECTED_ENV = re.compile(r'^(PATH|HOME|LANG|LC_\w+|PYTHON\w*|DASH_URL|SYMBLIC_\w*|LD_\w+|DASHBOARD_DIR|GIT_\w+)$')
+
+
+def child_env(extra=None):
+    """The environment every trusted LIFE subprocess gets: nothing inherited, fixed PATH, thermal guard on (it only
+    refuses on a hot node: a call named @NODE is never re-placed, symblic_apply pins it), git's system and global
+    configuration off (GIT_CONFIG_NOSYSTEM, GIT_CONFIG_GLOBAL=/dev/null). `extra` may add only keys outside
+    PROTECTED_ENV. Candidate (agent-written) code never runs with this environment: it runs under sandbox_argv() with
+    an empty temporary HOME."""
+    env = {'PATH': '/usr/local/bin:/usr/bin:/bin', 'HOME': '/home/operator', 'LANG': 'C.UTF-8',
+           'PYTHONDONTWRITEBYTECODE': '1', 'DASH_URL': DASH, 'SYMBLIC_THERMAL': '1',
+           'SYMBLIC_CALL_WALL_S': str(CALL_TIMEOUT), 'GIT_CONFIG_NOSYSTEM': '1', 'GIT_CONFIG_GLOBAL': '/dev/null',
+           'GIT_TERMINAL_PROMPT': '0'}
+    for key, value in (extra or {}).items():
+        if PROTECTED_ENV.match(key):
+            raise ValueError(f'child_env: {key} is protected')
+        env[key] = str(value)
+    return env
+
+
+# Every git command LIFE runs in a workspace that candidate code could have written: hooks, fsmonitor, external diff,
+# textconv and filters can never execute (the workspace's .git/config is not trusted; see git_meta_sha256).
+GIT_SAFE = ('-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', '-c', 'core.sshCommand=/bin/false',
+            '-c', 'diff.external=', '-c', 'protocol.ext.allow=never', '-c', 'core.pager=cat')
+GIT_META = ('config', 'config.worktree', 'info', 'hooks', 'objects/info/alternates')
+
+
+def git_meta_sha256(ws):
+    """sha256 over the executable-configuration parts of ws/.git (config, config.worktree, info/, hooks/, the
+    alternates file): taken before candidate code runs in ws and compared after it; a difference means candidate code
+    edited git's own configuration and the workspace is deleted and re-created (never used by trusted git again)."""
+    h = hashlib.sha256()
+    base = os.path.join(ws, '.git')
+    for rel in GIT_META:
+        path = os.path.join(base, rel)
+        if os.path.islink(path):
+            h.update(rel.encode() + b'\0link\n')
+        elif os.path.isfile(path):
+            h.update(rel.encode() + b'\0' + file_sha(path).encode() + b'\n')
+        elif os.path.isdir(path):
+            for root, dirs, files in os.walk(path):
+                dirs.sort()
+                for name in sorted(files):
+                    p = os.path.join(root, name)
+                    h.update(os.path.relpath(p, base).encode() + b'\0'
+                             + (b'link' if os.path.islink(p) else file_sha(p).encode()) + b'\n')
+        else:
+            h.update(rel.encode() + b'\0absent\n')
+    return h.hexdigest()
+
+
+def devcheck_tools():
+    """(env additions, read-only-exec dirs) so bin/devcheck finds ruff and ast-grep inside the sandbox: the same
+    candidate paths scripts/devcheck.py:find_ruff/find_ast_grep use, resolved through symlinks."""
+    env, dirs = {}, []
+    for var, candidates in (('DEVCHECK_RUFF', ('/home/operator/agent-upgrades/envs/ruff/bin/ruff', '/home/operator/.local/bin/ruff')),
+                            ('DEVCHECK_AST_GREP', ('/home/operator/.local/bin/ast-grep',
+                                                   '/home/operator/.local/share/uv/tools/ast-grep-cli/bin/ast-grep'))):
+        for path in candidates:
+            if os.path.isfile(path) and os.access(path, os.X_OK):
+                real = os.path.realpath(path)
+                env[var] = real
+                dirs.append(os.path.dirname(os.path.dirname(real)))
+                break
+    return env, dirs
+
+
+def sandbox_argv(cwd, home, command, rx=(), env_extra=None):
+    """Candidate code (a watched test, check 0 of a codebase run, the gate) runs ONLY like this: the repository's
+    Landlock launcher with --require (a missing Landlock or a kernel without network rules refuses, exit 125, never an
+    unsandboxed run), the system read-only, `cwd` and the empty temporary `home` the only writable places, the rest of
+    /home/operator (STATE, ~/.ssh, ~/.config, the live checkout, .env) absent, TCP connect only to port 1 and no TCP
+    bind (so 127.0.0.1:8080 and every local TCP service are unreachable), no unix sockets, signals only inside the
+    sandbox (Landlock scoping), only stdin/stdout/stderr inherited (close_fds), and an environment built from nothing.
+    NOT blocked: UDP (the launcher has no UDP rule: GAP 15) and metadata changes such as chmod on paths it cannot read
+    (Landlock does not cover them: GAP 16; state_problems sees a changed mode and holds)."""
+    env = ['PATH=/usr/local/bin:/usr/bin:/bin', 'HOME=' + home, 'LANG=C.UTF-8', 'TMPDIR=' + home,
+           'PYTHONDONTWRITEBYTECODE=1']
+    for key, value in (env_extra or {}).items():
+        env.append(f'{key}={value}')
+    argv = ['env', '-i', *env, SYS_PY, '-I', '-B', SANDBOX_LAUNCHER, '--cwd', cwd, '--rw', cwd, '--rw', home,
+            '--require', '--no-unix', '--net-connect', '1']
+
+
+[This is part 19 of 21. Reply only with the word RECEIVED.]

@@ -1,0 +1,86 @@
+{
+  "note": "One division of the seed learning cell as the registry records it. Values are illustrative; ids follow spawn/PROTOCOL.md section 3. Learning is a model organ, so there is no workspaces stage and the commit follows the assign stage at once.",
+  "parent": {
+    "cell_id": "learning.0.00000000",
+    "organ": "learning",
+    "depth": 0,
+    "node": "node-d",
+    "focus": "research the open questions and record new sources",
+    "state": "dividing",
+    "failures_in_a_row": 0,
+    "backlog_ticks": 3,
+    "queued": 14
+  },
+  "division": {
+    "division_id": "3f1c0b6a9d2e4475",
+    "stage": "foci",
+    "release": 1,
+    "ticks": 0,
+    "foci_retries": 0,
+    "last_step_tick": 0,
+    "snapshot": [
+      "learning:<16hex of question 1>",
+      "learning:<16hex of question 2>",
+      "... 14 ids: priority, then oldest updated_at, then item id"
+    ]
+  },
+  "foci_call": {
+    "program": "reproduce",
+    "applicator": "ollama:llama3.2:1b@node-d",
+    "inputs": {
+      "organ": "learning",
+      "parent_focus": "research the open questions and record new sources",
+      "sample_items": "ceramic foam porosity measurement methods | polymer fibre tensile tests | ..."
+    },
+    "returned": {
+      "focus_a": "research porous ceramic structure questions",
+      "focus_b": "research polymer fibre mechanics questions"
+    },
+    "code_check": "8..120 characters each; focus_a, focus_b and the parent focus all different after norm_text"
+  },
+  "assign_calls": {
+    "program": "assign-item",
+    "applicator": "ollama:qwen2.5:0.5b@node-d",
+    "per_tick": 4,
+    "max_items": 16,
+    "returned": {
+      "learning:<16hex of question 1>": "a",
+      "learning:<16hex of question 2>": "b"
+    },
+    "failed_rule": "a failed assign-item answer is recorded at once as the parity side and never asked again"
+  },
+  "commit": {
+    "rule": "assign-item answer, else the parity of sha256(item_id)",
+    "child_a": {
+      "cell_id": "learning.1.<first 8 hex of sha256('learning.0.00000000\\na\\nresearch porous ceramic structure questions')>",
+      "node": "node-d",
+      "items": 8
+    },
+    "child_b": {
+      "cell_id": "learning.1.<first 8 hex of sha256('learning.0.00000000\\nb\\nresearch polymer fibre mechanics questions')>",
+      "node": "node-i",
+      "items": 6
+    },
+    "parent_after": {
+      "state": "retired",
+      "end_reason": "divided"
+    },
+    "budget_births": 2,
+    "events": [
+      "born",
+      "born",
+      "divided"
+    ],
+    "rechecked": [
+      "parent still dividing",
+      "the active release is still the division's",
+      "organ live cells + 1 <= 3",
+      "organism live cells + 1 <= 16",
+      "births today + 2 <= 8",
+      "control switches and hashes",
+      "the parent's workspace is not busy",
+      "child b node available"
+    ],
+    "where": "lifecycle, at the first armed working tick after the last assignment (no model, no node slot)"
+  }
+}

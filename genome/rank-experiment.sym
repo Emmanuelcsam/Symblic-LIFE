@@ -1,0 +1,11 @@
+program LIFE experiment ranking.
+use profile=verified, context=none, determine=false, solve=false.
+note Worker of a compute cell, rank stage. Model labels only: code applies the rule. An experiment is measured only when feasible is true, risk is low and score is at least 60; nothing a model says waives the governor, the budget or the benchmark template's own timeout. Worst case 2 + 2 + 2 + 3 = 9 calls.
+given hypothesis: Text.
+given benchmark: Text.
+ask feasible: Bool "Can this benchmark, as described, test this hypothesis within its stated per-run timeout on one node? Hypothesis: {hypothesis} Benchmark: {benchmark}" from hypothesis, benchmark with effort=medium, retries=1
+ask novelty: one of {none, small, large} "How different is this hypothesis from the benchmark's default baseline?" from hypothesis, benchmark with effort=low, retries=1
+ask risk: one of {low, medium, high} "How likely is this run to overheat or overload a node or to fill its disk?" from benchmark with effort=low, retries=1
+ask score: Int in 0..100 "Give one integer priority from 0 to 100 for spending cluster time on this experiment." from hypothesis, feasible, novelty, risk with effort=medium, retries=2
+let ranking = {feasible: feasible, novelty: novelty, risk: risk, score: score}.
+return ranking.

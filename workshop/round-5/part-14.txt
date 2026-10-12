@@ -1,0 +1,323 @@
+  base_sha256  TEXT NOT NULL,
+  new_sha256   TEXT NOT NULL,
+  review       TEXT NOT NULL DEFAULT '' CHECK (review IN ('', 'accept', 'reject', 'needs_work')),
+  review_reason TEXT NOT NULL DEFAULT '',
+  state        TEXT NOT NULL CHECK (state IN ('bundled', 'ready', 'rejected', 'owner', 'stale', 'adopted')),
+  created_at   INTEGER NOT NULL,
+  updated_at   INTEGER NOT NULL
+);
+
+-- experiments and results: compute organ. Measurements run only operator-approved benchmark templates.
+CREATE TABLE IF NOT EXISTS experiments (
+  experiment_id TEXT NOT NULL PRIMARY KEY CHECK (length(experiment_id) = 16),  -- sha256(bench_sha256 + "\n" + param)[:16]
+  item_id       TEXT NOT NULL REFERENCES items (item_id),
+  benchmark_id  TEXT NOT NULL,
+  bench_sha256  TEXT NOT NULL CHECK (length(bench_sha256) = 64),     -- the template entry as measured
+  param         TEXT NOT NULL CHECK (length(param) BETWEEN 1 AND 64),
+  hypothesis    TEXT NOT NULL CHECK (length(hypothesis) BETWEEN 20 AND 300),
+  better        TEXT NOT NULL CHECK (better IN ('lower', 'higher')),
+  min_gain_pct  INTEGER NOT NULL CHECK (typeof(min_gain_pct) = 'integer' AND min_gain_pct BETWEEN 1 AND 90),
+  feasible      INTEGER CHECK (feasible IS NULL OR feasible IN (0, 1)),
+  novelty       TEXT CHECK (novelty IS NULL OR novelty IN ('none', 'small', 'large')),
+  risk          TEXT CHECK (risk IS NULL OR risk IN ('low', 'medium', 'high')),
+  score         INTEGER CHECK (score IS NULL OR score BETWEEN 0 AND 100),
+  state         TEXT NOT NULL CHECK (state IN ('proposed', 'ranked', 'ineligible', 'measured', 'failed')),
+  created_at    INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS results (
+  experiment_id   TEXT NOT NULL PRIMARY KEY REFERENCES experiments (experiment_id),
+  node            TEXT NOT NULL,
+  job_id          TEXT NOT NULL,
+  measurements    TEXT NOT NULL,                 -- JSON list of decimal strings in run order (warm-up first, then BENCH_ORDER)
+  gains_pct       TEXT NOT NULL,                 -- JSON list, one exact fraction "n/d" per pair, in the template's better direction
+  median_gain_pct TEXT NOT NULL,                 -- exact fraction "n/d"; display rounding never decides
+  passed          INTEGER NOT NULL CHECK (passed IN (0, 1)),
+  ran_at          INTEGER NOT NULL
+);
+
+-- migrations LIFE applies to (or refused for) the organism database (organism.sqlite3). 'applying' is written,
+-- with the text already in STATE/bundles/migrations/<id>.sql, BEFORE the organism transaction (crash recovery).
+CREATE TABLE IF NOT EXISTS migrations (
+  migration_id TEXT NOT NULL PRIMARY KEY CHECK (length(migration_id) BETWEEN 6 AND 45),
+  item_id      TEXT REFERENCES items (item_id), -- NULL for a migration imported from the organism's own ledger
+  sha256       TEXT NOT NULL,
+  state        TEXT NOT NULL CHECK (state IN ('applying', 'applied', 'refused')),
+  detail       TEXT NOT NULL DEFAULT '' CHECK (length(detail) <= 400),
+  at           INTEGER NOT NULL
+);
+
+-- samples and governor: metabolism (LIFE.md section 10). Samples are written only from a readable status list;
+-- samples older than 7 days are deleted daily.
+CREATE TABLE IF NOT EXISTS samples (
+  at      INTEGER NOT NULL,
+  node    TEXT NOT NULL,
+  online  INTEGER NOT NULL CHECK (online IN (0, 1)),
+  cpu     REAL,                                   -- 100 x vitals.load[1] / vitals.cpus (5-minute load per processor), NULL when missing
+  temp    REAL,                                   -- vitals.temp: degrees C, NULL when missing or invalid
+  mem_avail_mib INTEGER,                          -- vitals.memavail bytes // 1048576
+  PRIMARY KEY (at, node)
+);
+CREATE TABLE IF NOT EXISTS governor (
+  id                 INTEGER PRIMARY KEY CHECK (id = 1),
+  at                 INTEGER NOT NULL,
+  state              TEXT NOT NULL CHECK (state IN ('work', 'rest', 'hold')),
+  continuous_seconds INTEGER NOT NULL CHECK (continuous_seconds >= 0),
+  quiet_seconds      INTEGER NOT NULL CHECK (quiet_seconds >= 0),
+  hot                TEXT NOT NULL DEFAULT '[]',  -- JSON list of LIFE nodes currently hot
+  reasons            TEXT NOT NULL DEFAULT '[]',  -- JSON list of hold reasons
+  node_rest          TEXT NOT NULL DEFAULT '{}',  -- JSON {node: rest start}: per-node duty-cycle rests
+  observed           INTEGER NOT NULL DEFAULT 0 CHECK (observed IN (0, 1))   -- this sample was complete (quiet credit needs two)
+);
+
+-- node_holds: independent holds of a node, keyed (node, cause, subject), so one never overwrites or shortens another
+-- (life_common.hold_node). cause infra: the node answered infra; timeout: subject = the program that timed out (only
+-- that program waits); orphan: subject = a call id a killed tick or STOP may have left running; job: subject = a
+-- benchmark job id or label that is unknown or lost, until = 0 (no expiry: the listing or the operator releases it).
+CREATE TABLE IF NOT EXISTS node_holds (
+  node    TEXT NOT NULL CHECK (node IN ('node-a', 'node-b', 'node-d', 'node-f', 'node-i')),
+  cause   TEXT NOT NULL CHECK (cause IN ('infra', 'timeout', 'orphan', 'job')),
+  subject TEXT NOT NULL DEFAULT '',
+  until   INTEGER NOT NULL CHECK (typeof(until) = 'integer' AND until >= 0 AND (until > 0 OR cause = 'job')),
+  reason  TEXT NOT NULL DEFAULT '' CHECK (length(reason) <= 400),
+  PRIMARY KEY (node, cause, subject)
+);
+
+-- call_intents: written in the same transaction as a slot action's budget charge, BEFORE its process starts, and
+-- deleted when its result is recorded. A row a killed tick or STOP left behind holds its node ORPHAN_HOLD_SECONDS
+-- (division steps have no item, so items alone cannot say a call may still run).
+CREATE TABLE IF NOT EXISTS call_intents (
+  call_id    TEXT NOT NULL PRIMARY KEY,
+  node       TEXT NOT NULL CHECK (node IN ('node-a', 'node-b', 'node-d', 'node-f', 'node-i')),
+  cell_id    TEXT NOT NULL REFERENCES cells (cell_id),
+  item_id    TEXT REFERENCES items (item_id),   -- NULL for a division step
+  program    TEXT NOT NULL,
+  started_at INTEGER NOT NULL
+);
+
+-- workspace_guard: a sandboxed run (watched test, confirmation, gate) in a workspace is recorded here, with the
+-- git_meta_sha256 taken before it, in its own committed transaction BEFORE the run, and removed after the after-hash
+-- matched. A row a killed tick left behind means the run's end was never checked: the next tick deletes that
+-- workspace (it is re-created) and trusted git never runs in it.
+CREATE TABLE IF NOT EXISTS workspace_guard (
+  workspace TEXT NOT NULL PRIMARY KEY,
+  sha256    TEXT NOT NULL CHECK (length(sha256) = 64),
+  at        INTEGER NOT NULL
+);
+
+-- budget: per UTC day counters (charged before the work starts; never refunded).
+CREATE TABLE IF NOT EXISTS budget (
+  day            TEXT NOT NULL PRIMARY KEY CHECK (length(day) = 10 AND day GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'),   -- YYYY-MM-DD (UTC)
+  program_runs   INTEGER NOT NULL DEFAULT 0 CHECK (typeof(program_runs) = 'integer' AND program_runs >= 0),
+  model_calls    INTEGER NOT NULL DEFAULT 0 CHECK (typeof(model_calls) = 'integer' AND model_calls >= 0),
+  agent_runs     INTEGER NOT NULL DEFAULT 0 CHECK (typeof(agent_runs) = 'integer' AND agent_runs >= 0),
+  bench_jobs     INTEGER NOT NULL DEFAULT 0 CHECK (typeof(bench_jobs) = 'integer' AND bench_jobs >= 0),
+  births         INTEGER NOT NULL DEFAULT 0 CHECK (typeof(births) = 'integer' AND births >= 0),
+  self_questions INTEGER NOT NULL DEFAULT 0 CHECK (typeof(self_questions) = 'integer' AND self_questions >= 0)
+);
+
+-- metrics: per organ per UTC day.
+CREATE TABLE IF NOT EXISTS metrics (
+  organ           TEXT NOT NULL CHECK (organ IN ('command', 'learning', 'digest', 'codebase', 'immune', 'selfdev',
+                                                 'compute', 'database')),
+  day             TEXT NOT NULL CHECK (length(day) = 10 AND day GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'),
+  items_done      INTEGER NOT NULL DEFAULT 0 CHECK (typeof(items_done) = 'integer' AND items_done >= 0),
+  items_failed    INTEGER NOT NULL DEFAULT 0 CHECK (typeof(items_failed) = 'integer' AND items_failed >= 0),
+  items_abstained INTEGER NOT NULL DEFAULT 0 CHECK (typeof(items_abstained) = 'integer' AND items_abstained >= 0),
+  program_runs    INTEGER NOT NULL DEFAULT 0 CHECK (typeof(program_runs) = 'integer' AND program_runs >= 0),
+  agent_runs      INTEGER NOT NULL DEFAULT 0 CHECK (typeof(agent_runs) = 'integer' AND agent_runs >= 0),
+  PRIMARY KEY (organ, day)
+);
+
+-- notices: what the operator must see. (kind, subject) is the condition key: while one is open a repeat only counts.
+-- notice_id = sha256(kind, subject, at, 8 random hex)[:12]. Acknowledging never clears the condition itself.
+-- kind is one of life_common.NOTICE_KINDS (code refuses any other).
+CREATE TABLE IF NOT EXISTS notices (
+  notice_id TEXT NOT NULL PRIMARY KEY CHECK (length(notice_id) = 12),
+  kind      TEXT NOT NULL CHECK (length(kind) BETWEEN 1 AND 40 AND kind NOT GLOB '*[^a-z_]*'),
+  subject   TEXT NOT NULL CHECK (length(subject) <= 120),   -- life_common.notice_subject: the full condition key
+  text      TEXT NOT NULL CHECK (length(text) <= 600),
+  state     TEXT NOT NULL CHECK (state IN ('open', 'acked')),
+  at        INTEGER NOT NULL CHECK (typeof(at) = 'integer'),
+  last_at   INTEGER NOT NULL CHECK (typeof(last_at) = 'integer'),
+  count     INTEGER NOT NULL DEFAULT 1 CHECK (typeof(count) = 'integer' AND count >= 1)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS notices_open ON notices (kind, subject) WHERE state = 'open';
+
+===== FILE: db/organism.sql =====
+-- LIFE v2.2 organism database: /home/operator/.local/state/life/organism.sqlite3
+-- The database the organism grows itself. It starts with only the migration ledger below. Every later
+-- table arrives as an additive migration drafted by a database cell and applied by bin/life-tick.py after
+-- code validation (LIFE.md section 7.8; the exact grammar is life_common.MIGRATION_RULES): only CREATE TABLE IF NOT
+-- EXISTS, CREATE [UNIQUE] INDEX IF NOT EXISTS and ALTER TABLE ... ADD COLUMN, every name starts with org_, no
+-- AUTOINCREMENT, no quoted identifier. Nothing is ever dropped or deleted. Rows arrive only through the store adapter
+-- (quote-verified knowledge into org_ tables whose columns are fact_id plus source_url, claim, quote, created_at) or the
+-- operator. The control registry (life.sqlite3) is a separate file, so a migration can never touch control state.
+
+CREATE TABLE IF NOT EXISTS schema_migrations (
+  migration_id TEXT NOT NULL PRIMARY KEY CHECK (length(migration_id) BETWEEN 6 AND 45),
+  sha256       TEXT NOT NULL CHECK (length(sha256) = 64),
+  applied_at   INTEGER NOT NULL
+);
+
+===== FILE: units/life-tick.service =====
+# LIFE coordinator tick. The operator installs this file and life-tick.timer into ~/.config/systemd/user/ (README
+# step 5); nothing in the kit installs it. Code only: it calls light models on the worker nodes through the fleet runner
+# (bin/symblic run --by ollama:MODEL@node-X) and starts bounded agy runs through bin/symblic-task. It runs in
+# work.slice; its heavy children (watched tests, the gate, clones, fetches) run in their own life-*.scope units in
+# work.slice, each with RuntimeMaxSec, and ExecStopPost stops any life-*.scope still running when the tick ends.
+# Exit 1 (a tick fault) is listed as success on purpose: faults surface as notices and the fault hold, and the
+# timer keeps running. On stop (or TimeoutStartSec) systemd sends SIGTERM: the tick ends its process groups
+# (SIGTERM, SIGKILL 30 s later) and every life-*.scope, and exits 4 (listed: a stop is not a fault); TimeoutStopSec
+# leaves that 60 s before SIGKILL of the whole unit. Slot programs, watched tests, gates, clones and fetches run in
+# their own life-*.scope units, so MemoryMax=1G bounds only the coordinator itself.
+# TasksMax = life_common.TICK_TASKS_MAX: 8 tick threads + 5 nodes x 32 (a slot's client before its scope) + 24 helpers.
+# python3 -I: no PYTHON* variable and no user site can change what the coordinator imports.
+[Unit]
+Description=LIFE coordinator tick (code only; light models run on the worker nodes)
+ConditionPathIsDirectory=/home/operator/.local/state/life
+
+[Service]
+Type=oneshot
+Slice=work.slice
+WorkingDirectory=/home/operator/.local/state/life
+ExecStart=/usr/bin/python3 -I -B /home/operator/host-checkout/docs/life/bin/life-tick.py
+ExecStopPost=-/usr/bin/systemctl --user stop life-*.scope
+Nice=10
+TimeoutStartSec=3000
+TimeoutStopSec=60
+KillMode=control-group
+KillSignal=SIGTERM
+SuccessExitStatus=1 3 4 5 6
+Restart=no
+MemoryMax=1G
+TasksMax=192
+
+===== FILE: units/life-tick.timer =====
+# Runs the LIFE tick 10 minutes after boot, then 300 s after each tick ENDS (a long tick delays the next one;
+# missed ticks never pile up). A reboot always comes back disarmed: ARMED holds the previous boot's id.
+[Unit]
+Description=LIFE coordinator tick every 300 s after the previous one ends
+
+[Timer]
+OnBootSec=10min
+OnUnitInactiveSec=300
+AccuracySec=30s
+Persistent=false
+
+[Install]
+WantedBy=timers.target
+
+===== FILE: benchmarks/benchmarks.example.json =====
+{
+  "version": 2,
+  "benchmarks": [
+    {
+      "id": "zlib-level",
+      "description": "Seconds for Python zlib to compress 64 MiB of generated mixed text at level N, median of five runs (time.perf_counter); no file is written. Compression ratio is not measured: a faster level may compress less.",
+      "cmd": "python3 -c 'import zlib,time,statistics,sys; n=int(sys.argv[1]); data=(b\"life organism \"*400+bytes(range(256)))*17000; data=data[:67108864]; ts=[]\nfor _ in range(5):\n s=time.perf_counter(); zlib.compress(data,n); ts.append(time.perf_counter()-s)\nprint(\"LIFE_RESULT %.4f s\" % statistics.median(ts))' {{item}}",
+      "param_rx": "^[1-9]$",
+      "baseline": "6",
+      "unit": "s",
+      "timeout": 300,
+      "better": "lower",
+      "min_gain_pct": 10
+    },
+    {
+      "id": "sqlite-journal",
+      "description": "Seconds to insert 200000 rows into a fresh SQLite file with journal mode N (DELETE, WAL, MEMORY, TRUNCATE), median of five runs, in a temporary folder removed even on failure. Durability differs between modes and is not measured.",
+      "cmd": "python3 -c 'import sqlite3,tempfile,time,statistics,sys; m=sys.argv[1]; ts=[]\nfor _ in range(5):\n with tempfile.TemporaryDirectory() as d:\n  c=sqlite3.connect(d+\"/t.db\")\n  try:\n   c.execute(\"PRAGMA journal_mode=\"+m); c.execute(\"CREATE TABLE t(a,b)\"); s=time.perf_counter(); c.executemany(\"INSERT INTO t VALUES(?,?)\",((i,str(i)) for i in range(200000))); c.commit(); ts.append(time.perf_counter()-s)\n  finally:\n   c.close()\nprint(\"LIFE_RESULT %.4f s\" % statistics.median(ts))' {{item}}",
+      "param_rx": "^(DELETE|WAL|MEMORY|TRUNCATE)$",
+      "baseline": "DELETE",
+      "unit": "s",
+      "timeout": 300,
+      "better": "lower",
+      "min_gain_pct": 10
+    }
+  ]
+}
+
+===== FILE: VALIDATE.sh =====
+#!/usr/bin/env bash
+# LIFE kit validator: STATIC checks only. No model, no agent, no network, no task start, no file written
+# outside a private temporary folder (Python runs with -B, so no bytecode cache is written either).
+#   1 inventory   every required file exists (regular, no symlink); entry points are executable
+#   2 genome      bin/symblic check on each of the nine programs (exit 0 and "ok"); no placement option in any
+#   3 organs      organs/organs.json passes life_common.organs_problems (closed schema, non-thinking ladder models)
+#   4 templates   each raw agent template (organs/<organ>.lines.txt, placeholders unfilled) lints with ZERO
+#                 findings and no root and starts every line with a symblic_autogen verb; each renders with
+#                 organs/fixtures.json into exactly two statements that lint with ZERO findings; its policy equals the
+#                 fixed LIFE policy with the organ's exact checks and passes symblic_autogen.normalize; policy_flags()
+#                 fed through bin/symblic-task's OWN parser and autogen_policy() normalizes to the same sha256 (the round
+#                 trip the server sees); the largest legal values (life_common.worst_values, each field checked to be at
+#                 its maximum) still fit; the release validator life-ctl check_release passes on the kit
+#   5 syntax      bash -n on every shell file; ast.parse on every Python file; every JSON file parses
+#   6 databases   db/life.sql and db/organism.sql applied twice in memory; required tables; CHECK constraints, triggers
+#                 and indexes refuse 28 bad rows (see the list in the check)
+#   7 canaries    exactly the nine program checks and the registry check, each once, in order, each target present
+#   8 benchmarks  benchmarks/benchmarks.example.json passes the tick's own bench_problems rules; a backtracking
+#                 param_rx is refused; the generated run wrapper (bench_wrapper) runs under sh on a printf command and
+#                 frames LIFE_RUN / LIFE_RC / LIFE_TRUNC / LIFE_END exactly (no model, no network, a private temp file)
+#   9 embedding   every "### <path>" block in LIFE.md equals that file byte for byte; no duplicate or extra block; every
+#                 kit file (except LIFE.md, BRIEF.md, workshop/, __pycache__/) is embedded
+#  10 contract    life_common.contract_problems() is empty (the platform facts LIFE relies on hold)
+#  11 rules       pure-function negative and positive cases: protected lines, placement, migrations and snapshots,
+#                 the credential screen, verify lines, the gate's path and local_fix rules, path classes, cell ids, test
+#                 ids, payload schemas, failure fingerprints, lint rewrites, the unit file, every stage budget fits the
+#                 tick, the research and benchmark bounds, every CONTRACT file is gate-protected, every notice kind and
+#                 meta key the code writes is declared, /proc/pressure/io and /proc/pressure/memory readable, the two
+#                 credential tiers, typechanges, nested signatures and duplicate definitions, traceback identities,
+#                 environment errors, the migration grammar, payload values, notice keys, the derived limits (KV
+#                 context, model-call wall, division ticks, storage), protocol limits equal in code, SQL and regexes
+#  12 numbers     no timing literal in any bin/*.py program except life_common.py (every number lives there), and the
+#                 gate script's two timeouts equal GATE_DEVCHECK_TIMEOUT and GATE_TEST_TIMEOUT
+#  13 generated   LIFE.md sections 13, 14 and 17 hold exactly the tables life_common generates (numbers, notice kinds,
+#                 contract rows)
+# It prints PASS/FAIL per check and ends with STATIC PASS or SOME FAILED. Exit 0 only on STATIC PASS.
+# STATIC PASS is not an admission test: the coordinator's behaviour under concurrency, crashes and STOP is
+# not exercised here (LIFE.md section 18, GAP 8).
+set -u
+shopt -s nullglob
+KIT="/home/operator/host-checkout/docs/life"
+REPO="/home/operator/host-checkout"
+PY="/usr/bin/python3 -B -I"
+fail=0
+pass() { printf 'PASS  %-10s %s\n' "$1" "$2"; }
+bad()  { printf 'FAIL  %-10s %s\n' "$1" "$2"; fail=1; }
+
+echo "== 1 inventory =="
+required=(BRIEF.md README.md DECISIONS.md LIFE.md VALIDATE.sh
+  bin/life_common.py bin/life-tick.py bin/life-ctl.py bin/life-status.py bin/life-check.py bin/life-seed.sh
+  bin/life-fetch.py bin/life-research.py
+  checks/devcheck-gate.sh checks/canaries.txt db/life.sql db/organism.sql
+  organs/organs.json organs/fixtures.json organs/codebase.lines.txt organs/selfdev.lines.txt organs/database.lines.txt
+  policies/codebase.json policies/selfdev.json policies/database.json
+  spawn/PROTOCOL.md spawn/example/division.json units/life-tick.service units/life-tick.timer
+  benchmarks/benchmarks.example.json)
+for p in classify-command triage-error extract-source distill-lesson propose-experiment rank-experiment review-patch reproduce assign-item; do
+  required+=("genome/$p.sym"); done
+inv=0
+for f in "${required[@]}"; do
+  if [ -f "$KIT/$f" ] && [ ! -L "$KIT/$f" ]; then :; else bad inventory "$f missing"; inv=1; fi; done
+for f in VALIDATE.sh bin/life-tick.py bin/life-ctl.py bin/life-status.py bin/life-check.py bin/life-seed.sh bin/life-fetch.py \
+         bin/life-research.py checks/devcheck-gate.sh; do
+  [ -x "$KIT/$f" ] || { bad inventory "$f is not executable"; inv=1; }; done
+[ "$inv" = 0 ] && pass inventory "${#required[@]} files"
+
+echo "== 2 genome (bin/symblic check, no model) =="
+for f in "$KIT"/genome/*.sym; do
+  out="$("$REPO/bin/symblic" check "$f" 2>&1)"; rc=$?
+  placement="$($PY -c 'import sys; sys.path.insert(0, sys.argv[1] + "/bin"); import life_common as L; print("; ".join(L.genome_placement_problems(open(sys.argv[2], encoding="utf-8").read())))' "$KIT" "$f")"
+  if [ "$rc" = 0 ] && printf '%s' "$out" | tail -1 | grep -q ': ok' && [ -z "$placement" ]; then pass check "$(basename "$f")"; else bad check "$(basename "$f") $placement"; fi
+done
+
+echo "== 3-4 organs and templates (lint zero findings, normalize, fixed policy, CLI round trip) =="
+if $PY - <<'PYEOF'
+import importlib.machinery, importlib.util, json, sys
+sys.path.insert(0, '/home/operator/host-checkout'); sys.path.insert(0, '/home/operator/host-checkout/docs/life/bin')
+import life_common as L
+import symblic_autogen as A
+ok = True
+problems = L.organs_problems(json.load(open(L.KIT + '/organs/organs.json', encoding='utf-8'), object_pairs_hook=L._no_dup_keys))
+
+
+[This is part 14 of 26. Do not critique yet. Reply only with the word RECEIVED.]

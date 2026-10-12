@@ -1,0 +1,208 @@
+| `STATE/calls/<call_id>/` | each program run's record (`bin/symblic run --dir`) | bin/symblic; deleted 14 days after the call ended |
+| `STATE/text/<16hex of source_key>.txt` | fetched source text snapshots (at most 6000 characters) | the tick |
+| `STATE/runs/<request_id>/` | the exact statements, policy and versioned `manifest.json` of each agent run (a re-send is rebuilt only from them) | the tick; deleted 14 days after the run was collected |
+| `STATE/migration-numbers.txt` | the append-only, fsynced journal of every migration number ever allocated (outside both databases, so no restore lowers it) | the tick |
+| `STATE/operator/node-cleanup.txt` | hub agent checkouts LIFE could not discard (node, run, agent) | the tick |
+| `STATE/bundles/{patches,proposals,migrations}/` | gated patches, proposals, migration texts (each bundle written in a `.tmp-*` folder, then renamed) | the tick |
+| `STATE/applied/<patch_id>/` | before-bytes and the apply journal (intent, done, reverting, reverted, recovered) of every operator apply | life-ctl apply, revert, recover-apply |
+| `STATE/backups/` | daily registry and organism copies (7 per database), pre-migration copies (newest 10), `replaced-*` folders of a restore | the tick; life-ctl restore |
+| `STATE/operator/status.json`, `STATE/operator/reports/<command_id>.md`, `STATE/logs/tick.log` | status, command reports, log (5 MiB, plus 3 archives) | the tick |
+| `STATE/retired/<cell_id>.json` | last commit of a removed codebase clone | the tick |
+| `/home/operator/symblicos/projects/life-<organ>-<depth>-<8hex>/` | one git workspace per agent cell (unique); database workspaces also hold `schema-snapshot.sql` and `MIGRATION-RULES.txt` | seed, revive or division (clone), the tick (reset, sync), autogen promotion |
+| `/home/operator/symblicos/projects/life-<organ>-<depth>-<8hex>.agents/<name>-<stamp>/` | the hub's checkout of one agent attempt (a worktree of the branch, about 0.8 GB for codebase) | the hub; discarded by LIFE through `POST /api/agents/work/discard` once the run is collected |
+
+`host-checkout` itself is never written by LIFE, except by `life-ctl.py apply`, which the operator
+runs. Research runs go through `bin/life-research.py`, which writes no report (the operator's own
+`bin/local-research` keeps writing to `host-checkout/local_research_data/`; LIFE never runs it except
+`--list`). No STATE file is ever carried to a worker node: STATE is not a git workspace, and the agent
+workspaces never contain STATE paths. On a worker node, the hub keeps a bare mirror per workspace
+(`~/agents-repos/<workspace>.git`) and a checkout per attempt (`~/agents-work/<name>`); the discard route removes
+the attempt checkouts with their twins on the host, and the mirrors stay (GAP 14). The storage rule (section 12) counts
+STATE and every `PROJECTS/life-*` path (workspaces and their `.agents` siblings) together.
+
+## 4. The coordinator tick (`bin/life-tick.py`)
+
+Run by the user timer `units/life-tick.timer`: 10 min after boot, then 300 s after each tick **ends**
+(`OnUnitInactiveSec=300`). The service (`units/life-tick.service`) runs `/usr/bin/python3 -I -B` in
+`work.slice` with `TimeoutStartSec=3000`, `TimeoutStopSec=60`, `KillMode=control-group`,
+`ExecStopPost=-/usr/bin/systemctl --user stop life-*.scope`, `SuccessExitStatus=1 3 4 5 6`, `Restart=no`,
+`MemoryMax=1G`, `TasksMax=192`, `Nice=10`, `ConditionPathIsDirectory=STATE`. Times inside a tick, from its
+start: no new the host stage, agent start, division step or slot action begins after `TICK_DEADLINE` 1200 s; a
+stage starts only when `elapsed + its budget + KILL_GRACE + START_MARGIN <= TICK_HARD` 2700 s, and every
+process inside a stage gets its own timeout clipped to what is left of that budget (the stage budgets are in
+section 13); systemd's limit is 3000 s. Heavy local work (watched tests, the gate, clones, git fetches, page fetches,
+every slot program's client, and check 0 of a codebase run through `life-check.py sandboxed`) runs in its own
+`life-<purpose>-<8hex>.scope` in work.slice with MemoryMax, CPUQuota 200 %, TasksMax 64 and RuntimeMaxSec = its
+budget + 30 s (a scope without a lifetime is refused), so the tick's own MemoryMax=1G bounds only the coordinator.
+Immediately before every heavy local process, the host's load, io and memory pressure, MemAvailable and free disk are
+read again (`launch_allowed(heavy=True)`). One tick, in this exact order:
+
+1. **lock** — `flock(STATE/tick.lock, LOCK_EX|LOCK_NB)`; held: print and exit 0.
+   From here to the end, a watcher thread checks STOP every 1 s (`stop_present`: `control/STOP` exists, or
+   `control/` cannot be inspected) and, when it holds, starts stopping every `life-*.scope` (once per STOP, then only
+   while process groups remain) and ends every LIFE process group (SIGTERM, SIGKILL to the whole group 30 s later,
+   whether or not its leader exited). A process STOP ended returns `STOPPED_RC`: its work goes back to its queue with
+   no counter, hold or notice of its own. A SIGTERM to the tick itself (systemd stop or `TimeoutStartSec`) does the
+   same and exits 4 (listed as success: a stop is not a fault).
+2. **stop** — STOP holds: `stop_everything` (section 5; it needs only the registry, never the release, not even the
+   schema check), then, when the schema is right, a reconciliation-only pass (recover, poll runs and benchmark jobs,
+   record what the platform proves; no start, no re-send) and exit 3. Then the registry schema must be 5 (else exit 5).
+3. **recover** — every call intent a killed tick left (`call_intents`: program runs AND division steps) holds its
+   node `ORPHAN_HOLD_SECONDS` (a SIGKILLed `bin/symblic run` can leave its fleet-runner run going until its own
+   RuntimeMaxSec); model-stage items left `running` return to their queue; a `workspace_guard` row (a sandboxed run
+   whose end was never checked) deletes that workspace before any trusted git runs there; a run whose terminal
+   status was copied but not collected (a crash in between) is collected now.
+4. **integrity** — every STATE directory is a real 0700 directory owned by the operator; the active release loads
+   and its folder holds exactly genome/, organs/ and policies/ with exactly its manifest's regular files and
+   hashes; when armed, the kit code, the pinned platform files (`PLATFORM_PINS`) and DECISIONS.md still have the
+   hashes recorded at arm; the platform contract (section 17) holds and, when armed, the running server's autogen
+   defaults equal LIFE's; the last canary round passed; no fault hold. Any failure: a notice and a hold. When armed
+   and no `life-ctl.py gate-selftest` passed for this kit and these platform files (meta `gate_selftest`), only the
+   codebase gates and agent runs wait (notice `gate_unproven`).
+5. **metabolism** — sample `/api/cluster/status` and `/api/cluster/highpower/state`, the host's load, io and
+   memory pressure and MemAvailable, and LIFE's own per-node load ledger; update the governor and per-node rests
+   (section 10); compute the nodes available for new work.
+6. **canaries** — a round when one is due (hourly), at every tick while no round has ever passed, and at every
+   tick after a failed round, when `can_start(CANARY_ROUND_SECONDS)`: a maintenance admission (time left and no STOP;
+   never ARMED, never the absence of the canary hold it exists to clear). A passing round removes the canary hold
+   before step 10 decides.
+7. **runs** — poll every LIFE autogen run (`GET /api/symblicos/autogen/get?id=RUN_ID`): confirm each new run's
+   identity (section 7.9); re-send the identical start of a run the server does not know (only on a fully admitted
+   tick with no hold, rebuilt from its manifest); request a cancel of runs live 3000 s after submission; collect
+   ended runs, each in one transaction, then discard their hub checkouts. Poll benchmark jobs through the paged
+   `GET /api/cluster/jobs?kind=map&limit=200&offset=N` (until the listing's `total`, at most 5 pages; a listing not
+   read to its total is never proof of absence), by job id or by `meta.label` (two jobs with one label are an
+   ambiguity for the operator); score ended ones; release node holds of jobs that ended.
+8. **reconcile** — a division open longer than `DIVISION_MAX_SECONDS` aborts (even while held); the organism's
+   `schema_migrations` and the registry's `migrations` are compared (section 7.8).
+9. **upkeep** — the storage walk (ticks 1, 13, 25, ...; free space on both filesystems every tick); unless storage
+   holds, the inbox (at most 50 files, oldest name first, section 6); the daily retention and backup at the first
+   tick of each UTC day (the backup skipped under a storage hold or without room); command reports (skipped under
+   a storage hold).
+10. **gate** — STOP appeared meanwhile: `stop_everything` and exit 3. Not admitted (not ARMED for this boot, a
+    changed kit, platform-file or DECISIONS hash, FROZEN), no release, or any hold: every cell's `backlog_ticks`
+    resets to 0, hold notices, status, exit (0, or 5 for an integrity or contract hold). **Observe-only ends here**:
+    it never runs agenda entries, watched tests, fetches, gates, applies, models, agents or benchmarks.
+    A tick that passes this gate is a WORKING tick: `meta.working_tick_no` + 1.
+11. **agenda** — the operator's recurring commands (section 6).
+12. **findings** — one due watched test, sandboxed, in a codebase clone (section 7.4).
+13. **dispatch** — free items stranded on retired or quarantined cells; give each unassigned queued item
+    to the best-matching active cell of its organ (section 9).
+14. **the host stages** — fetch up to 4 source texts; at most one operator-finding confirmation, one codebase
+    gate, one selfdev gate and one database apply; then start agent runs (section 7.9). Every one first
+    re-reads STOP, ARMED, the hashes and FREEZE, and every process it creates is admitted again by
+    `launch_allowed` (heavy the host work: also the host's load, pressure, memory and disk) immediately before it is
+    created. Reads that start no work (the task-engine catalogue, the model inventory, canary lines) are bounded by
+    their own timeouts and are not admission points.
+15. **lifecycle** — workable-backlog and idle counters; quarantine and its automatic release; apoptosis; the
+    open division's code steps (its tick count, a changed release, the workspaces stage, the commit); one missing
+    workspace re-created (and any workspace failing `git_admin_problems` deleted); one retired codebase clone removed
+    with its `.agents` sibling; cells on long-offline nodes moved; the store adapter; questions whose reserved
+    sources settled; derived questions; a division start (section 9).
+16. **dispatch** again.
+17. **node slots** — the installed-model inventory is re-read once a day (`bin/local-research --list`, no
+    model; sooner after a node missing from it needed a model); before EVERY slot action, when the last governor
+    sample is older than 120 s, every governor input is read again; each available LIFE worker node plans ONE action, its
+    budget, its running state and one `call_intents` row per model process are committed in one transaction, and
+    all program runs start in parallel threads (one per worker node, each process in its own `life-slot-*.scope`; the threads
+    touch no registry connection); when a node's action ends, its result is recorded in the main thread and the node
+    plans its next action, at most `SLOT_ACTIONS_MAX` 4 actions per node per tick, each admitted again (section 8).
+    The ONE cross-cell order on a node: the open division of a cell there, when its last step was at least 2 working
+    ticks ago; else the node's cells, a command cell first only when its oldest queued item has waited longer than
+    300 s, then the least recently served (`last_served_at`, updated only when an action is admitted), then the
+    lowest cell id; inside a cell, priority, then the oldest `updated_at`, then the lowest item id (a benchmark start
+    and a program run are both items in that order).
+    **Order of steps 12-17 on odd working ticks**: 13, 15, 16, 17, then 12 and 14. A research run needs 2100 s and
+    must start by tick second 510; when the host stages ran first every tick, a backlog of fetches, gates and watched
+    tests could starve it forever; alternating gives each side the tick's start every other working tick.
+18. **status** — `STATE/operator/status.json`, written on every exit after step 2 (also faults), with its
+    `disposition`: `worked`, `observe:<first hold>`, `integrity`, `stop`, `fault` or `killed`.
+
+Exit codes: 0 done (also observe-only, held, or the lock was busy), 1 a tick fault (logged, a `tick_fault`
+notice with the count; three in a row set the fault hold until `life-ctl.py clear-fault`), 3 STOP handled, 4 ended
+by SIGTERM (systemd stop or `TimeoutStartSec`; not a fault, no notice), 5 integrity or contract hold or a wrong
+schema, 6 not seeded. One item's fault never stops a tick or poisons later
+ones: `Tick.guard` logs it, returns the item to its queue and fails it after 3 such faults at one stage
+(`items.faults`, reset when the item changes stage).
+
+## 5. Control: ARMED, FREEZE, STOP, reboot, operator commands
+
+| switch | meaning | set by |
+|--------|---------|--------|
+| ARMED | `control/ARMED` holds exactly `{"boot_id": <this boot's canonical id>, "kit_sha256": <hash of the kit's bin, checks, db, units and VALIDATE.sh: every entry, its type, mode bits and bytes>, "platform_sha256": <hash of PLATFORM_PINS>, "decisions_sha256": <sha256 of DECISIONS.md>}` as strict JSON (unique keys, 64 lowercase hex each); anything else is disarmed (malformed or unreadable is reported as such by life-status); a different boot means observe-only; a different hash is an integrity hold | `life-ctl.py arm --confirm ARM-UNTESTED --decisions HEX16` (needs a finished seed, VALIDATE.sh STATIC PASS, the installed units, the sandbox probe; published under the control lock only if no STOP happened since arm began) / `disarm`; `stop` removes it |
+| FREEZE | nothing new starts; running agent runs and benchmark jobs are polled and collected; fetches, confirmations, gates, applies, findings, program runs, agent starts, division steps and agenda entries are new work and wait | `freeze` / `thaw` |
+| SELFDEV_ARMED | selfdev agent runs may start (a grant: an EMPTY regular file the operator owns, not group- or other-writable, opened without following a link; anything else grants nothing) | `selfdev-arm` / `selfdev-disarm` |
+| STOP | end every LIFE process and scope, request the cancel of every LIFE run and benchmark job, disarm, start nothing. Fail closed: STOP also holds when `control/` cannot be inspected | `stop` / `unstop` (both under the control lock; stop also increments STOP_GENERATION) |
+| NO_SELF_QUESTIONS | learning makes no derived questions | the operator (empty file) |
+| CODEBASE_HISTORY_OK | codebase agent runs may start (GAP 11; a grant, like SELFDEV_ARMED) | the operator (empty file) |
+
+**Admission** is one answer, `control_state()['admit']`: STOP absent, ARMED for this boot with the kit,
+platform and decisions hashes unchanged, FREEZE absent. It is read before every stage and again by
+`launch_allowed` immediately before every new process (a slot action, a fetch, a gate, a watched test); an
+agent start reads it immediately before the submit.
+
+**Reboot**: ARMED names the old boot, so the first tick after a reboot only observes. Runs that were live
+are reconciled through the API before anything new starts (a run LIFE cannot confirm stays `submit_unknown`, with a
+notice after 900 s; it is re-sent identically only on a fully admitted working tick, never resubmitted under another
+id, and after 3 re-sends it waits for the operator's `abandon-run`). Nothing restarts itself; the operator re-arms.
+
+**STOP**, exactly:
+1. `life-ctl.py stop` writes `control/STOP` and removes `control/ARMED`. From that instant every admission
+   re-reads it, so nothing new starts; there remains only the instant between that check and a process start
+   (the watcher then ends it), and a `bin/symblic-task start` already running (up to START_TIMEOUT 180 s; it is
+   untracked so a half-submitted request is never torn).
+2. A running tick's watcher sees STOP within 1 s, sends SIGTERM to every LIFE process group (SIGKILL to the
+   whole group 30 s later) and stops every `life-*.scope`. A `bin/symblic run` process cancels its fleet-runner runs on
+   SIGTERM (`symblic_run` sets its stop event; `symblic_apply` calls `fleet_runner.cancel`);
+   `bin/life-research.py` cancels every fleet-runner run it started. A fleet-runner run that a SIGKILL orphans still ends at
+   its own unit `RuntimeMaxSec`; its node is held ORPHAN_HOLD_SECONDS meanwhile.
+3. `life-ctl.py stop` itself, without waiting for the lock, asks `bin/symblic-task autogen cancel RUN_ID`
+   (60 s each) for every run in `submitting`, `live` or `submit_unknown`, and `POST /api/cluster/job/cancel`
+   (30 s each) for every running benchmark job with an id, printing each answer.
+4. The registry rows are updated by `stop_everything` (in life-ctl when the lock is free, else by the tick at
+   its next STOP check, and again at every tick while STOP exists): every target's cancel is asked on its own and
+   the answers are collected before anything is written (a registry that cannot be written never skips a cancel);
+   an accepted cancel is only a REQUEST (`symblicos/autogen.py` sets `cancel_requested` and answers ok even for an
+   ended run; the job route sets a flag): the run or job stays `live`/`running`, its structured `runs.cancel_cause`
+   set to `stop` (only when no cause is recorded yet; the diagnostic detail is never overwritten), until a poll sees
+   it end; a benchmark with no job id yet is first looked up by its label; the scopes are stopped in a helper thread
+   while the process groups get their grace, and the notice says which scopes and groups were not yet confirmed
+   ended. A run collected after a STOP-cancel goes back to its queue with a new attempt number (not counted as a
+   failure or as infra); every open call intent holds its node; model-stage items return to the queue; a `stopped`
+   notice names every target whose cancel was not accepted. While STOP exists every tick repeats the cancels and
+   then reconciles (step 2), so a run created by a start that was still in flight is cancelled at the next tick.
+   In-process work (a migration or store transaction) checks STOP in its progress handler and again immediately
+   before COMMIT: a STOP that came first rolls it back.
+5. `unstop` removes STOP only. LIFE stays disarmed until the operator arms again; work that STOP cancelled returns to its
+   queue and starts again only after that arm (DECISIONS.md line 8). Arm and stop are serialized by the control lock:
+   an arm that was validating when a STOP happened refuses instead of publishing ARMED.
+
+If the registry cannot be read at all, `life-ctl.py stop` says so and the operator cancels by hand with
+`bin/symblic-task autogen list` (LIFE request ids start with `life-`) and the jobs whose `meta.label` starts with
+`life-`.
+
+**Operator commands** go only through `life-ctl.py` (section 15), the inbox or the agenda. Stop, freeze,
+cool and power are never routed through a model: the command classifier cannot express them.
+
+## 6. Work items
+
+An item is one unit of work: an `items` row with `item_id = <organ>:<first 16 hex of sha256(kind + "\n"
++ the identity parts joined by "\n")>` (`life_common.item_id(organ, kind, *parts)`; a part holding a
+newline is refused, so two identities never serialize alike). Deduplication stops duplicate CONCURRENT work,
+never later work: `new_item` returns the existing id while that item is queued or running; when it has ended
+and the caller names a re-occurrence key (the operator command that asks again, or a watched test's occurrence
+counter), a new item is created with identity + that key. An item recorded `abstained` with outcome `OVERFLOW:` (the
+organ's queue was full) is not an ending: the next request for the same identity re-queues that row when the queue
+has room, and `life-ctl.py requeue` accepts it.
+
+| kind | organ | identity parts | payload keys by stage (`life_common.PAYLOAD_KEYS`: required; optional in brackets) | taint |
+|------|-------|----------------|---------------------------------------------------------------|-------|
+| command | command | command_id | classify: `command_id` | operator |
+| question | learning | norm_text(question) [+ command_id when it asks again]; derived: fact_id, "derived" | research: `question` (<= 600), `command_id` ("" when derived), `found` (usable source links) | operator / web |
+| source | digest | source_key | fetch: `source_key, url`; extract: + `text_path, text_sha256`; distill: + `fact_id, claim, quote` | web |
+| finding | codebase | watch: test_id, base commit, fingerprint, occurrence; operator: test_id, "owner", command_id | confirm (operator only): `test_id, finding_text, base_commit "", source, command_text`; triage: `test_id, finding_text (<= 600), base_commit, source, wall_s, trace_files, trace_functions`; patch/gate: + `change_class` [`review_note, previous_patch`] | code / operator |
+| patch | immune | patch_id | review: `subject "patch", patch_id` | the finding's taint, at least model (agy wrote the diff) |
+| proposal | immune | proposal_id | review: `subject "proposal", proposal_id` | the lesson's taint, at least model |
+
+
+[This is part 2 of 26. Do not critique yet. Reply only with the word RECEIVED.]

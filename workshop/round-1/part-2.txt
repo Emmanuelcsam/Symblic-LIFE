@@ -1,0 +1,274 @@
+[LIFE critique packet, part 2 of 5]
+
+
+
+===== FILE: LIFE.md (sections 1-11; section 12 appendices are the files below in full) =====
+# LIFE v1 — the master Symblic script that brings the cluster to life
+
+Author's note. This is a complete, self-contained script. It is **written, not run**. It was
+workshopped against the platform's own code (every fact below was checked in the live checkout on
+2026-10-11 with no model, agent or cluster job). Where the platform cannot do something the brief
+asks, §11 (GAPS) says so plainly, with the smallest platform change that would close it and the
+interim rule this script follows meanwhile. Every statement line here passes
+`symblic_autogen.lint` with zero errors and zero warnings; every policy passes
+`symblic_autogen.normalize`; every `.sym` passes `bin/symblic check`; every shell check passes
+`bash -n`. Run `VALIDATE.sh` to confirm (§10). It calls no model, agent or cluster job.
+
+Design stance, from the operator's brief: a living, breathing cluster that continuously takes
+commands, optimises its codebase, fixes errors, learns from the internet, develops itself from
+what it learns, creates databases, finds new ways to compute and store data, and **reproduces and
+learns efficiently**. The Symblic program is the gcode; an agent is the 3D printer. Lightweight
+models do the work; CLI agents are used only where a full tool loop is unavoidable. Models
+propose; code decides. Nothing restarts itself.
+
+---
+
+## 1. The cell: one subtask, two agents
+
+A **cell** is one subtask. Like a living cell it has two functions that must stay separate:
+
+- **WORKER** — performs one extremely specific task and nothing else. It is a **lightweight local
+  model** wherever the task is a typed decision, an extraction, a classification or a bounded file
+  edit (reached through the formal language `genome/*.sym`, English statements, delegate
+  templates, spec sheets or `bin/local-research`). It is a **CLI agent** (agy first) only where
+  the task genuinely needs a full read-edit-run tool loop — for example applying and testing a
+  multi-file code patch. A cell is realised as one statement inside an organ's autogen lane; the
+  lane's attempt is a CLI agent that, for every typed decision in its batch, calls the matching
+  lightweight-model program rather than deciding itself.
+- **REPRODUCER** — never does the task. It reads the cell's own metrics (generation, failures in a
+  row, new items last generation, lineage depth) and decides whether and how the cell divides. It
+  runs `genome/reproduce.sym` on a lightweight model and returns `stay`, `divide` (with two
+  distinct child foci) or `apoptosis`. On `divide` it writes a **spawn record** — it does not
+  start anything.
+
+This mirrors cell biology: a differentiated cell keeps doing its one job, while division is a
+separate, tightly controlled act that keeps the whole organism going. Reproduction is **admitted
+only by code**: the orchestrator `bin/life-spawn-tick.py` on the host validates each spawn record
+(lint + normalize + budget + lineage depth + content-hash dedup) and only then starts the child
+run with `bin/symblic-task`. No model ever launches a run. See §4 and `spawn/PROTOCOL.md`.
+
+Why two agents and not one process doing both: a worker that could also spawn would reproduce its
+own mistakes without review. Splitting the functions means every division passes through the
+code gate, and a failing cell (failures_in_a_row > 0) is refused division by the reproducer's own
+`ensure` check **and** cannot pass the orchestrator budget. The content-hash dedup is the brake on
+runaway self-replication: a reproducer that re-proposes identical work is a silent no-op.
+
+## 2. The organism: ten organs
+
+The organism lives in one git-backed workspace, `/home/operator/symblicos/projects/life` (created by
+`bin/symblic-task workspace life`; `symblicos/workspaces.py` runs `git init` on `main`). Each organ
+is its **own** autogen run with its own `--id`, because autogen runs statements strictly in order
+and a perpetual lane never ends — so concurrent organs must be separate runs (RECURSION.md §3.1,
+verified in `symblicos/autogen.py:_current`). Each organ writes into its own `organ-<name>/`
+subfolder and keeps its own `AUTOGEN-INDEX.jsonl` dedup ledger.
+
+| # | Organ | Lane file | Engine | Node (class) | Default model for its typed decisions | Interval | Kind | Acceptance check |
+|---|-------|-----------|--------|--------------|----------------------------------------|----------|------|------------------|
+| 1 | command inbox | organs/command.lines.txt | agy | node-f (mid, keepAwake) | qwen3:4b-instruct@node-a (classify-command.sym) | 120 s | perpetual | `test -s verify.txt` |
+| 2 | codebase fixer | organs/codebase.lines.txt | agy | node-i (heavy) | qwen2.5-coder:3b (triage-error.sym) + agy tool loop | 1800 s | perpetual, sat 4 | `test -s verify.txt`, then devcheck-gate in checkout |
+| 3 | learning | organs/learning.lines.txt | agy | node-d (mid) | qwen3:4b-instruct via bin/local-research | 1800 s | perpetual, sat 3 | `test -s verify.txt` |
+| 4 | digest | organs/digest.lines.txt | agy | node-f (mid) | qwen3:4b-instruct@node-d (extract-source.sym) | 900 s | perpetual, sat 3 | `test -s verify.txt` |
+| 5 | self-development | organs/selfdev.lines.txt | agy | node-i (heavy) | qwen3:4b-instruct (proposes edits to genome/policies) | 3600 s | perpetual, sat 4 | `test -s verify.txt` |
+| 6 | compute/storage R&D | organs/compute.lines.txt | agy | node-i (heavy) | qwen3:4b-instruct@node-i (rank-experiment.sym) | 3600 s | perpetual, sat 4 | `test -s verify.txt` |
+| 7 | metabolism (energy) | organs/metabolism.lines.txt | agy | the host (i/o only) | none — reads cluster APIs, no model | 300 s | perpetual | `test -s verify.txt` |
+| 8 | immune | organs/immune.lines.txt | agy | node-i (heavy) | qwen2.5-coder:3b@node-f (review-patch.sym) | 1800 s | perpetual, sat 6 | `test -s verify.txt` |
+| 9 | heartbeat | organs/heartbeat.lines.txt | agy | the host (i/o only) | none — reads ledgers, no model | 300 s | perpetual | `test -s verify.txt` |
+| 10 | database | organs/database.lines.txt | agy | node-a (light) | none — writes SQL, runs sqlite3 | — | bounded build | `test -s verify.txt` + final check_schema.sh |
+
+Node classes (verified against `cluster_data/nodes.json` and the live capacity probe, 2026-10-11):
+**light** = node-a, node-b (8 cpu, ~15.6 GB free, Ollama cap 12 GiB, models up to qwen3:4b-instruct);
+**mid** = node-d, node-f (node-f keepAwake, has granite3.3:2b, phi4-mini, ministral); **heavy** =
+node-i (16 cpu, ~31 GB, Ollama cap 26 GiB, high-power mode top rank, underused) and node-h (28 GB but
+Ollama cap **3 GiB** → only models ≤2.5 GB, and it is overcommitted, so LIFE avoids it for model
+work); **never for models** = the host (host; i/o-only lanes allowed because agy CLI is not a local
+model) and node-arm/the ARM node (failover standby; the fleet runner runs nothing there).
+
+Every perpetual organ drops `other_node` from its strategies (`fresh,feedback,other_engine`),
+because `other_node` round-robins over every online node including the host and the ARM node
+(`symblicos/autogen.py` `next_strategy`), which must never host a model lane. A node going to sleep
+between generations therefore shows as INFRASTRUCTURE and the lane waits rather than migrating to
+The host; LIFE places perpetual lanes on nodes that stay awake (node-f keepAwake; node-i/node-d/node-h
+are protected infrastructure) to keep this rare.
+
+## 3. Lightweight-first: the model ladder
+
+Cells try the cheapest capable model first and only climb when a check fails. All of these are on
+the installed list (`bin/local-research --list`, 2026-10-11). Cloud CLIs are last resort.
+
+| Rung | Model | Installed on | Used by | Lane |
+|------|-------|--------------|---------|------|
+| 0 | qwen2.5:0.5b | node-a/b/d/f/i | tiniest yes/no and 2-way choice | formal `.sym` ask, effort=low |
+| 1 | llama3.2:1b | all worker nodes | urgency/confidence/risk labels | `.sym` ask, effort=low |
+| 1 | gemma3:1b | node-a/b/d/f/i | short enum choice | `.sym` ask |
+| 2 | deepseek-r1:1.5b | node-a/b/f | small reasoned choice | `.sym` ask, effort=medium |
+| 2 | granite3.3:2b | node-d/f/i | novelty label, 2-class | `.sym` ask |
+| 3 | qwen2.5-coder:3b | node-a/b/d/f/i | error triage, patch review | triage-error.sym, review-patch.sym |
+| 4 | qwen3:4b-instruct | all worker nodes incl node-h | **default** typed decision, fact extraction, routing, ranking, local-research | classify/extract/rank/reproduce.sym, bin/local-research |
+| 4 | gemma3:4b | node-d/f/i | alt 4B for family diversity in votes | `.sym` ask, effort=ultra |
+| 4 | phi4-mini | node-d/f/i | alt 4B reasoning | `.sym` ask |
+| big | qwen2.5:14b, qwen3.8:27b, laguna-xs-2.1 | node-i only | reserved; not used by default cells (heat) | manual `--by ollama:...@node-i` |
+
+Lanes a lightweight model reaches (all call no cloud, run on a worker node through the fleet runner's one-model-per-node cap):
+- **formal `.sym` asks** with `ensure` checks — the six `genome/*.sym` programs. The kernel checks
+  the answer (type, range, verbatim quote, enum, record fields). This is the main lane.
+- **English statements** (`bin/symblic english`) — for the simplest closed questions a 0.5–1B model
+  can answer; compiles to the verified profile, `context=none`.
+- **delegate templates** (`bin/symblic delegate`) — `enum_classification` for routing/triage,
+  `witnessed_line` for quote extraction, `typed_transform` for structured edits; local ladder
+  1B→Granite 2B→Qwen 4B when no `--by` is given.
+- **spec sheets** (`bin/symblic spec`) — when a cell must produce checked JS/HTML, each unit is a
+  `Code js` ask tested in a sandbox before acceptance; suits 0.5B–1B workers (`signatures` view).
+- **`bin/local-research`** — the learning organ's web lane: a local model drives SEARCH/READ/ANSWER
+  over SearXNG at 127.0.0.1:18888; the model never touches the network directly; calls go through
+  `fleet_runner.launch` (the only safe path — a direct the host Ollama call caused the 2026-09-30
+  oomd kill).
+- **the `local` task engine** (cli-agent over Ollama, 8192 ctx) — only in lines/agent tasks, never in
+  autogen; LIFE uses it only for short discrete helper turns, because it refuses long inputs.
+
+**When a CLI agent is allowed.** Only inside the codebase, selfdev and database organs, and only
+for the apply-and-test tool loop. Order: **agy** first (cheapest, local-friendly), then **codex**,
+then **claude**, then **copilot** (the host only) or **mistral** (node-a/b only). The `other_engine`
+strategy rotates within `ENGINES ∩ ADMITTED_ENGINES`, so a stuck lane escalates engines
+automatically without a model ladder (which `normalize` refuses).
+
+## 4. Reproduction (admitted by code)
+
+Full detail in `spawn/PROTOCOL.md`; the orchestrator is `bin/life-spawn-tick.py`. Summary:
+
+1. A reproducer cell runs `genome/reproduce.sym`. On `divide` it writes `spawn/queue/<name>/` with
+   `statements.txt`, `policy.json`, `lineage.json`, `reason.txt`.
+2. `bin/life-spawn-tick.py` (operator's timer, the host, no model) checks, in order: **kill switch**
+   (STOP absent), **heat gate** (`checks/heat-gate.sh`), **budget** (< `LIFE_MAX_RUNS`=16 live
+   `life-*` runs), **lint** (0 errors, 0 warnings), **normalize**, **lineage depth** (< 10, ≤ 64,
+   `cell_id` = `organ.generation.8hex`), **content-hash dedup** (`spawn/hashes.txt`).
+3. On all-pass it starts the child with `bin/symblic-task start … --id life-<organ>-<8hex>` plus the
+   flags `policy_flags()` derives from `policy.json`, records the hash, and files the record under
+   `spawn/approved/`. Any failure files it under `spawn/rejected/` with a reason.
+
+`apoptosis` writes no record; it appends the cell_id to `spawn/retired.txt` and the operator/immune
+organ cancels the run. A retired cell's content hash stays known, so it is never re-spawned.
+
+## 5. Databases
+
+`db/schema.sql` defines five tables in one SQLite file
+`/home/operator/symblicos/projects/life/db/life.sqlite3`, all `CREATE TABLE IF NOT EXISTS` so a
+re-apply never drops rows: **knowledge** (one checked fact per row: id, claim, quote, source_id,
+source_url, organ, created_at, verified), **lineage** (the cell family tree: cell_id, organ,
+parent_id, depth, focus, spawn_reason, content_hash, run_id, created_at, retired_at; unique index
+on content_hash), **metrics** (one row per organ generation: organ, run_id, generation, new_items,
+failures, node, at), **commands** (operator commands with their route), **experiments** (compute R&D
+proposals and measured results). Migrations are statements in the database organ's lane
+(`organ-database/migrations/0001_init.sql`), each idempotent, each verified by `check_schema.sh`.
+The exact columns and types are in Appendix E.
+
+## 6. Metabolism (energy) and heat
+
+The metabolism organ (the host, i/o only, every 300 s) reads `/api/cluster/status`, `/capacity` and
+`/highpower/state` from the loopback dashboard and writes a `metabolism.jsonl` row deciding whether
+fan-out is allowed. Rules, from the operator heat rule and `docs/fleet-power.md`:
+- **Continuous all-worker node load stays under ~1 hour**, then rest. Each organ's `wall_seconds` and
+  `interval_seconds` build the rest in; the orchestrator's `heat-gate.sh` refuses new spawns when
+  The host 1-min load ≥ 4.0 or io full avg10 ≥ 40.0.
+- **high-power mode only when a batch justifies it**: a 5–120 min lease, never chained (a new lease is
+  refused for as long as the last ran). LIFE never enables high-power mode automatically in v1 — the
+  compute organ may *request* it by writing a row the operator approves (§11 gap). The host never runs
+  a model.
+- the fleet runner enforces one model per node at a time; LIFE respects that by one perpetual model lane per
+  worker node plus the shared formal-language calls.
+
+## 7. Immune system
+
+The immune organ (node-i, every 1800 s) runs three jobs each generation: **canary checks** (a list
+in `organ-immune/canaries.txt` of cheap commands that must keep passing — e.g. `bin/symblic check`
+on each genome file), **adversarial patch review** (`genome/review-patch.sym`: a second model must
+`accept` a codebase patch, and only when its automated checks already passed — a model accept alone
+never promotes), and **quarantine** (a lineage whose cells fail `novelty_limit` generations in a row
+is written to `organ-immune/verdicts.jsonl` and its run cancelled by the operator). **Rollback** uses
+git: every promotion is a Work→Apply 3-way merge into the live checkout with nothing committed, so a
+bad apply is reverted with `git checkout -- <file>` in the live tree (the operator's existing recovery
+path). LIFE never force-pushes and never restarts the dashboard.
+
+## 8. Observability (heartbeat)
+
+The heartbeat organ (the host, every 300 s) writes `organ-heartbeat/status.json` summarising each
+organ's last generation, new items and failures, and `bin/life-status.py` prints the same from the
+run records on demand. What the operator looks at: `bin/life-status.py`, `bin/symblic-task autogen
+list`, `bin/symblic-task autogen get life-<organ> --tasks`, and the per-organ `verify.txt`.
+
+## 9. Starting it, and the reproduction timer
+
+Seeding: `bin/life-seed.sh` (Appendix F) — creates the workspace, folders and schema copy, and
+starts the ten organ runs. Reproduction stays **off** until the operator installs a systemd *user*
+timer for the orchestrator. Suggested unit text (the operator installs this; it is not installed here):
+
+```ini
+# ~/.config/systemd/user/life-spawn.service
+[Unit]
+Description=LIFE spawn orchestrator tick (validates and births queued cells)
+[Service]
+Type=oneshot
+Environment=DASH_URL=http://127.0.0.1:8080
+ExecStart=/usr/bin/python3 /home/operator/host-checkout/docs/life/bin/life-spawn-tick.py
+Nice=10
+```
+```ini
+# ~/.config/systemd/user/life-spawn.timer
+[Unit]
+Description=Run the LIFE spawn tick every 5 minutes
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=5min
+[Install]
+WantedBy=timers.target
+```
+Enable with `systemctl --user enable --now life-spawn.timer`. The tick is niced, calls no model,
+and births nothing while `STOP` exists or the heat gate holds.
+
+## 10. Validation (no model, no agent, no network)
+
+`VALIDATE.sh` runs exactly: `symblic_autogen.lint` on every organ lines file (must be 0 errors and
+0 warnings), `symblic_autogen.normalize` on every policy, `bin/symblic check` on every genome
+program, `bash -n` on every shell script, `python3 -m py_compile` on every python script, and an
+in-memory idempotent apply of `db/schema.sql`. It prints PASS/FAIL per file and exits non-zero on
+any failure. It starts no task and calls no model.
+
+## 11. GAPS — what the platform cannot do, and the interim rule
+
+1. **No autogen engine can launch a new autogen run from inside a run.** There is no
+   recursion-to-new-run primitive in the statement layer; a worker calling the loopback API to
+   spawn is out of policy. *Interim rule:* reproduction is a **separate code path** — the operator's
+   timer runs `bin/life-spawn-tick.py`, which is the only launcher. *Smallest platform change:* an
+   autogen `spawn` policy field / coordinator hook that, on a validated on-disk spawn record,
+   submits a sibling run under the same global budget. Then reproduction would need no external
+   timer.
+2. **Autogen attempts are CLI agents only** (`ADMITTED_ENGINES` = agy, claude, codex, mistral,
+   copilot). Lightweight local models cannot *be* autogen workers. *Interim rule:* the lane's CLI
+   agent calls `bin/symblic run genome/*.sym --by ollama:MODEL@node-X` (and local-research/delegate)
+   for every typed decision, so the heavy thinking is still a 0.5–4B model; the CLI agent is only
+   the hands. *Smallest change:* admit `ollama`/`local` as an autogen engine for pure typed-decision
+   statements (schema-checked), so a cell could be a bare local model with no CLI wrapper.
+3. **Remote handoff is refused** ("remote handoff unsupported"; no `workspaceFrom`). The
+   `generations` context-handoff mechanism works only for the host-local attempts. *Interim rule:*
+   worker node lanes rely on **self-split** (`AUTOGEN-SPLIT.txt`) and decompose instead of handoff; the
+   database organ (bounded, `--handoff 2`) runs on node-a where a handoff that does need carrying
+   can be reconsidered, but its policy leans on self-split. *Smallest change:* a `workspaceFrom`
+   in task submit so a successor attempt can inherit a predecessor's checkout on a worker node.
+4. **The formal language's `delegate` targets the /agents hub, not Ollama directly** (`local` needs
+   `model=`, `cwd` defaults to `~`). LIFE does not use `delegate` for cell work; it uses `.sym`
+   asks `--by ollama:...`. *Interim rule:* no `delegate` inside LIFE v1. *Smallest change:* none
+   needed; noted so an author does not reach for `delegate` expecting a light-model call.
+5. **No fleet-wide heat governor inside autogen.** Only `interval_seconds` and `attempt_seconds`
+   space and bound work. *Interim rule:* the metabolism organ + `heat-gate.sh` + conservative
+   intervals + `wall_seconds` caps implement rest; the operator is asked before long worker node load.
+   *Smallest change:* an autogen duty-cycle field that pauses all lanes when a cluster heat signal
+   trips.
+6. **high-power mode cannot be safely self-chained** (a new lease is refused for as long as the last
+   ran). *Interim rule:* LIFE never enables high-power mode on its own; the compute organ writes a
+   request row for the operator. *Smallest change:* an admitted, rate-limited high-power mode request API a
+   metabolism cell could call with a justification and a bounded lease.
+7. **`other_node` can place a lane on the host or the ARM node.** There is no node allow-list policy
+   field. *Interim rule:* every model lane omits `other_node` and names a safe worker node. *Smallest
+   change:* an autogen `nodes_allow` field so a lane can rotate nodes without risking the host/ARM node.
+===== END LIFE.md (sections 1-11; section 12 appendices are the files below in full) =====
+
+[This is part 2 of 5 of the LIFE critique packet. Do not critique yet. Reply only with the word RECEIVED.]

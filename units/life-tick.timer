@@ -1,0 +1,13 @@
+# Runs the LIFE tick 10 minutes after boot, then 300 s after each tick ENDS (a long tick delays the next one;
+# missed ticks never pile up). A reboot always comes back disarmed: ARMED holds the previous boot's id.
+[Unit]
+Description=LIFE coordinator tick every 300 s after the previous one ends
+
+[Timer]
+OnBootSec=10min
+OnUnitInactiveSec=300
+AccuracySec=30s
+Persistent=false
+
+[Install]
+WantedBy=timers.target

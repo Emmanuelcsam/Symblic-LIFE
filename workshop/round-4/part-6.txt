@@ -1,0 +1,269 @@
+[LIFE round-4 critique packet, part 6 of 21]
+
+| DIVISION_MAX_TICKS | 12 | armed working ticks; an open division counted past this aborts (lifecycle) |
+| DIVISION_MAX_SECONDS | 86400 | s; wall-clock backstop: an open division older than this aborts, checked even while held |
+| DIVISION_STEP_EVERY | 2 | ticks; a division takes its parent node's slot at most every this many armed ticks |
+| FOCI_RETRIES | 1 | retries; a failed reproduce.sym answer retries this often at the next rung before the division aborts |
+| APOPTOSIS_IDLE_SECONDS | 86400 | s; an empty, idle cell with an active sibling retires after this long |
+| QUARANTINE_FAILURES | 8 | items; consecutive terminal failed items before a cell is quarantined |
+| EFFICIENCY_FLOOR | 0.2 | ratio; (done + abstained) / (program runs + 3 x agent runs) an organ needs to divide |
+| EFFICIENCY_MIN_RUNS | 20 | cost units; below this over the two prior UTC days, efficiency is not judged |
+| LAST_CELL_AUTO_RELEASE | 86400 | s; an organ's only live cell, quarantined this long, is released automatically |
+| AUTO_RELEASE_WINDOW | 604800 | s; at most one automatic release per cell in any rolling window of this length |
+| NODE_OFFLINE_MOVE | 21600 | s; a cell whose node was reported offline in every sample this long moves to another node |
+| OFFLINE_MIN_SAMPLES | 6 | samples; explicit offline samples needed inside NODE_OFFLINE_MOVE before a move |
+| WORKSPACE_FAILURES_MAX | 3 | failures; workspace re-creations before the cell retires (or, as its organ's last cell, is quarantined) |
+| ABSTAIN_WINDOW, ABSTAIN_RATE | 20 / 0.9 | items / ratio; notice abstain_rate when >= 90 % of a cell's last 20 endings abstained |
+| QUEUE_CAP_PER_ORGAN | 200 | items; at 200 or more queued items in an organ, a new non-owner item ends abstained (OVERFLOW) |
+| RUNG_DOWN_HOLD | 604800 | s; after a rung_up of a program in a cell, no rung_down of it for this long |
+| AGENT_RUNS_LIVE_MAX | 2 | runs; LIFE autogen runs submitting/live/submit_unknown at once, fleet-wide (1 per cell) |
+| AGENT_RUN_KILL_SECONDS | 4500 | s; the tick asks to cancel a LIFE run still live this long after submission (a failure) |
+| RUN_UNKNOWN_NOTICE | 900 | s; a run LIFE cannot confirm this long opens notice run_unknown |
+| START_TIMEOUT | 180 | s; bin/symblic-task start (untracked: STOP's watcher never ends it) |
+| CANCEL_TIMEOUT | 60 | s; bin/symblic-task autogen cancel |
+| CATALOG_TIMEOUT | 60 | s; bin/symblic-task catalog --json and bin/local-research --list |
+| NEEDS_WORK_MAX | 2 | rounds; reviewer needs_work rounds per finding before it goes to the operator |
+| FINDING_CUTS | (700, 500, 300, 150) | characters; finding_text lengths tried in turn until both statements fit STATEMENT_MAX |
+| PROGRAM_RUNS_PER_DAY | 1200 | runs; genome program runs, research runs and division steps |
+| MODEL_CALLS_PER_DAY | 14400 | model calls; reserved: 12 per program run, RESEARCH_GENERATIONS per research run |
+| AGENT_RUNS_PER_DAY | 12 | runs; agy autogen runs (each up to 4 agents) |
+| BENCH_JOBS_PER_DAY | 12 | jobs; benchmark cluster jobs |
+| BIRTHS_PER_DAY | 8 | cells; children born (2 per division) |
+| SELF_QUESTIONS_PER_DAY | 2 | questions; derived questions learning asks itself |
+| QUESTION_DRY_LIMIT | 3 | runs; research runs in a row that add no new question-source link before a question is exhausted |
+| QUESTION_SOURCE_LIMIT | 9 | links; usable question-source links per question before it is done |
+| NEW_SOURCES_PER_RUN | 3 | links; at most min(3, 9 - found) links are recorded from one research run |
+| SELF_QUESTION_QUEUE_MAX | 3 | questions; derived questions are made only while learning has fewer queued questions |
+| SELF_QUESTION_CANDIDATES | 50 | rows; the newest knowledge rows scanned for one derived question |
+| QUESTION_CHARS | 600 | characters; a research question (longer operator text: notice command_too_long) |
+| SOURCE_TEXT_CHARS | 6000 | characters; text kept per source snapshot |
+| SOURCE_TEXT_MIN | 200 | characters; shorter fetched text is EMPTY (abstained) |
+| SOURCE_KEY_MAX | 200 | characters; a source key (longer items_key results become sha256: keys) |
+| URL_MAX | 2000 | characters; a research URL LIFE records |
+| ANSWER_CHARS | 4000 | characters; a research answer kept in table answers |
+| FETCHES_PER_TICK | 4 | fetches; source fetches per tick |
+| FETCH_TIMEOUT | 240 | s; one bin/life-fetch.py process (safe_fetch: robots + 5 hops x (10 + 25) s + parsing) |
+| FETCH_MEMORY | 1G | bytes (systemd); MemoryMax of the scope each fetch runs in (also prlimit --as) |
+| FETCH_AS_BYTES | 1073741824 | bytes; prlimit --as of the fetch process |
+| WATCH_MAX | 20 | tests; watch.txt lines read |
+| WATCH_TIMEOUT | 120 | s; one watched-test run (= symblicos/autogen.py CHECK_TIMEOUT) |
+| WATCH_SLOW | 90 | s; wall time of a sandboxed run (scope and sandbox start-up included) above which a test is never patched |
+| WATCH_BACKOFF | (21600, 43200, 86400, 172800) | s; 6 h, 12 h, 24 h, then 48 h between runs of a failing test |
+| TAIL_LINES | 40 | lines; output tail kept from a failing test |
+| FINDING_CHARS | 600 | characters; a finding_text |
+| TEST_ID_MAX | 160 | characters; a test id (at most 5 components after tests, each 1..64) |
+| GATE_TIMEOUT | 900 | s; checks/devcheck-gate.sh as a whole |
+| GATE_DEVCHECK_TIMEOUT | 600 | s; the gate's sandboxed ./bin/devcheck --changed BASE (checks/devcheck-gate.sh; VALIDATE compares) |
+| GATE_TEST_TIMEOUT | 240 | s; the gate's sandboxed focused unittest (checks/devcheck-gate.sh; VALIDATE compares) |
+| SANDBOX_CHECK_TIMEOUT | 110 | s; life-check.py sandboxed default (inside autogen's 120 s check timeout) |
+| SANDBOX_TIMEOUT_MAX | 900 | s; the largest --timeout life-check.py sandboxed accepts |
+| DIFF_MAX_BYTES | 262144 | bytes; larger diffs are refused at the gate |
+| DIFF_REVIEW_BYTES | 6000 | bytes; a diff larger than this is not model-reviewed: it goes to the operator |
+| LOCAL_FIX_FILES_MAX | 3 | files; a local_fix may change at most these traceback files |
+| LOCAL_FIX_FUNCTIONS_MAX | 3 | functions; a local_fix may change at most these function bodies, each named in the traceback |
+| GIT_TIMEOUT | 120 | s; one local git command |
+| GIT_FETCH_TIMEOUT | 300 | s; git fetch of a codebase clone |
+| CLONE_TIMEOUT | 600 | s; one whole workspace creation (its git steps share this one deadline) |
+| GENOME_MAX_BYTES | 65536 | bytes; a genome program file read by the gates and life-check |
+| VERIFY_MAX_BYTES | 400 | bytes; verify.txt read by life-check |
+| WATCH_STAGE_SECONDS | 600 | s; one watched test: refresh the clone, run the test, reset |
+| CONFIRM_STAGE_SECONDS | 600 | s; one operator-finding confirmation |
+| GATE_STAGE_SECONDS | 1200 | s; one codebase gate: stage, diff, the gate script, re-stage, bundle, reset |
+| SELFDEV_GATE_STAGE_SECONDS | 300 | s; one selfdev gate |
+| START_STAGE_SECONDS | 600 | s; one agent start: reset, sync, render, submit |
+| BENCH_PAIRS | 3 | pairs; baseline/candidate pairs per experiment, in ABBA order |
+| BENCH_WARMUP_RUNS | 1 | runs; one discarded baseline run before the pairs |
+| BENCH_ORDER | ('baseline', 'candidate', 'candidate', 'baseline', 'baseline', 'candidate') | runs; the scored order after the warm-up (pair k = the k-th baseline and the k-th candidate) |
+| BENCH_RUNS | 7 | runs; per job |
+| BENCH_TIMEOUT_MIN, BENCH_TIMEOUT_MAX | 30 / 300 | s; per run, operator template field |
+| BENCH_RUN_SLACK | 10 | s; timeout --kill-after per run |
+| BENCH_JOB_EXTRA | 60 | s; job timeout = BENCH_RUNS x (T + BENCH_RUN_SLACK) + this |
+| BENCH_GRACE | 300 | s; a job past its timeout + this, still not terminal, goes to the operator (node held) |
+| BENCH_OUT_BYTES | 4096 | bytes; output kept per run (head -c): 7 runs x (4096 + markers) stay under cluster_engine.OUT_HEAD 40000 |
+| JOB_CANCEL_TIMEOUT | 30 | s; POST /api/cluster/job/cancel |
+| JOBS_PAGE, JOBS_PAGES_MAX | 200 / 5 | jobs / pages; the jobs listing is read in pages of 200, at most 5 per tick |
+| JOB_UNKNOWN_HOLD | 31536000 | s; a node whose LIFE job is unknown or lost is held this long, until the listing shows it ended or the operator releases it |
+| BENCH_AS_BYTES | 4294967296 | bytes; prlimit --as for every benchmark run |
+| BENCH_FSIZE_BYTES | 2147483648 | bytes; prlimit --fsize for every benchmark run |
+| BENCH_NOFILE | 256 | files; prlimit --nofile for every benchmark run |
+| PARAM_RX | [A-Za-z0-9._:+][A-Za-z0-9._:+-]{0,63} | every benchmark parameter and baseline (fullmatch; never a leading -) |
+| PARAM_RX_MAX | 200 | characters; an operator param_rx (no quantified group: LIFE refuses nested repetition) |
+| BENCH_FILE_MAX_BYTES | 65536 | bytes; control/benchmarks.json |
+| BENCH_MAX | 20 | entries; benchmarks in control/benchmarks.json |
+| CATALOGUE_CHARS | 3000 | characters; the catalogue text shown to propose-experiment.sym |
+| MIGRATION_MAX_BYTES | 16384 | bytes; one migration file |
+| MIGRATION_STATEMENTS_MAX | 24 | statements; per migration |
+| SNAPSHOT_MAX_BYTES | 262144 | bytes; schema-snapshot.sql |
+| MIGRATION_NUMBER_MAX | 9999 | number; after it the database organ holds (notice migration_numbers) |
+| MIGRATION_SECONDS | 120 | s; SQLite progress deadline of a migration's validation, and of its apply transaction |
+| ORGANISM_MAX_BYTES | 1073741824 | bytes; organism.sqlite3 larger than this holds the database organ (notice storage) |
+| ORGANISM_VALIDATE_MAX_BYTES | 67108864 | bytes; up to this size a migration is validated on an in-memory copy WITH its rows |
+| STORE_ROWS_PER_TICK | 500 | rows; knowledge rows the store adapter copies into organism tables per tick |
+| APPLY_STAGE_SECONDS | 360 | s; one migration apply (validation and transaction, MIGRATION_SECONDS each, plus git) |
+| REQUEST_MIN_CHARS, REQUEST_MAX_CHARS | 10 / 600 | characters; a data request |
+| LESSON_MIN_CHARS, LESSON_MAX_CHARS | 10 / 300 | characters; a lesson |
+| CANARY_EVERY_SECONDS | 3600 | s; canary round period (a never-passed or failed round runs at every tick) |
+| CANARY_TIMEOUT | 60 | s; one canary line |
+| CANARY_ROUND_SECONDS | 600 | s; the whole round |
+| STATE_MAX_BYTES | 10737418240 | bytes (allocated); STATE plus every LIFE workspace under PROJECTS |
+| STORAGE_EVERY_TICKS | 12 | ticks; the storage walk runs on ticks 1, 13, 25, ... (the free-space check every tick) |
+| DISK_FREE_MIN | 5368709120 | bytes; free space on the STATE and PROJECTS filesystems below which new work holds |
+| BACKUP_MARGIN_BYTES | 67108864 | bytes; a backup starts only with its source size + this free |
+| LOG_ROTATE_BYTES | 5242880 | bytes; tick.log rotates past this (three archives tick.log.1..3) |
+| BACKUP_KEEP | 7 | files; daily backup files kept per database |
+| PREMIGRATION_KEEP | 10 | files; organism-before-<id> copies kept |
+| CALLS_KEEP_DAYS | 14 | days; STATE/calls/<id>/ folders whose call ended this long ago are deleted at the daily backup |
+| CALL_ROWS_KEEP_DAYS | 90 | days; calls rows that ended this long ago are deleted at the daily backup |
+| RUNS_DIR_KEEP_DAYS | 14 | days; STATE/runs/<request_id>/ of collected runs that ended this long ago are deleted |
+| INBOX_DONE_KEEP_DAYS | 30 | days; inbox-done files older than this are deleted |
+| NOTICES_KEEP_DAYS | 90 | days; acknowledged notices older than this are deleted |
+| SAMPLES_KEEP_DAYS | 7 | days; samples older than this are deleted |
+| TMP_KEEP_SECONDS | 86400 | s; abandoned .life-tmp-*, release .tmp-* and inbox-tmp files older than this are removed |
+| HOLD_NOTICE_TICKS | 12 | ticks; the same hold this many ticks in a row opens notice held |
+| TEMP_MISSING_SAMPLES | 12 | samples; a node without a temperature this many samples in a row opens notice telemetry |
+| NO_CAPACITY_TICKS | 12 | ticks; armed working ticks in a row with queued slot items and no node passing node_ok open notice no_capacity |
+| FAULTS_IN_A_ROW_MAX | 3 | ticks; tick faults in a row before the fault hold (life-ctl clear-fault) |
+| REPORT_COMMANDS_PER_TICK | 20 | commands; dispatched commands examined for a report per tick (least recently examined first) |
+| REPORT_ITEMS_MAX | 500 | items; listed in one report (the report says when it is cut) |
+| REPORT_TRAVERSE_MAX | 5000 | items; a command's descendants are followed this far; past it the report waits (notice report_truncated) |
+| APPROVAL_STALE_DAYS | 7 | days; a lesson or request waiting for approval this long counts as ended for its command's report |
+| OUTPUT_KEEP_BYTES | 1048576 | bytes; stdout kept per process |
+| ERR_KEEP_BYTES | 65536 | bytes; stderr kept per process |
+| OUTPUT_KILL_BYTES | 16777216 | bytes; a process writing more than this (stdout + stderr) is ended and returns OUTPUT_LIMIT_RC |
+| OUTPUT_LIMIT_RC | 1000 | rc; the return code Procs.run gives an output-limit kill (never a real exit code) |
+| HTTP_MAX_BYTES | 8388608 | bytes; a loopback HTTP answer |
+| JSON_MAX_DEPTH | 32 | levels; a loopback JSON answer nested deeper is refused |
+| LOADED_CPU | 50.0 | % busy; vitals.cpu at or above: the node is loaded in this sample |
+| LOADED_OWN_FRACTION | 0.5 | ratio; or LIFE kept the node busy this fraction of the interval |
+| FLEET_LOADED_FRACTION | 0.5 | ratio; at least max(1, ceil(this x online LIFE nodes)) loaded nodes: the fleet is loaded |
+| WORK_WINDOW | 3000 | s; loaded (or unobserved) seconds before the fleet must rest |
+| REST_SECONDS | 600 | s; consecutive observed quiet seconds that end a rest and reset the window |
+| NODE_WINDOW, NODE_BUSY_MAX, NODE_REST | 3600 / 3000 / 600 | s; per node: an action is admitted only if busy + its budget <= 3000 of the last 3600; busy >= 3000 rests it 600 idle s |
+| TELEMETRY_REFRESH | 120 | s; the slot phase re-reads every governor input when the sample is older than this |
+| HOT_C, COOL_C | 85.0 / 75.0 | deg C; same thresholds as symblic_apply.THERMAL_HOT/THERMAL_COOL (hysteresis) |
+| TEMP_MIN_C, TEMP_MAX_C | -50.0 / 150.0 | deg C; a temperature outside is unavailable (treated as hot) |
+| MEM_RESERVE_MIB | 2048 | MiB; a node needs memAvailMiB >= reserve + the model's size + KV_ALLOWANCE_MIB |
+| KV_ALLOWANCE_MIB | 1024 | MiB; context (KV cache) allowance per call on top of the model weights |
+| MODEL_MIB_UNKNOWN | 4096 | MiB; memory assumed for a model missing from MODEL_MIB |
+| HOST_LOAD_FRACTION | 0.75 | ratio; the host load1 must stay below this x os.cpu_count() |
+| HOST_IO_FULL_AVG60 | 10.0 | %; the host /proc/pressure/io full avg60 must stay below this |
+| HOST_MEM_FLOOR_MIB | 6144 | MiB; the host MemAvailable must be at least this (a 4 GiB scope + 2 GiB reserve) |
+| HOST_MEM_SOME_AVG60 | 10.0 | %; the host /proc/pressure/memory some avg60 must stay below this |
+| HOUR, DAY | 3600 / 86400 | s; units |
+| HTTP_TIMEOUT | 30 | s; one loopback GET or POST that should answer at once (one deadline for the whole exchange) |
+| HTTP_SLOW_TIMEOUT | 60 | s; /api/cluster/status (it may probe), autogen get, the jobs listing, map submit |
+| SQLITE_TIMEOUT | 5 | s; a connection waits this long for another writer (busy_timeout 5000 ms) |
+| CTL_LOCK_WAIT | 3000 | s; life-ctl waits this long for the tick's lock (a progress line every CTL_LOCK_PROGRESS s) |
+| CTL_LOCK_PROGRESS | 60 | s; life-ctl prints that it is waiting this often |
+| SEED_LOCK_WAIT | 60 | s; seed waits this long for the lock |
+| VALIDATE_TIMEOUT | 900 | s; seed and arm run VALIDATE.sh with this timeout |
+| PAYLOAD_MAX | 16384 | characters; an item payload (JSON); a larger one is refused before the write |
+| COMMAND_MAX_BYTES | 4000 | bytes; one operator command (inbox file or agenda text) |
+| INBOX_PER_TICK | 50 | files; inbox files taken per tick |
+| AGENDA_MAX | 20 | entries; agenda entries read (more: notice agenda_invalid) |
+| AGENDA_FILE_MAX_BYTES | 131072 | bytes; control/agenda.json |
+| WATCH_FILE_MAX_BYTES | 16384 | bytes; control/watch.txt |
+| AGENDA_HOURS_MIN, AGENDA_HOURS_MAX | 6 / 720 | hours; an agenda entry's period |
+
+A spent daily budget holds that class of work until 00:00 UTC with one `budget` notice. Budgets are charged
+before the work starts (a program run and its 12 model calls when it is planned, a research run with 5, a division
+step with 12 per run, an agent run before submit, a benchmark job before its POST) and never refunded; the calls
+rows record the actual model calls. Storage over its limit holds all new work and intake. **Deleted automatically**
+(at the daily retention): backups beyond the kept counts, rotated logs beyond 3, call folders 14 days after their
+call ended (unless its item is still queued or running), calls rows 90 days after they ended, run folders 14 days
+after a collected run ended, inbox-done files after 30 days, acknowledged notices after 90 days, samples after 7
+days, abandoned `.life-tmp-*` workspaces, release `.tmp-*` folders and inbox-tmp files after 1 day, a retired
+codebase cell's clone. Nothing else (items, knowledge, sources, releases, bundles and cell rows are kept).
+
+## 14. Observability
+
+`bin/life-status.py` (read-only, one read transaction for the registry and a separate read of the control files,
+each with its own time, `registry_sampled_at` and `control_sampled_at`, re-read once when ARMED, STOP or FREEZE
+changed meanwhile; `--json`): control switches (including whether the kit, platform files or decisions changed
+since arm), the tracked branch, release, fault and canary holds, governor (with node rests), today's budget, every
+live cell with its queue, live runs, open notices with their repeat counts; it prints UNKNOWN and exits 1 when the
+registry or the control state cannot be read; every registry string is printed through `one_line`.
+`STATE/operator/status.json` is the tick's projection with `tick_started_at`, `tick_finished_at` and `disposition`,
+written on every exit after step 2. Notices stay open until acknowledged; while one is open, a repeat of its kind
+and subject only raises its `count` and `last_at` (acknowledging never clears the condition itself; a condition that
+persists opens a new notice at its next occurrence). Every kind, with its subject (code refuses any other kind;
+VALIDATE proves every kind the code writes is listed):
+
+| kind | subject |
+|------|---------|
+| stopped | STOP |
+| integrity | state | release N | kit | platform | decisions |
+| contract | platform |
+| canary_failed | canaries |
+| storage | state | organism | backup |
+| budget | <budget column> <UTC day> |
+| held | the hold reason |
+| telemetry | node |
+| overflow | <organ> <UTC day> |
+| no_capacity | slots |
+| inbox_refused | first 16 hex of sha256(file name) |
+| agenda_invalid | entry id or agenda.json |
+| agenda_skipped | entry id |
+| command_too_long | command id |
+| command_needs_test | command id |
+| command_needs_program | command id |
+| command_database_confirm | command id |
+| command_heartbeat | command id |
+| command_immune | command id |
+| command_none | command id |
+| command_merged | command id |
+| command_failed | command id |
+| command_done | command id |
+| report_truncated | command id |
+| approve_needed | item id |
+| tracked_private_data | codebase |
+| already_passing | item id |
+| watch_timeout | test id |
+| watch_too_slow | test id |
+| watch_error | test id |
+| sandbox | landlock |
+| finding_owner | item id |
+| finding_failed | item id |
+| patch_ready | patch id |
+| patch_test_only | patch id |
+| patch_repeat | patch id |
+| proposal_ready | proposal id |
+| review_owner | item id |
+| migration_applied | migration id |
+| migration_numbers | database |
+| migration_recovery_required | migration id |
+| migration_imported | migration id |
+| store_table | org table |
+| experiment_passed | experiment id |
+| benchmarks_missing | compute |
+| benchmarks_invalid | benchmark id or benchmarks.json |
+| bench_refused | experiment id |
+| job_unknown | job id or label |
+| job_lost | job label |
+| agy_not_ready | node |
+| catalogue_shape | catalog |
+| inventory_shape | inventory |
+| model_absent | <node> <program> |
+| workspace | workspace path |
+| quarantine | cell id |
+| auto_released | cell id |
+| moved | cell id |
+| abstain_rate | cell id |
+| render | item id |
+| run_unknown | run id |
+| policy_mismatch | run id |
+| infra_repeat | item id |
+| tick_fault | exception type |
+
+`metrics` holds per organ per UTC day: items done, failed, abstained, program runs (reproduction included), agent
+runs. Command reports: section 7.1.
+
+## 15. Operator operations (`bin/life-ctl.py`)
+
+| command | lock | refuses when | effect |
+|---------|------|--------------|--------|
+| `seed --confirm START [--branch NAME]` | yes (60 s) | STOP present; the live checkout has no branch NAME (default main); the contract or VALIDATE.sh fails; already seeded; a resumed seed with another kit or branch | creates or finishes creating everything; NAME is recorded as the tracked branch; `meta.seed_complete` last |
+| `arm --confirm ARM-UNTESTED --decisions HEX16` | no | STOP present; seed not finished; HEX16 is not the start of DECISIONS.md's sha256; contract or STATE problems; VALIDATE.sh fails; the sandbox probe fails | ARMED = {boot id, kit, platform and decisions hashes} |
+
+
+[This is part 6 of 21. Reply only with the word RECEIVED.]

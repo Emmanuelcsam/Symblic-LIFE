@@ -1,0 +1,321 @@
+[LIFE round-4 critique packet, part 12 of 21]
+
+-- The database the organism grows itself. It starts with only the migration ledger below. Every later
+-- table arrives as an additive migration drafted by a database cell and applied by bin/life-tick.py after
+-- code validation (LIFE.md section 7.8; the exact grammar is life_common.MIGRATION_RULES): only CREATE TABLE IF NOT
+-- EXISTS, CREATE [UNIQUE] INDEX IF NOT EXISTS and ALTER TABLE ... ADD COLUMN, every name starts with org_, no
+-- AUTOINCREMENT, no quoted identifier. Nothing is ever dropped or deleted. Rows arrive only through the store adapter
+-- (quote-verified knowledge into org_ tables whose columns are fact_id plus source_url, claim, quote, created_at) or the
+-- operator. The control registry (life.sqlite3) is a separate file, so a migration can never touch control state.
+
+CREATE TABLE IF NOT EXISTS schema_migrations (
+  migration_id TEXT NOT NULL PRIMARY KEY CHECK (length(migration_id) BETWEEN 6 AND 45),
+  sha256       TEXT NOT NULL CHECK (length(sha256) = 64),
+  applied_at   INTEGER NOT NULL
+);
+
+===== FILE: units/life-tick.service =====
+# LIFE coordinator tick. The operator installs this file and life-tick.timer into ~/.config/systemd/user/ (README
+# step 5); nothing in the kit installs it. Code only: it calls light models on the worker nodes through the fleet runner
+# (bin/symblic run --by ollama:MODEL@node-X) and starts bounded agy runs through bin/symblic-task. It runs in
+# work.slice; its heavy children (watched tests, the gate, clones, fetches) run in their own life-*.scope units in
+# work.slice, each with RuntimeMaxSec, and ExecStopPost stops any life-*.scope still running when the tick ends.
+# Exit 1 (a tick fault) is listed as success on purpose: faults surface as notices and the fault hold, and the
+# timer keeps running. On stop (or TimeoutStartSec) systemd sends SIGTERM: the tick ends its process groups
+# (SIGTERM, SIGKILL 30 s later) and exits; TimeoutStopSec leaves that 60 s before SIGKILL of the whole unit.
+# TasksMax = life_common.TICK_TASKS_MAX: 8 tick threads + 5 nodes x 32 (one bin/symblic run each) + 24 helpers.
+# python3 -I: no PYTHON* variable and no user site can change what the coordinator imports.
+[Unit]
+Description=LIFE coordinator tick (code only; light models run on the worker nodes)
+ConditionPathIsDirectory=/home/operator/.local/state/life
+
+[Service]
+Type=oneshot
+Slice=work.slice
+WorkingDirectory=/home/operator/.local/state/life
+ExecStart=/usr/bin/python3 -I -B /home/operator/host-checkout/docs/life/bin/life-tick.py
+ExecStopPost=-/usr/bin/systemctl --user stop life-*.scope
+Nice=10
+TimeoutStartSec=3000
+TimeoutStopSec=60
+KillMode=control-group
+KillSignal=SIGTERM
+SuccessExitStatus=1 3 5 6
+Restart=no
+MemoryMax=1G
+TasksMax=192
+
+===== FILE: units/life-tick.timer =====
+# Runs the LIFE tick 10 minutes after boot, then 300 s after each tick ENDS (a long tick delays the next one;
+# missed ticks never pile up). A reboot always comes back disarmed: ARMED holds the previous boot's id.
+[Unit]
+Description=LIFE coordinator tick every 300 s after the previous one ends
+
+[Timer]
+OnBootSec=10min
+OnUnitInactiveSec=300
+AccuracySec=30s
+Persistent=false
+
+[Install]
+WantedBy=timers.target
+
+===== FILE: benchmarks/benchmarks.example.json =====
+{
+  "version": 2,
+  "benchmarks": [
+    {
+      "id": "zlib-level",
+      "description": "Seconds for Python zlib to compress 64 MiB of generated mixed text at level N, median of five runs (time.perf_counter); no file is written. Compression ratio is not measured: a faster level may compress less.",
+      "cmd": "python3 -c 'import zlib,time,statistics,sys; n=int(sys.argv[1]); data=(b\"life organism \"*400+bytes(range(256)))*17000; data=data[:67108864]; ts=[]\nfor _ in range(5):\n s=time.perf_counter(); zlib.compress(data,n); ts.append(time.perf_counter()-s)\nprint(\"LIFE_RESULT %.4f s\" % statistics.median(ts))' {{item}}",
+      "param_rx": "^[1-9]$",
+      "baseline": "6",
+      "unit": "s",
+      "timeout": 300,
+      "better": "lower",
+      "min_gain_pct": 10
+    },
+    {
+      "id": "sqlite-journal",
+      "description": "Seconds to insert 200000 rows into a fresh SQLite file with journal mode N (DELETE, WAL, MEMORY, TRUNCATE), median of five runs, in a temporary folder removed even on failure. Durability differs between modes and is not measured.",
+      "cmd": "python3 -c 'import sqlite3,tempfile,time,statistics,sys; m=sys.argv[1]; ts=[]\nfor _ in range(5):\n with tempfile.TemporaryDirectory() as d:\n  c=sqlite3.connect(d+\"/t.db\")\n  try:\n   c.execute(\"PRAGMA journal_mode=\"+m); c.execute(\"CREATE TABLE t(a,b)\"); s=time.perf_counter(); c.executemany(\"INSERT INTO t VALUES(?,?)\",((i,str(i)) for i in range(200000))); c.commit(); ts.append(time.perf_counter()-s)\n  finally:\n   c.close()\nprint(\"LIFE_RESULT %.4f s\" % statistics.median(ts))' {{item}}",
+      "param_rx": "^(DELETE|WAL|MEMORY|TRUNCATE)$",
+      "baseline": "DELETE",
+      "unit": "s",
+      "timeout": 300,
+      "better": "lower",
+      "min_gain_pct": 10
+    }
+  ]
+}
+
+===== FILE: VALIDATE.sh =====
+#!/usr/bin/env bash
+# LIFE kit validator: STATIC checks only. No model, no agent, no network, no task start, no file written
+# outside a private temporary folder (Python runs with -B, so no bytecode cache is written either).
+#   1 inventory   every required file exists (regular, no symlink); entry points are executable
+#   2 genome      bin/symblic check on each of the nine programs (exit 0 and "ok"); no placement option in any
+#   3 organs      organs/organs.json passes life_common.organs_problems (closed schema, non-thinking ladder models)
+#   4 templates   each raw agent template (organs/<organ>.lines.txt, placeholders unfilled) lints with ZERO
+#                 findings and no root; each renders with organs/fixtures.json into exactly two statements that lint
+#                 with ZERO findings; its policy equals the fixed LIFE policy with the organ's exact checks and passes
+#                 symblic_autogen.normalize; policy_flags() fed through bin/symblic-task's OWN parser and autogen_policy()
+#                 normalizes to the same sha256 (the round trip the server sees); the worst-case values still fit
+#   5 syntax      bash -n on every shell file; ast.parse on every Python file; every JSON file parses
+#   6 databases   db/life.sql and db/organism.sql applied twice in memory; required tables; CHECK constraints, triggers
+#                 and indexes refuse 23 bad rows (see the list in the check)
+#   7 canaries    exactly the nine program checks and the registry check, each once, in order, each target present
+#   8 benchmarks  benchmarks/benchmarks.example.json passes the tick's own bench_problems rules
+#   9 embedding   every "### <path>" block in LIFE.md equals that file byte for byte; no duplicate or extra block; every
+#                 kit file (except LIFE.md, BRIEF.md, workshop/, __pycache__/) is embedded
+#  10 contract    life_common.contract_problems() is empty (the platform facts LIFE relies on hold)
+#  11 rules       pure-function negative and positive cases: protected lines, placement, migrations and snapshots,
+#                 the credential screen, verify lines, the gate's path and local_fix rules, path classes, cell ids, test
+#                 ids, payload schemas, failure fingerprints, lint rewrites, the unit file, every stage budget fits the
+#                 tick, the research and benchmark bounds, every CONTRACT file is gate-protected, every notice kind and
+#                 meta key the code writes is declared, /proc/pressure/io and /proc/pressure/memory readable
+#  12 numbers     no timing literal in any bin/*.py program except life_common.py (every number lives there), and the
+#                 gate script's two timeouts equal GATE_DEVCHECK_TIMEOUT and GATE_TEST_TIMEOUT
+#  13 generated   LIFE.md sections 13, 14 and 17 hold exactly the tables life_common generates (numbers, notice kinds,
+#                 contract rows)
+# It prints PASS/FAIL per check and ends with STATIC PASS or SOME FAILED. Exit 0 only on STATIC PASS.
+# STATIC PASS is not an admission test: the coordinator's behaviour under concurrency, crashes and STOP is
+# not exercised here (LIFE.md section 18, GAP 8).
+set -u
+shopt -s nullglob
+KIT="/home/operator/host-checkout/docs/life"
+REPO="/home/operator/host-checkout"
+PY="/usr/bin/python3 -B -I"
+fail=0
+pass() { printf 'PASS  %-10s %s\n' "$1" "$2"; }
+bad()  { printf 'FAIL  %-10s %s\n' "$1" "$2"; fail=1; }
+
+echo "== 1 inventory =="
+required=(BRIEF.md README.md DECISIONS.md LIFE.md VALIDATE.sh
+  bin/life_common.py bin/life-tick.py bin/life-ctl.py bin/life-status.py bin/life-check.py bin/life-seed.sh
+  bin/life-fetch.py bin/life-research.py
+  checks/devcheck-gate.sh checks/canaries.txt db/life.sql db/organism.sql
+  organs/organs.json organs/fixtures.json organs/codebase.lines.txt organs/selfdev.lines.txt organs/database.lines.txt
+  policies/codebase.json policies/selfdev.json policies/database.json
+  spawn/PROTOCOL.md spawn/example/division.json units/life-tick.service units/life-tick.timer
+  benchmarks/benchmarks.example.json)
+for p in classify-command triage-error extract-source distill-lesson propose-experiment rank-experiment review-patch reproduce assign-item; do
+  required+=("genome/$p.sym"); done
+inv=0
+for f in "${required[@]}"; do
+  if [ -f "$KIT/$f" ] && [ ! -L "$KIT/$f" ]; then :; else bad inventory "$f missing"; inv=1; fi; done
+for f in VALIDATE.sh bin/life-tick.py bin/life-ctl.py bin/life-status.py bin/life-check.py bin/life-seed.sh bin/life-fetch.py \
+         bin/life-research.py checks/devcheck-gate.sh; do
+  [ -x "$KIT/$f" ] || { bad inventory "$f is not executable"; inv=1; }; done
+[ "$inv" = 0 ] && pass inventory "${#required[@]} files"
+
+echo "== 2 genome (bin/symblic check, no model) =="
+for f in "$KIT"/genome/*.sym; do
+  out="$("$REPO/bin/symblic" check "$f" 2>&1)"; rc=$?
+  placement="$($PY -c 'import sys; sys.path.insert(0, sys.argv[1] + "/bin"); import life_common as L; print("; ".join(L.genome_placement_problems(open(sys.argv[2], encoding="utf-8").read())))' "$KIT" "$f")"
+  if [ "$rc" = 0 ] && printf '%s' "$out" | tail -1 | grep -q ': ok' && [ -z "$placement" ]; then pass check "$(basename "$f")"; else bad check "$(basename "$f") $placement"; fi
+done
+
+echo "== 3-4 organs and templates (lint zero findings, normalize, fixed policy, CLI round trip) =="
+if $PY - <<'PYEOF'
+import importlib.machinery, importlib.util, json, sys
+sys.path.insert(0, '/home/operator/host-checkout'); sys.path.insert(0, '/home/operator/host-checkout/docs/life/bin')
+import life_common as L
+import symblic_autogen as A
+ok = True
+problems = L.organs_problems(json.load(open(L.KIT + '/organs/organs.json', encoding='utf-8'), object_pairs_hook=L._no_dup_keys))
+print(('PASS  organs     ' if not problems else 'FAIL  organs     ') + ('organs.json' if not problems else '; '.join(problems)))
+ok &= not problems
+loader = importlib.machinery.SourceFileLoader('symblic_task_cli', L.TASK)
+spec = importlib.util.spec_from_loader('symblic_task_cli', loader)
+cli = importlib.util.module_from_spec(spec)
+loader.exec_module(cli)
+fixtures = json.load(open(L.KIT + '/organs/fixtures.json', encoding='utf-8'))
+for organ in L.AGENT_ORGANS:
+    raw = A.statements(open(f'{L.KIT}/organs/{organ}.lines.txt', encoding='utf-8').read())
+    raw_findings = A.lint(raw)                  # the raw template, no root: it must name its absolute folder itself
+    print(('PASS  raw lint   ' if not raw_findings else 'FAIL  raw lint   ') + f'{organ}: ' +
+          ('0 lint findings without a root' if not raw_findings else '; '.join(f'{lv} line {n}: {m}' for lv, n, m in raw_findings)))
+    ok &= not raw_findings
+    try:
+        lines, policy, sha = L.render_run(L.KIT, organ, fixtures[organ])
+        flags = L.policy_flags(policy)
+        opts, _args = cli.parse(flags)
+        round_trip = A.normalize(cli.autogen_policy(opts, lines))['sha256']
+        if round_trip != sha:
+            raise ValueError(f'bin/symblic-task would send a policy with sha256 {round_trip[:12]}, LIFE expects {sha[:12]}')
+        print(f'PASS  template   {organ}: {len(lines)} statements, 0 lint findings, policy sha256 {sha[:12]} = CLI round trip, {len(flags)} flags')
+    except Exception as exc:
+        print(f'FAIL  template   {organ}: {exc}'); ok = False
+worst = {'codebase': dict(fixtures['codebase'], finding_text='x' * L.FINDING_CUTS[-1], test_id='tests.' + 'a' * 64 + '.' + 'b' * 64 + '.' + 'c' * 20,
+                          scope='function bodies inside the files ' + ', '.join(['a' * 117 + '.py'] * 3)),
+         'database': dict(fixtures['database'], request='y' * L.REQUEST_MAX_CHARS, migration_id='9999_' + 'z' * 40),
+         'selfdev': dict(fixtures['selfdev'], lesson='y' * L.LESSON_MAX_CHARS, program='propose-experiment')}
+for organ, values in worst.items():
+    try:
+        L.render_run(L.KIT, organ, values)
+        print(f'PASS  worst      {organ}: the largest values render within {L.STATEMENT_MAX} characters')
+    except Exception as exc:
+        print(f'FAIL  worst      {organ}: {exc}'); ok = False
+sys.exit(0 if ok else 1)
+PYEOF
+then :; else fail=1; fi
+
+echo "== 5 syntax =="
+for f in "$KIT"/bin/*.sh "$KIT"/checks/*.sh "$KIT/VALIDATE.sh"; do
+  if bash -n "$f" 2>/dev/null; then pass "bash -n" "${f#$KIT/}"; else bad "bash -n" "${f#$KIT/}"; fi; done
+for f in "$KIT"/bin/*.py; do
+  if $PY -c 'import ast,sys; ast.parse(open(sys.argv[1],encoding="utf-8").read(), sys.argv[1])' "$f" 2>/dev/null; then
+    pass ast "${f#$KIT/}"; else bad ast "${f#$KIT/}"; fi; done
+for f in "$KIT"/organs/*.json "$KIT"/policies/*.json "$KIT"/spawn/example/*.json "$KIT"/benchmarks/*.json; do
+  if $PY -c 'import json,sys; json.load(open(sys.argv[1],encoding="utf-8"))' "$f" 2>/dev/null; then :; else bad json "${f#$KIT/}"; fi; done
+
+echo "== 6 databases (in memory, applied twice) =="
+if $PY - "$KIT" <<'PYEOF'
+import sqlite3, sys
+kit = sys.argv[1]
+c = sqlite3.connect(':memory:'); c.execute('PRAGMA foreign_keys=ON')
+for _ in (1, 2):
+    c.executescript(open(kit + '/db/life.sql', encoding='utf-8').read())
+need = {'meta','releases','cells','cell_events','cell_programs','items','calls','runs','divisions','commands','sources',
+        'question_sources','answers','knowledge','patches','proposals','experiments','results','migrations','samples',
+        'governor','node_holds','budget','metrics','notices'}
+have = {r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+assert need <= have, need - have
+c.execute("INSERT INTO releases (release, at, source, manifest, active) VALUES (1, 0, 'kit', '{}', 1)")
+n = 0
+def refused(sql):
+    global n
+    try:
+        c.execute(sql)
+    except sqlite3.IntegrityError:
+        n += 1
+        return True
+    return False
+cell = "INSERT INTO cells (cell_id, organ, kind, parent_id, depth, focus, node, workspace, state, born_at, release) VALUES "
+item = "INSERT INTO items (item_id, organ, kind, stage, state, taint, payload, created_at, updated_at, cell_id) VALUES "
+assert refused("INSERT INTO releases (release, at, source, manifest, active) VALUES (2, 0, 'kit', '{}', 1)")
+assert refused(cell + "('learning.11.00000000', 'learning', 'model', NULL, 11, 'research something', 'node-d', NULL, 'active', 0, 1)")
+assert refused(cell + "('brain.0.00000000', 'brain', 'model', NULL, 0, 'think about things', 'node-d', NULL, 'active', 0, 1)")
+assert refused(cell + "('learning.00.00000000', 'learning', 'model', NULL, 0, 'research something', 'node-d', NULL, 'active', 0, 1)")
+assert refused(cell + "('learning.0.0000000g', 'learning', 'model', NULL, 0, 'research something', 'node-d', NULL, 'active', 0, 1)")
+assert refused(cell + "('codebase.0.00000000', 'codebase', 'model', NULL, 0, 'fix failing tests', 'node-i', NULL, 'active', 0, 1)")
+assert refused(cell + "('codebase.0.00000000', 'codebase', 'agent', NULL, 0, 'fix failing tests', 'node-h', '/w/a', 'active', 0, 1)")
+assert refused(cell + "(NULL, 'learning', 'model', NULL, 0, 'research something', 'node-d', NULL, 'active', 0, 1)")
+assert refused(cell + "('learning.1.5.000000', 'learning', 'model', NULL, 1.5, 'research something', 'node-d', NULL, 'active', 0, 1)")
+c.execute(cell + "('learning.0.00000000', 'learning', 'model', NULL, 0, 'research the open questions', 'node-d', NULL, 'active', 0, 1)")
+c.execute(cell + "('codebase.0.00000000', 'codebase', 'agent', NULL, 0, 'fix failing tests', 'node-i', '/w/a', 'active', 0, 1)")
+assert refused(cell + "('codebase.1.0000000a', 'codebase', 'agent', 'codebase.0.00000000', 1, 'fix other tests', 'node-i', '/w/a', 'active', 0, 1)")
+assert refused(cell + "('digest.1.0000000b', 'digest', 'model', 'learning.0.00000000', 1, 'digest other things', 'node-b', NULL, 'active', 0, 1)")
+assert refused(cell + "('learning.3.0000000c', 'learning', 'model', 'learning.0.00000000', 3, 'research deeper things', 'node-d', NULL, 'active', 0, 1)")
+assert refused("UPDATE cells SET depth=1 WHERE cell_id='learning.0.00000000'")
+assert refused(item + "('learning:0123456789abcdef', 'learning', 'source', 'research', 'queued', 'owner', '{}', 0, 0, NULL)")
+assert refused(item + "('learning:0123456789abcdeg', 'learning', 'question', 'research', 'queued', 'owner', '{}', 0, 0, NULL)")
+assert refused(item + "('immune:0123456789abcdef', 'immune', 'lesson', 'review', 'queued', 'code', '{}', 0, 0, NULL)")
+assert refused(item + "('digest:0123456789abcdef', 'digest', 'source', 'apply', 'queued', 'web', '{}', 0, 0, NULL)")
+assert refused(item + "('digest:0123456789abcdef', 'digest', 'source', 'fetch', 'queued', 'web', '{}', 0, 0, 'learning.0.00000000')")
+c.execute(item + "('immune:0123456789abcdef', 'immune', 'patch', 'review', 'queued', 'code', '{}', 0, 0, NULL)")
+assert refused("UPDATE items SET taint='owner' WHERE item_id='immune:0123456789abcdef'")
+assert refused("UPDATE items SET priority=1.5 WHERE item_id='immune:0123456789abcdef'")
+c.execute("INSERT INTO divisions (division_id, parent_id, stage, release, snapshot, started_at) VALUES ('d1', 'learning.0.00000000', 'foci', 1, '[]', 0)")
+assert refused("INSERT INTO divisions (division_id, parent_id, stage, release, snapshot, started_at) VALUES ('d2', 'codebase.0.00000000', 'workspaces', 1, '[]', 0)")
+c.execute("INSERT INTO budget (day) VALUES ('2026-10-11')")
+assert refused("UPDATE budget SET births = -1")
+assert refused("INSERT INTO migrations (migration_id, item_id, sha256, state, at) VALUES ('0001_x', NULL, 'a', 'pending', 0)")
+o = sqlite3.connect(':memory:')
+for _ in (1, 2):
+    o.executescript(open(kit + '/db/organism.sql', encoding='utf-8').read())
+assert {r[0] for r in o.execute("SELECT name FROM sqlite_master WHERE type='table'")} == {'schema_migrations'}
+print(f'PASS  sqlite     life.sql (schema 4), organism.sql, {n} bad rows refused')
+sys.exit(0 if n == 23 else 1)
+PYEOF
+then :; else bad sqlite "life.sql or organism.sql"; fi
+
+echo "== 7 canaries =="
+if $PY - "$KIT" <<'PYEOF'
+import os, shlex, sys
+kit = sys.argv[1]
+lines = [ln.strip() for ln in open(kit + '/checks/canaries.txt', encoding='utf-8') if ln.strip() and not ln.startswith('#')]
+programs = ['classify-command', 'triage-error', 'extract-source', 'distill-lesson', 'propose-experiment', 'rank-experiment',
+            'review-patch', 'reproduce', 'assign-item']
+want = [f'/home/operator/host-checkout/bin/symblic check {{release_dir}}/genome/{p}.sym' for p in programs]
+want.append('/usr/bin/python3 -B {kit}/bin/life-check.py registry')
+assert lines == want, 'checks/canaries.txt must be exactly the nine program checks and the registry check, in order'
+for line in lines:
+    argv = shlex.split(line.replace('{release_dir}', kit).replace('{kit}', kit))
+    assert os.path.isfile(argv[0]) and os.path.isfile(argv[-1] if argv[-1].endswith('.sym') else argv[-2]), line
+PYEOF
+then pass canaries "10 lines, exact"; else bad canaries "checks/canaries.txt"; fi
+
+echo "== 8 benchmarks example =="
+if $PY - "$KIT" <<'PYEOF'
+import importlib.util, json, sys
+kit = sys.argv[1]
+sys.path.insert(0, kit + '/bin')
+spec = importlib.util.spec_from_file_location('life_tick', kit + '/bin/life-tick.py')
+tick = importlib.util.module_from_spec(spec); spec.loader.exec_module(tick)
+d = json.load(open(kit + '/benchmarks/benchmarks.example.json', encoding='utf-8'))
+assert d['version'] == 2 and d['benchmarks']
+ids = [b['id'] for b in d['benchmarks']]
+assert len(ids) == len(set(ids))
+for b in d['benchmarks']:
+    assert not tick.bench_problems(b), (b.get('id'), tick.bench_problems(b))
+assert tick.bench_problems(dict(d['benchmarks'][0], baseline='6; rm -rf ~'))
+PYEOF
+then pass bench "benchmarks.example.json"; else bad bench "benchmarks.example.json"; fi
+
+echo "== 9 LIFE.md embeds every file verbatim =="
+if $PY - "$KIT" <<'PYEOF'
+import os, re, sys
+kit = sys.argv[1]
+data = open(kit + '/LIFE.md', 'rb').read()
+text = data.decode('utf-8')
+blocks = re.findall(r'^### (\S+)\n\n(`{3,4})[a-z]*\n(.*?)\n\2$', text, re.M | re.S)
+seen, bad = set(), []
+for path, _fence, body in blocks:
+    if path in seen:
+        bad.append(path + ' embedded twice')
+    seen.add(path)
+
+
+[This is part 12 of 21. Reply only with the word RECEIVED.]

@@ -1,0 +1,16 @@
+program LIFE error triage.
+use profile=verified, context=none, determine=false, solve=false.
+note Worker of a codebase cell, first stage. One failing test and its sanitized output in, one change class out. Code then decides by the patch's actual paths (life_common.path_class), and a protected path always wins over this label. unknown, or confident false, sends the finding to the operator and no patch is attempted. Worst case 3 + 3 = 6 calls.
+given finding_id: Text.
+given test_id: Text.
+given finding_text: Text.
+define ChangeClass as one of {
+  test_only: "the test itself is wrong or outdated and only the test module file named by the test id needs to change",
+  comment_or_doc: "only Markdown documentation under docs/ needs to change",
+  local_fix: "up to three function bodies in files the traceback names need to change, with no signature, import or module-level change",
+  signature_change: "a change to a function or class signature or a public interface",
+  unknown: "the class cannot be decided from this text alone"}.
+ask change_class: ChangeClass "Classify the smallest change that would make the failing test {test_id} pass. Output of the failing test: {finding_text}" from test_id, finding_text with effort=medium, retries=2
+ask confident: Bool "Is this classification well supported by the test output alone?" from finding_text, change_class with effort=low, retries=2
+let triage = {finding: finding_id, change_class: change_class, confident: confident}.
+return triage.

@@ -1,0 +1,251 @@
+# LIFE v2.3 — how to bring the cluster to life, use it, and stop it
+
+This folder is a **script kit, not a running system**. Nothing here has been started, installed or
+armed. The operator starts it, once, when they choose. Read this file, then `DECISIONS.md` (what the kit
+bounds and why; arming accepts it), then `LIFE.md` (the master script: every rule, number, path and
+file, with every file embedded verbatim).
+
+LIFE is a cell organism on the cluster. Each **cell** is one subline of work with two agents: a
+**worker** that does one exact task on a light local model (or, for three organs, a bounded `agy` run),
+and a **reproducer** that, when code says the cell may divide, splits its work into two child cells
+on two worker nodes. One code program, `bin/life-tick.py`, runs 300 s after the previous tick ends on the host:
+it admits, schedules, checks and records everything. Models propose; code decides. The host only
+orchestrates: it runs code, the gates, the watched tests, clones and page fetches, each in its own bounded scope,
+and never a model. The three agent organs (codebase, selfdev, database) use the operator's cloud agy login on the model
+named in `control/agy-model.txt`, at most 12 runs a day; everything else uses 0.5B-4B local models on the worker nodes.
+
+What the brief's words mean here, exactly (DECISIONS.md is the full list): "optimises the codebase" = it measures
+benchmark templates you write and reports passed experiments with a ready-to-send command; code changes come only
+from failing tests. "Fixes errors" = it fixes only failing tests you list in `control/watch.txt` or name in a command
+(`fix: tests.test_x`); it never reads the dashboard's logs. "Creates databases" = additive tables in its own
+organism database; rows arrive only in tables shaped for its quote-verified knowledge. The top-level loop is the
+Python coordinator `bin/life-tick.py`; the Symblic parts are the nine genome programs (`genome/*.sym`) and the three
+two-line statement templates (`organs/*.lines.txt`): the Symblic program is the gcode, the tick is the printer's
+firmware, and there is no separate runnable LIFE statement script.
+
+## Start it (operator, on the host)
+
+1. **Validate** (static: no model, no agent, no network):
+   ```
+   /home/operator/host-checkout/docs/life/VALIDATE.sh      # must end STATIC PASS
+   ```
+2. **Seed** (creates `/home/operator/.local/state/life`, release 1, three workspaces and the eight seed
+   cells; starts nothing; a seed that stopped halfway is finished by running it again with the same branch).
+   `--branch` names the branch the codebase organ tracks for its whole life (default `main`). To start over
+   instead (a changed kit refuses to resume), remove `~/.local/state/life` AND the three folders
+   `/home/operator/symblicos/projects/life-{codebase,selfdev,database}-0-00000000` by hand, then seed again:
+   ```
+   /home/operator/host-checkout/docs/life/bin/life-seed.sh --branch main   # type START
+   ```
+3. **Check readiness** (no model is called):
+   ```
+   B=/home/operator/host-checkout/docs/life/bin
+   /home/operator/host-checkout/bin/symblic-task catalog --json   # "ready": {"agy": true} on node-i, node-a, node-b?
+   /home/operator/host-checkout/bin/local-research --list         # the ladder models installed on each LIFE worker node?
+   $B/life-ctl.py gate-selftest tests.test_symblic_autogen            # must print PASS (see below)
+   ```
+   `gate-selftest` takes any test that passes with `/usr/bin/python3 -s -B -m unittest ID` inside the clone (no .venv,
+   no network); `tests.test_symblic_autogen` is only the default suggestion. It runs the sandbox probe (a sentinel file
+   in STATE, STATE itself, `~/.ssh` and the live checkout unreadable, 127.0.0.1:8080 unreachable, unix sockets and
+   signals to outside processes denied, each denial the policy's own PermissionError; a target missing outside the
+   sandbox makes it INCONCLUSIVE), then the gate twice on an idle codebase clone: a harmless comment added to the
+   test's module must PASS with devcheck checking at least one file, and a line that does not parse must FAIL at
+   devcheck (exit 4). A PASS proves the codebase gate for this kit and these platform files: until then codebase
+   gates and agent runs wait (notice `gate_unproven`); run it again after any kit or platform-pin change.
+   If agy is not ready on a seed agent node, log agy in there (the worker node CLI login procedure) or the
+   codebase, selfdev and database organs simply wait (notice `agy_not_ready`); that is expected, not a fault.
+4. **Give it work and limits** (all optional; operator files under `~/.local/state/life/control/`, each a regular
+   file you own; LIFE never writes them):
+   - `watch.txt`: one unittest id per line (`tests.test_x`), at most 20. Each must pass
+     `life-ctl.py gate-selftest ID` and finish in under 90 s of WALL time as LIFE runs it: `/usr/bin/python3 -s -B
+     -m unittest ID` (the system Python, no .venv, no network, an empty HOME, inside the sandbox and a scope, start-up
+     included). A test that needs the .venv or the network ends as `watch_error`, never a finding.
+   - `benchmarks.json`: copy `benchmarks/benchmarks.example.json`, read every command, keep only what you
+     approve (at most 20 entries, 64 KiB) — the compute organ measures only these.
+   - `agy-model.txt`: one line, the exact agy model id the three agent organs may use (a model `agy models` lists;
+     a light one keeps the weekly quota). Without it agent organs wait (notice `agy_model`); every run is `--effort low`.
+   - `agenda.json`: recurring commands, `{"version": 1, "entries": [{"id": "materials-weekly", "text": "Research
+     ...", "every_hours": 168}]}` (6..720 hours, at most 20 entries, ids unique, text 6..4000 bytes). An entry fires
+     once in every period of every_hours counted from the Unix epoch, including the period in which it is added or
+     edited (on the first armed working tick of that period); missed periods are skipped (notice `agenda_skipped`),
+     never caught up.
+   - Commands are routed by a small model unless they start with a prefix, which code routes without asking any
+     model: `research:` (a question), `fix: tests.test_x [path.py:Class.function]` (a failing test, optionally the
+     function to fix), `database:` (a schema request: `database: keep a reading list of papers with title, DOI and the
+     question it answers`), `measure:` (an experiment over your benchmarks), `genome:` (a lesson naming one genome
+     program); the single word `status` answers with a heartbeat. A database change ALWAYS needs its prefix.
+   - `CODEBASE_HISTORY_OK` (an empty regular file you own; a symlink or directory grants nothing): read LIFE.md
+     section 18 GAP 11 first. An agent checkout on a worker node is
+     a full worktree of the tracked branch: the tracked `.backups/` files (a private database among
+     them) are plain files in the agent's folder, and the whole history sits in the worker node's bare mirror.
+     Without this file, codebase agent runs wait.
+   - `NO_SELF_QUESTIONS` (empty file): stops learning from asking its own follow-up questions.
+5. **Install the timer** (user units; the kit never installs them):
+   ```
+   cp /home/operator/host-checkout/docs/life/units/life-tick.{service,timer} ~/.config/systemd/user/
+   systemctl --user daemon-reload
+   systemctl --user enable --now life-tick.timer
+   loginctl enable-linger operator          # once: user timers keep running after logout
+   ```
+   `arm` checks that the LOADED units are the kit's (ExecStart, MemoryMax, TasksMax, KillMode, timeouts, exit codes,
+   the timer's 300 s) and refuses otherwise; after editing the kit's units, copy them again and daemon-reload.
+   Disarmed, each tick only observes: it samples the cluster, takes inbox commands, runs canaries and writes status.
+6. **Arm** (for this boot, this kit, these platform files and these decisions only; a reboot, a STOP or any change
+   to them comes back disarmed). Read `DECISIONS.md`, then pass the first 16 hex of its sha256:
+   ```
+   sha256sum /home/operator/host-checkout/docs/life/DECISIONS.md | cut -c1-16
+   $B/life-ctl.py arm --confirm ARM-UNTESTED --decisions <those 16 hex>   # runs VALIDATE.sh and the sandbox probe first
+   $B/life-ctl.py selfdev-arm                    # optional: genome proposals
+   ```
+   The word ARM-UNTESTED says it: the admission tests (LIFE.md GAP 8) do not exist yet.
+
+## Use it
+
+```
+$B/life-ctl.py command "Research how ceramic foam porosity is measured by gas adsorption"
+$B/life-status.py                 # control, governor, budgets, cells, runs, notices, the tracked branch
+$B/life-ctl.py notices            # what needs you; ack with: $B/life-ctl.py ack ID
+$B/life-ctl.py report COMMAND_ID  # what a finished command produced (answers, sources, claims, patches)
+$B/life-ctl.py show ITEM          # read web-derived work, then: $B/life-ctl.py approve ITEM --confirm APPROVE
+$B/life-ctl.py apply PATCH --confirm APPLY      # a reviewed, gated patch into the live checkout (no commit)
+                                                # then run bin/devcheck in the live checkout before you commit
+$B/life-ctl.py revert PATCH --confirm REVERT    # only if nobody changed those files since
+$B/life-ctl.py adopt PROPOSAL --confirm ADOPT   # a reviewed genome proposal becomes the next release
+$B/life-ctl.py requeue ITEM --confirm REQUEUE   # an item that went to you (or a source that overflowed or came back
+                                                # empty), back to work
+$B/life-ctl.py abandon-run RUN_ID --confirm ABANDON   # a run the dashboard cannot confirm (notice run_unknown)
+$B/life-ctl.py revive ORGAN NODE                # a new first cell for an organ that has none (one birth)
+```
+
+LIFE never applies a patch, adopts a genome change, restarts the dashboard, commits to
+host-checkout, enables high-power mode or changes guest internet. Those stay with you. A test-only patch is
+never made ready by the reviewer model: you read it and apply it with `--unreviewed`.
+
+## KILL SWITCH
+
+| what | command | effect |
+|------|---------|--------|
+| stop everything now | `$B/life-ctl.py stop` | writes `control/STOP` and removes `control/ARMED`; within 1 s a running tick sends SIGTERM to every LIFE process group and stops every `life-*.scope` (SIGKILL 30 s later; a killed `bin/symblic run` or research run cancels its fleet-runner run on the worker node first); life-ctl itself asks bin/symblic-task to cancel every LIFE autogen run (60 s each) and the job API to cancel every benchmark job (30 s each); nothing new starts. A cancel is a request: runs and jobs show as live until a tick sees them end. Then `unstop` removes STOP and `arm` is needed again; cancelled work returns to its queue and starts again only after you arm |
+| pause new work | `$B/life-ctl.py freeze` / `thaw` | running work finishes and is collected; nothing new starts (fetches, gates, applies, findings and agent starts are new work and wait) |
+| disarm | `$B/life-ctl.py disarm` | same as a reboot: observe only until `arm` |
+| stop the timer and the running tick | `systemctl --user disable --now life-tick.timer && systemctl --user stop life-tick.service` | no further tick; the running tick (if any) gets SIGTERM from the stop, ends its process groups and scopes (SIGKILL 30 s later) and exits 4. Disabling the timer alone does NOT stop a running tick |
+| one cell | `$B/life-ctl.py retire CELL` | the cell ends; its queue returns to its organ |
+
+STOP lives outside every workspace (`~/.local/state/life/control/`), which no worker can read: model
+calls have no tools, agents run on the worker nodes in their own checkouts, and agent-written code that runs on
+The host (check 0, the gate, watched tests) runs only inside the Landlock sandbox, where STATE is not readable. If
+anything makes `control/` impossible to inspect (a chmod: GAP 16), LIFE reads that as STOP (fail closed).
+
+## Safety summary
+
+- Light models run only on node-a/b/d/f/i through the fleet runner (`bin/symblic run --by ollama:M@node-X`, a call
+  named for a node is never re-placed; `bin/life-research.py`); never on the host, the ARM node, node-c/e or node-h.
+- Agent runs are `agy` only, on the model in `control/agy-model.txt` at effort low, strategies `fresh,feedback` (no
+  engine or node rotation), at most 4 agents per run, at most 2 runs at once and 12 a day, at most 2700 s each
+  (cancel requested at 3000 s), no internal splitting (`self_split false`, `depth 0`); a run starts only on a node
+  with no LIFE work in the previous hour.
+- The heat governor rests the fleet after 3000 s of fleet load (5-minute load per processor) until 600 s are
+  observed quiet, admits an action only while the fleet's loaded seconds plus its worst case stay within 3000 s and
+  the node's LIFE work in the last hour plus its worst case stays within 3000 s (then the node rests 1800 s; at most
+  6 h of LIFE work per node per UTC day), holds while a high-power mode lease, its rest or any phase but off is on, holds
+  while the host is short of memory or under memory or io pressure (checked again before every heavy local process),
+  and gives hot worker nodes (85 °C, cool again below 75 °C) no new work.
+- The sandbox denies every TCP connect and bind and every unix socket; it does not block UDP (GAP 15) and cannot stop
+  a chmod of a path it cannot read (GAP 16: STOP and FREEZE then read as present and LIFE holds on its STATE check).
+- No credential, `.env` value or private-store value is written by LIFE; inbox text with
+  credential-shaped values is refused; web text is data (taint `web`), quoted to agents only after you
+  approve it, never a statement or command by itself.
+
+===== FILE: DECISIONS.md =====
+# LIFE requirements decisions (the operator accepts these at arm)
+
+`life-ctl.py arm --confirm ARM-UNTESTED --decisions HEX16` requires HEX16 = the first 16 hex of sha256 of THIS file,
+and ARMED records the full sha256. Any change to this file disarms LIFE (integrity hold) until the operator reads it and
+arms again with the new hash. Each line names an operator word from BRIEF.md and the exact bound the kit puts on it; the
+bound is a number in `bin/life_common.py` (LIFE.md section 13) unless it says otherwise. Arming accepts every line;
+it never claims that the unbounded words are met as written.
+
+## Words of 10 Oct that later binding rules bound
+
+1. "regenerate until complete or split": an item retries across ticks and days (infra re-queues up to 6, rung
+   escalation up to 2 rungs, two timeouts at the top rung end at the operator, research re-runs until 3 dry runs or 9
+   fetched sources, 2 needs_work rounds); a single attempt is bounded (agent run: 900 s per attempt, 2700 s per run,
+   cancel requested at 3000 s; program run: 900 s, each model call 75 s; research run: 2100 s). "Split off what they
+   cannot do" is switched off: LIFE agent runs never split (self_split false, depth 0); work a run cannot do ends at
+   the operator, never silently away.
+2. "no time cap while they try new things": no WORK has a wall cap; every ATTEMPT does (line 1). Divisions have a
+   27-counted-tick cap and a 24 h wall backstop.
+3. "the master coordinator may spawn as many agents as needed": at most 16 live cells (3 per organ, 4 per node), 8
+   births per UTC day (a revive is a birth), 12 agent runs (each up to 4 agents) per UTC day, 2 agent runs at once.
+4. "research lanes may run for days": a question is researched again at later ticks for as long as it finds new
+   sources (any number of days); each run is 3 tool uses, 5 generations, 2100 s.
+5. "a living breathing cluster": LIFE breathes in ticks (300 s after the previous tick ends) and rests (fleet: after
+   3000 s of load until 600 s quiet; a node: 3000 s of LIFE work in any hour, then 1800 s idle; at most 6 h of LIFE
+   work per node per UTC day). An agent run starts only on a node with no LIFE work in the whole previous hour and
+   consumes that node's duty window while it runs (its other cells wait).
+
+## Binding rules that win over the 10 Oct words
+
+6. "keep continuous all-worker node load under about an hour before resting": implemented by line 5; a new action is admitted
+   only while the fleet's loaded seconds plus its worst case stay within 3000 s; a high-power mode lease or its rest, cool
+   mode, or any high-power mode phase other than off holds LIFE entirely.
+7. "models propose, code decides": every acceptance (gates, checks, quote verification, division, quarantine,
+   budgets, routing of prefixed commands) is code; a model accept never applies, adopts or makes a test-only patch
+   ready.
+8. "nothing restarts itself": LIFE never restarts the dashboard, never re-arms itself (a reboot, STOP, or any kit,
+   platform-file or DECISIONS change disarms), never resubmits a run under a new id while the old one may exist. Two
+   accepted exceptions: an organ's only cell, quarantined for 86400 s, is released automatically at its top rung at
+   most once per 604800 s (auto_release); and work that STOP cancelled returns to its queue and starts again only
+   after the operator arms again.
+9. "the host only orchestrates": light models run only on node-a/b/d/f/i; the host runs code, sandboxed tests, gates,
+   the checks of codebase runs, fetches, clones and the clients of slot programs, each in its own bounded scope;
+   agent runs are placed on the cell's worker node.
+10. "no credentials in shared documents": LIFE writes no credential; inbox and agenda text with a credential-shaped
+    value is refused; fetched pages are stored with credential-shaped spans redacted; web text is data.
+
+## Scope decisions for the operator's brief
+
+11. "extremely light weight models": the five model organs use 0.5B to 4B local models; the three agent organs
+    (codebase, selfdev, database) use one bounded `agy` run per item stage, on the agy model the operator writes in
+    control/agy-model.txt (effort low; until that file exists agent organs wait), a cloud model of the operator's agy
+    login, counted only by the agent-run budget (12 a day). No other cloud use exists.
+12. "optimizes the codebase": the compute organ measures operator-written benchmark templates (warm-ups, ABBA pairs, exact
+    fractions) and reports passed experiments with a ready-to-send command; turning a measured gain into a code change
+    is the operator's (GAP 12).
+13. "fixes errors": only failing tests the operator lists in control/watch.txt or names in a command (`fix: tests.x`,
+    optionally `path.py:Class.function`), only three change classes (test_only, comment_or_doc, local_fix of function
+    bodies the traceback or the command names), only through the gate and review, applied only by the operator.
+14. "learns from the internet": through SearXNG and the platform's safe fetch only; web text is quoted as data,
+    lessons and requests from it wait for the operator's approval before any agent run.
+15. "develops itself": genome proposals change only ask instructions (not review-patch, which is protected), are
+    gated, reviewed, and adopted only by the operator.
+16. "creates databases": additive org_ schema migrations (operator-prefixed or approved requests) plus the store adapter,
+    which copies quote-verified knowledge into org_ tables shaped for it; no model writes a row (GAP 13).
+17. "figures out new ways to compute and store data": experiments over the operator's templates; adoption is the operator's.
+18. "reproduces": cells divide only when code says so (workable backlog, health, efficiency, room, a second worker node); the
+    reproducer model only names foci and sorts items.
+19. "the codebase organ's history exposure": codebase agent runs wait until the operator creates
+    control/CODEBASE_HISTORY_OK (GAP 11: the worker node checkout holds the tracked .backups/ files).
+20. "untested": arming says ARM-UNTESTED until the admission tests of GAP 8 exist and pass; codebase gates also wait
+    until `life-ctl.py gate-selftest` passed for this kit and these platform files.
+
+## Known exposures the operator accepts at arm (each is a GAP with the platform change that would close it)
+
+21. Candidate code (watched tests, codebase checks, the gate) runs with every TCP connect and bind denied, but it can
+    send UDP (GAP 15: the launcher has no UDP rule).
+22. Candidate code can change the mode, owner or times of paths it cannot read (GAP 16: Landlock does not cover
+    metadata); STOP and FREEZE then read as present (fail closed) and the STATE check holds LIFE.
+23. Fetched pages are downloaded and parsed outside the Landlock sandbox (they need the network and the .venv), in
+    their own scope with a 1 GiB memory and address-space limit and the platform's safe-fetch path.
+24. Benchmark templates run on the worker node host under per-process limits, timeout and an output cap, not in a job-wide
+    cgroup (GAP 7); only templates the operator wrote run.
+25. The gate's focused test runs inside the candidate's own process: it is a regression check, not an adversarial
+    oracle (GAP 19); the path rules, the local_fix rule, the model review and the operator's apply stand against a hostile
+    patch.
+26. Sandboxed code can write /dev/shm (GAP 17); LIFE removes every entry a run left, after the run.
+27. Byte pins cover the platform files LIFE runs directly, not everything they import (GAP 18).
+
+===== FILE: organs/codebase.lines.txt =====
+
+
+[This is part 10 of 26. Do not critique yet. Reply only with the word RECEIVED.]

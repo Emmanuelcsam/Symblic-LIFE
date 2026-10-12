@@ -1,0 +1,431 @@
+-- LIFE v2.3 registry (schema 5): /home/operator/.local/state/life/life.sqlite3
+-- The ONE authoritative store for control, identity, lineage, work items, runs, knowledge and metrics.
+-- Exactly one writer at a time: bin/life-tick.py, or bin/life-ctl.py for operator operations, under STATE/tick.lock.
+-- Lanes, models and agents never open this file. Applying this file twice is a no-op.
+-- Times are integer UTC Unix seconds written by Python int(time.time()). Ids are text and never NULL. Every count,
+-- depth, priority and budget is an INTEGER by type (typeof), not only by range.
+-- No credential, .env value or private-store value is ever written here.
+
+CREATE TABLE IF NOT EXISTS meta (
+  key   TEXT NOT NULL PRIMARY KEY,               -- one of life_common.META_KEYS (code refuses any other)
+  value TEXT NOT NULL
+);
+
+-- releases: immutable copies of genome/, organs/, policies/ under STATE/release/<n>/. Exactly one is active (the
+-- index forbids two; the tick and life-ctl refuse zero).
+CREATE TABLE IF NOT EXISTS releases (
+  release   INTEGER PRIMARY KEY CHECK (release >= 1),
+  at        INTEGER NOT NULL,
+  source    TEXT NOT NULL CHECK (source IN ('kit', 'adopt')),
+  manifest  TEXT NOT NULL,                       -- JSON {relative path: sha256}
+  active    INTEGER NOT NULL DEFAULT 0 CHECK (active IN (0, 1)),
+  note      TEXT NOT NULL DEFAULT ''
+);
+CREATE UNIQUE INDEX IF NOT EXISTS releases_one_active ON releases (active) WHERE active = 1;
+
+-- cells: one row per cell ever born. Birth facts (id, organ, kind, parent, depth, born_at) never change (trigger);
+-- state columns do (guarded by the tick). A child has its parent's organ and depth parent + 1 (trigger).
+CREATE TABLE IF NOT EXISTS cells (
+  cell_id           TEXT NOT NULL PRIMARY KEY,
+  organ             TEXT NOT NULL CHECK (organ IN ('command', 'learning', 'digest', 'codebase', 'immune',
+                                                   'selfdev', 'compute', 'database')),
+  kind              TEXT NOT NULL CHECK (kind = CASE WHEN organ IN ('codebase', 'selfdev', 'database') THEN 'agent' ELSE 'model' END),
+  parent_id         TEXT REFERENCES cells (cell_id),
+  depth             INTEGER NOT NULL CHECK (typeof(depth) = 'integer' AND depth BETWEEN 0 AND 10),
+  focus             TEXT NOT NULL CHECK (length(focus) BETWEEN 8 AND 120),
+  node              TEXT NOT NULL CHECK (node IN ('node-a', 'node-b', 'node-d', 'node-f', 'node-i')),
+  workspace         TEXT,                        -- agent cells only: /home/operator/symblicos/projects/life-<organ>-<depth>-<8hex>
+  state             TEXT NOT NULL CHECK (state IN ('active', 'dividing', 'quarantined', 'retired')),
+  failures_in_a_row INTEGER NOT NULL DEFAULT 0 CHECK (typeof(failures_in_a_row) = 'integer' AND failures_in_a_row >= 0),
+  items_done        INTEGER NOT NULL DEFAULT 0 CHECK (typeof(items_done) = 'integer' AND items_done >= 0),
+  idle_since        INTEGER,                     -- when the cell last became empty and idle; NULL while it has work
+  backlog_ticks     INTEGER NOT NULL DEFAULT 0 CHECK (typeof(backlog_ticks) = 'integer' AND backlog_ticks >= 0),
+  recent            TEXT NOT NULL DEFAULT '' CHECK (length(recent) <= 20),   -- last endings: d a f o
+  last_served_at    INTEGER NOT NULL DEFAULT 0,
+  born_at           INTEGER NOT NULL,
+  ended_at          INTEGER,
+  end_reason        TEXT CHECK (end_reason IS NULL OR end_reason IN ('divided', 'idle', 'owner', 'workspace')),
+  release           INTEGER NOT NULL REFERENCES releases (release),
+  CHECK (cell_id = organ || '.' || depth || '.' || substr(cell_id, -8) AND substr(cell_id, -8) NOT GLOB '*[^0-9a-f]*'
+         AND length(substr(cell_id, -8)) = 8),
+  CHECK ((parent_id IS NULL) = (depth = 0)),
+  CHECK ((state = 'retired') = (ended_at IS NOT NULL)),
+  CHECK ((workspace IS NOT NULL) = (kind = 'agent'))
+);
+CREATE INDEX IF NOT EXISTS cells_organ_state ON cells (organ, state);
+CREATE INDEX IF NOT EXISTS cells_node_state ON cells (node, state);
+CREATE UNIQUE INDEX IF NOT EXISTS cells_one_workspace ON cells (workspace) WHERE workspace IS NOT NULL;
+CREATE TRIGGER IF NOT EXISTS cells_lineage BEFORE INSERT ON cells
+WHEN NEW.parent_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM cells p WHERE p.cell_id = NEW.parent_id
+                                               AND p.organ = NEW.organ AND p.depth + 1 = NEW.depth)
+BEGIN SELECT RAISE(ABORT, 'a child has its parent''s organ and depth parent + 1'); END;
+CREATE TRIGGER IF NOT EXISTS cells_birth_facts BEFORE UPDATE OF cell_id, organ, kind, parent_id, depth, born_at ON cells
+BEGIN SELECT RAISE(ABORT, 'birth facts never change'); END;
+
+-- cell_events: append-only lifecycle log.
+CREATE TABLE IF NOT EXISTS cell_events (
+  seq      INTEGER PRIMARY KEY AUTOINCREMENT,
+  cell_id  TEXT NOT NULL REFERENCES cells (cell_id),
+  at       INTEGER NOT NULL,
+  event    TEXT NOT NULL CHECK (event IN ('born', 'divide_started', 'divided', 'divide_aborted', 'quarantined',
+                                          'released', 'retired', 'rung_up', 'rung_down', 'moved', 'workspace_made',
+                                          'workspace_failed', 'workspace_removed', 'revived')),
+  detail   TEXT NOT NULL DEFAULT '' CHECK (length(detail) <= 400)
+);
+
+-- cell_programs: the ladder rung a cell uses for each program, its last ten outcomes, and its last rung_up time.
+CREATE TABLE IF NOT EXISTS cell_programs (
+  cell_id    TEXT NOT NULL REFERENCES cells (cell_id),
+  program    TEXT NOT NULL,
+  rung       INTEGER NOT NULL DEFAULT 0 CHECK (typeof(rung) = 'integer' AND rung BETWEEN 0 AND 2),
+  window     TEXT NOT NULL DEFAULT '' CHECK (length(window) <= 10),   -- newest last: b(base) e(escalated) f(failed)
+  rung_up_at INTEGER NOT NULL DEFAULT 0,          -- no rung_down for RUNG_DOWN_HOLD seconds after it
+  PRIMARY KEY (cell_id, program)
+);
+
+-- items: one unit of work. An item belongs to one organ and, while queued or running, to one cell of THAT organ
+-- (trigger). Its identity (id, organ, kind, created_at) and its taint never change (trigger): approval is recorded
+-- beside the taint, never instead of it.
+CREATE TABLE IF NOT EXISTS items (
+  item_id      TEXT NOT NULL PRIMARY KEY CHECK (item_id = organ || ':' || substr(item_id, -16) AND length(item_id) = length(organ) + 17
+                                     AND substr(item_id, -16) NOT GLOB '*[^0-9a-f]*'),
+  organ        TEXT NOT NULL CHECK (organ IN ('command', 'learning', 'digest', 'codebase', 'immune', 'selfdev', 'compute',
+                                              'database')),
+  kind         TEXT NOT NULL CHECK (organ || '/' || kind IN ('command/command', 'learning/question', 'digest/source',
+                                     'codebase/finding', 'immune/patch', 'immune/proposal', 'selfdev/lesson',
+                                     'compute/experiment', 'database/request')),
+  cell_id      TEXT REFERENCES cells (cell_id),
+  stage        TEXT NOT NULL CHECK (organ || '/' || stage IN ('command/classify', 'learning/research', 'digest/fetch',
+                                     'digest/extract', 'digest/distill', 'codebase/confirm', 'codebase/triage',
+                                     'codebase/patch', 'codebase/gate', 'immune/review', 'selfdev/draft', 'selfdev/gate',
+                                     'compute/propose', 'compute/rank', 'compute/bench', 'database/draft', 'database/apply')),
+  state        TEXT NOT NULL CHECK (state IN ('queued', 'running', 'done', 'abstained', 'failed', 'owner')),
+  priority     INTEGER NOT NULL DEFAULT 1 CHECK (typeof(priority) = 'integer' AND priority IN (0, 1, 2)),
+  rung_extra   INTEGER NOT NULL DEFAULT 0 CHECK (typeof(rung_extra) = 'integer' AND rung_extra BETWEEN 0 AND 2),
+  attempts     INTEGER NOT NULL DEFAULT 0 CHECK (typeof(attempts) = 'integer' AND attempts >= 0),        -- request ids / job labels
+  infra_runs   INTEGER NOT NULL DEFAULT 0 CHECK (typeof(infra_runs) = 'integer' AND infra_runs >= 0),    -- operator at 6
+  faults       INTEGER NOT NULL DEFAULT 0 CHECK (typeof(faults) = 'integer' AND faults >= 0),            -- failed at 3
+  review_rounds INTEGER NOT NULL DEFAULT 0 CHECK (typeof(review_rounds) = 'integer' AND review_rounds >= 0),  -- operator at 2
+  dry_runs     INTEGER NOT NULL DEFAULT 0 CHECK (typeof(dry_runs) = 'integer' AND dry_runs >= 0),
+  start_refusals INTEGER NOT NULL DEFAULT 0 CHECK (typeof(start_refusals) = 'integer' AND start_refusals >= 0),  -- failed at 3
+  timeouts     INTEGER NOT NULL DEFAULT 0 CHECK (typeof(timeouts) = 'integer' AND timeouts >= 0),        -- escalates at 2
+  taint        TEXT NOT NULL CHECK (taint IN ('owner', 'web', 'code', 'model')),
+  approved     INTEGER NOT NULL DEFAULT 0 CHECK (approved IN (0, 1)),   -- the operator approved approved_sha (web/model text)
+  approved_sha TEXT NOT NULL DEFAULT '',          -- sha256 of the operative payload fields the operator read and approved
+  origin       TEXT NOT NULL DEFAULT '',          -- the item id, command id or fact id that produced it
+  payload      TEXT NOT NULL CHECK (length(payload) <= 16384),   -- closed JSON per kind and stage (life_common.PAYLOAD_KEYS)
+  outcome      TEXT NOT NULL DEFAULT '' CHECK (length(outcome) <= 400),
+  created_at   INTEGER NOT NULL,
+  updated_at   INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS items_cell_queue ON items (cell_id, state, priority, created_at);
+CREATE INDEX IF NOT EXISTS items_organ_state ON items (organ, state);
+CREATE INDEX IF NOT EXISTS items_origin ON items (origin);
+CREATE TRIGGER IF NOT EXISTS items_cell_organ_insert BEFORE INSERT ON items
+WHEN NEW.cell_id IS NOT NULL AND (SELECT organ FROM cells WHERE cell_id = NEW.cell_id) IS NOT NEW.organ
+BEGIN SELECT RAISE(ABORT, 'an item belongs only to a cell of its own organ'); END;
+CREATE TRIGGER IF NOT EXISTS items_cell_organ_update BEFORE UPDATE OF cell_id ON items
+WHEN NEW.cell_id IS NOT NULL AND (SELECT organ FROM cells WHERE cell_id = NEW.cell_id) IS NOT NEW.organ
+BEGIN SELECT RAISE(ABORT, 'an item belongs only to a cell of its own organ'); END;
+CREATE TRIGGER IF NOT EXISTS items_identity BEFORE UPDATE OF item_id, organ, kind, created_at, taint ON items
+BEGIN SELECT RAISE(ABORT, 'an item''s identity and taint never change'); END;
+
+-- calls: every genome program run, research run, division step and benchmark job (the node load ledger).
+CREATE TABLE IF NOT EXISTS calls (
+  call_id     TEXT NOT NULL PRIMARY KEY,
+  cell_id     TEXT NOT NULL REFERENCES cells (cell_id),
+  item_id     TEXT REFERENCES items (item_id),   -- NULL for division steps
+  program     TEXT NOT NULL CHECK (program IN ('classify-command', 'triage-error', 'extract-source', 'distill-lesson',
+                                               'propose-experiment', 'rank-experiment', 'review-patch', 'reproduce',
+                                               'assign-item', 'local-research', 'bench')),
+  release     INTEGER NOT NULL,
+  applicator  TEXT NOT NULL,                     -- ollama:<model>@<node> or job:<id>@<node>
+  node        TEXT NOT NULL CHECK (node IN ('node-a', 'node-b', 'node-d', 'node-f', 'node-i')),
+  outcome     TEXT NOT NULL CHECK (outcome IN ('done', 'failed', 'infra')),
+  model_calls INTEGER NOT NULL DEFAULT 0 CHECK (typeof(model_calls) = 'integer' AND model_calls >= 0),
+  started_at  INTEGER NOT NULL,
+  ended_at    INTEGER NOT NULL,
+  dir         TEXT NOT NULL,
+  detail      TEXT NOT NULL DEFAULT '' CHECK (length(detail) <= 400)
+);
+CREATE INDEX IF NOT EXISTS calls_node_time ON calls (node, ended_at);
+
+-- runs: every autogen run LIFE submits (agent cells). request_id -> run_id is autogen-<sha256(request_id)[:24]>.
+-- LIFE's own uncertainty is submit_unknown (resolved by re-sending the identical start: the server answers the
+-- existing run for the same request id); the server's terminal statuses are copied, then collected.
+CREATE TABLE IF NOT EXISTS runs (
+  request_id    TEXT NOT NULL PRIMARY KEY CHECK (length(request_id) <= 120),
+  run_id        TEXT NOT NULL UNIQUE CHECK (length(run_id) = 32),
+  cell_id       TEXT NOT NULL REFERENCES cells (cell_id),
+  item_id       TEXT NOT NULL REFERENCES items (item_id),
+  organ         TEXT NOT NULL,
+  workspace     TEXT NOT NULL,
+  node          TEXT NOT NULL,
+  engine        TEXT NOT NULL CHECK (engine = 'agy'),
+  policy_sha256 TEXT NOT NULL,
+  release       INTEGER NOT NULL,
+  base_commit   TEXT NOT NULL CHECK (length(base_commit) = 40),
+  statements_sha256 TEXT NOT NULL CHECK (length(statements_sha256) = 64),
+  model         TEXT NOT NULL DEFAULT '',        -- the agy model LIFE passed (--model; control/agy-model.txt)
+  effort        TEXT NOT NULL DEFAULT '',        -- the effort LIFE passed (--effort; life_common.AGY_EFFORT)
+  state         TEXT NOT NULL CHECK (state IN ('submitting', 'live', 'submit_unknown', 'not_submitted', 'completed',
+                                               'failed', 'stuck', 'cancelled', 'unknown', 'collected')),
+  cancel_cause  TEXT NOT NULL DEFAULT '' CHECK (cancel_cause IN ('', 'stop', 'age', 'mismatch', 'owner')),  -- the FIRST cause only
+  resends       INTEGER NOT NULL DEFAULT 0 CHECK (typeof(resends) = 'integer' AND resends >= 0),
+  submitted_at  INTEGER NOT NULL,
+  ended_at      INTEGER,
+  detail        TEXT NOT NULL DEFAULT '' CHECK (length(detail) <= 400)
+);
+CREATE INDEX IF NOT EXISTS runs_state ON runs (state);
+
+-- divisions: one row per division transaction (LIFE.md section 9). At most one is open at a time, fleet-wide.
+-- Stages: foci -> assign -> (agent organs) workspaces -> committed, or aborted. ticks counts the armed working ticks
+-- it has been open; release pins the release it started under.
+CREATE TABLE IF NOT EXISTS divisions (
+  division_id TEXT NOT NULL PRIMARY KEY,
+  parent_id   TEXT NOT NULL REFERENCES cells (cell_id),
+  stage       TEXT NOT NULL CHECK (stage IN ('foci', 'assign', 'workspaces', 'committed', 'aborted')),
+  release     INTEGER NOT NULL,
+  focus_a     TEXT,
+  focus_b     TEXT,
+  snapshot    TEXT NOT NULL,                     -- JSON list of the queued item ids at division start, queue order
+  assigned    TEXT NOT NULL DEFAULT '{}',        -- JSON {item_id: "a"|"b"} (assign-item answer, or parity on failure)
+  foci_retries INTEGER NOT NULL DEFAULT 0 CHECK (typeof(foci_retries) = 'integer' AND foci_retries >= 0),
+  ticks       INTEGER NOT NULL DEFAULT 0 CHECK (typeof(ticks) = 'integer' AND ticks >= 0),
+  last_step_tick INTEGER NOT NULL DEFAULT 0,
+  child_a     TEXT,
+  child_b     TEXT,
+  started_at  INTEGER NOT NULL,
+  ended_at    INTEGER,
+  reason      TEXT NOT NULL DEFAULT '' CHECK (length(reason) <= 400)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS divisions_one_open ON divisions ((1)) WHERE stage IN ('foci', 'assign', 'workspaces');
+
+-- commands: operator commands taken from STATE/inbox or control/agenda.json. The text stays here (STATE is 0700).
+CREATE TABLE IF NOT EXISTS commands (
+  command_id  TEXT NOT NULL PRIMARY KEY CHECK (length(command_id) = 16),  -- inbox: sha256(file name + "\n" + file text)[:16]
+  file        TEXT NOT NULL,                     -- the inbox file name, or agenda:<entry id>
+  text        TEXT NOT NULL CHECK (length(text) BETWEEN 1 AND 4000),
+  organ       TEXT CHECK (organ IS NULL OR organ IN ('learning', 'codebase', 'database', 'compute', 'selfdev',
+                                                     'immune', 'heartbeat', 'none')),
+  urgency     TEXT CHECK (urgency IS NULL OR urgency IN ('low', 'normal', 'high')),
+  restated    TEXT,
+  merged_into TEXT,                              -- a merged command: the command whose item already does the work
+  state       TEXT NOT NULL CHECK (state IN ('received', 'routed', 'dispatched', 'owner', 'done', 'failed')),
+  created_at  INTEGER NOT NULL,
+  updated_at  INTEGER NOT NULL                   -- also: when its report was last examined (round-robin)
+);
+
+-- sources: the ONE source-dedup authority for every learning cell. key = symblic_autogen.items_key(url), or
+-- 'sha256:' + 56 hex for a key longer than 196 characters.
+CREATE TABLE IF NOT EXISTS sources (
+  source_key   TEXT NOT NULL PRIMARY KEY CHECK (length(source_key) <= 200),
+  url          TEXT NOT NULL CHECK (url LIKE 'http://%' OR url LIKE 'https://%'),
+  title        TEXT NOT NULL DEFAULT '' CHECK (length(title) <= 200),
+  question_id  TEXT NOT NULL,                    -- the question that found it first
+  found_at     INTEGER NOT NULL,
+  text_path    TEXT,
+  text_sha256  TEXT,
+  fetch_state  TEXT NOT NULL DEFAULT 'pending' CHECK (fetch_state IN ('pending', 'fetched', 'empty', 'failed', 'duplicate')),
+  duplicate_of TEXT,                             -- fetch_state duplicate: the source whose snapshot has the same sha256
+  redacted     INTEGER NOT NULL DEFAULT 0 CHECK (redacted IN (0, 1))   -- credential-shaped spans were redacted before storing
+);
+CREATE INDEX IF NOT EXISTS sources_text ON sources (text_sha256);
+-- question_sources: every question a source answered (a known source counts for a new question without a refetch,
+-- while its fetch_state is pending or fetched).
+CREATE TABLE IF NOT EXISTS question_sources (
+  question_id  TEXT NOT NULL,
+  source_key   TEXT NOT NULL REFERENCES sources (source_key),
+  at           INTEGER NOT NULL,
+  PRIMARY KEY (question_id, source_key)
+);
+-- answers: the LATEST research answer per question (model text, unverified, taint web; shown in command reports).
+CREATE TABLE IF NOT EXISTS answers (
+  item_id     TEXT NOT NULL PRIMARY KEY,
+  applicator  TEXT NOT NULL,
+  answer      TEXT NOT NULL CHECK (length(answer) <= 4000),
+  at          INTEGER NOT NULL
+);
+
+-- knowledge: one quote-verified claim per row. quote_verified means only that the quote occurs in the stored text
+-- snapshot (NFC, whole words); the claim's truth is NOT established. claim_status 'superseded' is reserved: no LIFE
+-- path sets it in v2.2.
+CREATE TABLE IF NOT EXISTS knowledge (
+  fact_id        TEXT NOT NULL PRIMARY KEY CHECK (length(fact_id) = 16),    -- sha256(source_key + "\n" + quote)[:16]
+  source_key     TEXT NOT NULL REFERENCES sources (source_key),
+  text_sha256    TEXT NOT NULL,
+  claim          TEXT NOT NULL CHECK (length(claim) BETWEEN 20 AND 300),
+  quote          TEXT NOT NULL CHECK (length(quote) BETWEEN 12 AND 400),
+  quote_verified INTEGER NOT NULL CHECK (quote_verified = 1),   -- the quote occurs in the stored (possibly redacted) snapshot
+  claim_status   TEXT NOT NULL DEFAULT 'unreviewed' CHECK (claim_status IN ('unreviewed', 'superseded')),
+  applicator     TEXT NOT NULL,
+  created_at     INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS knowledge_source ON knowledge (source_key);
+
+-- patches: codebase bundles (STATE/bundles/patches/<patch_id>/). Never applied by LIFE; the operator runs life-ctl apply.
+CREATE TABLE IF NOT EXISTS patches (
+  patch_id      TEXT NOT NULL PRIMARY KEY CHECK (length(patch_id) = 16),  -- sha256(diff text)[:16]
+  item_id       TEXT NOT NULL REFERENCES items (item_id),   -- the finding item
+  base_commit   TEXT NOT NULL CHECK (length(base_commit) = 40),
+  files         TEXT NOT NULL,                   -- JSON list of changed paths
+  change_class  TEXT NOT NULL CHECK (change_class IN ('test_only', 'comment_or_doc', 'local_fix')),
+  path_class    TEXT NOT NULL CHECK (path_class IN ('tests', 'docs', 'restart_gated', 'live_static', 'other', 'mixed')),
+  gate_rc       INTEGER NOT NULL,
+  review        TEXT NOT NULL DEFAULT '' CHECK (review IN ('', 'accept', 'reject', 'needs_work')),
+  review_reason TEXT NOT NULL DEFAULT '',
+  state         TEXT NOT NULL CHECK (state IN ('bundled', 'ready', 'rejected', 'owner', 'applied', 'reverted')),
+  created_at    INTEGER NOT NULL,
+  updated_at    INTEGER NOT NULL
+);
+
+-- proposals: selfdev genome proposals (STATE/bundles/proposals/<proposal_id>/). Adopted only by life-ctl adopt.
+CREATE TABLE IF NOT EXISTS proposals (
+  proposal_id  TEXT NOT NULL PRIMARY KEY CHECK (length(proposal_id) = 16),   -- sha256(lesson item id + "\n" + sha256(new text))[:16]
+  item_id      TEXT NOT NULL REFERENCES items (item_id),   -- the lesson item
+  program      TEXT NOT NULL,
+  base_release INTEGER NOT NULL,
+  base_sha256  TEXT NOT NULL,
+  new_sha256   TEXT NOT NULL,
+  review       TEXT NOT NULL DEFAULT '' CHECK (review IN ('', 'accept', 'reject', 'needs_work')),
+  review_reason TEXT NOT NULL DEFAULT '',
+  state        TEXT NOT NULL CHECK (state IN ('bundled', 'ready', 'rejected', 'owner', 'stale', 'adopted')),
+  created_at   INTEGER NOT NULL,
+  updated_at   INTEGER NOT NULL
+);
+
+-- experiments and results: compute organ. Measurements run only operator-approved benchmark templates.
+CREATE TABLE IF NOT EXISTS experiments (
+  experiment_id TEXT NOT NULL PRIMARY KEY CHECK (length(experiment_id) = 16),  -- sha256(bench_sha256 + "\n" + param)[:16]
+  item_id       TEXT NOT NULL REFERENCES items (item_id),
+  benchmark_id  TEXT NOT NULL,
+  bench_sha256  TEXT NOT NULL CHECK (length(bench_sha256) = 64),     -- the template entry as measured
+  param         TEXT NOT NULL CHECK (length(param) BETWEEN 1 AND 64),
+  hypothesis    TEXT NOT NULL CHECK (length(hypothesis) BETWEEN 20 AND 300),
+  better        TEXT NOT NULL CHECK (better IN ('lower', 'higher')),
+  min_gain_pct  INTEGER NOT NULL CHECK (typeof(min_gain_pct) = 'integer' AND min_gain_pct BETWEEN 1 AND 90),
+  feasible      INTEGER CHECK (feasible IS NULL OR feasible IN (0, 1)),
+  novelty       TEXT CHECK (novelty IS NULL OR novelty IN ('none', 'small', 'large')),
+  risk          TEXT CHECK (risk IS NULL OR risk IN ('low', 'medium', 'high')),
+  score         INTEGER CHECK (score IS NULL OR score BETWEEN 0 AND 100),
+  state         TEXT NOT NULL CHECK (state IN ('proposed', 'ranked', 'ineligible', 'measured', 'failed')),
+  created_at    INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS results (
+  experiment_id   TEXT NOT NULL PRIMARY KEY REFERENCES experiments (experiment_id),
+  node            TEXT NOT NULL,
+  job_id          TEXT NOT NULL,
+  measurements    TEXT NOT NULL,                 -- JSON list of decimal strings in run order (warm-up first, then BENCH_ORDER)
+  gains_pct       TEXT NOT NULL,                 -- JSON list, one exact fraction "n/d" per pair, in the template's better direction
+  median_gain_pct TEXT NOT NULL,                 -- exact fraction "n/d"; display rounding never decides
+  passed          INTEGER NOT NULL CHECK (passed IN (0, 1)),
+  ran_at          INTEGER NOT NULL
+);
+
+-- migrations LIFE applies to (or refused for) the organism database (organism.sqlite3). 'applying' is written,
+-- with the text already in STATE/bundles/migrations/<id>.sql, BEFORE the organism transaction (crash recovery).
+CREATE TABLE IF NOT EXISTS migrations (
+  migration_id TEXT NOT NULL PRIMARY KEY CHECK (length(migration_id) BETWEEN 6 AND 45),
+  item_id      TEXT REFERENCES items (item_id), -- NULL for a migration imported from the organism's own ledger
+  sha256       TEXT NOT NULL,
+  state        TEXT NOT NULL CHECK (state IN ('applying', 'applied', 'refused')),
+  detail       TEXT NOT NULL DEFAULT '' CHECK (length(detail) <= 400),
+  at           INTEGER NOT NULL
+);
+
+-- samples and governor: metabolism (LIFE.md section 10). Samples are written only from a readable status list;
+-- samples older than 7 days are deleted daily.
+CREATE TABLE IF NOT EXISTS samples (
+  at      INTEGER NOT NULL,
+  node    TEXT NOT NULL,
+  online  INTEGER NOT NULL CHECK (online IN (0, 1)),
+  cpu     REAL,                                   -- 100 x vitals.load[1] / vitals.cpus (5-minute load per processor), NULL when missing
+  temp    REAL,                                   -- vitals.temp: degrees C, NULL when missing or invalid
+  mem_avail_mib INTEGER,                          -- vitals.memavail bytes // 1048576
+  PRIMARY KEY (at, node)
+);
+CREATE TABLE IF NOT EXISTS governor (
+  id                 INTEGER PRIMARY KEY CHECK (id = 1),
+  at                 INTEGER NOT NULL,
+  state              TEXT NOT NULL CHECK (state IN ('work', 'rest', 'hold')),
+  continuous_seconds INTEGER NOT NULL CHECK (continuous_seconds >= 0),
+  quiet_seconds      INTEGER NOT NULL CHECK (quiet_seconds >= 0),
+  hot                TEXT NOT NULL DEFAULT '[]',  -- JSON list of LIFE nodes currently hot
+  reasons            TEXT NOT NULL DEFAULT '[]',  -- JSON list of hold reasons
+  node_rest          TEXT NOT NULL DEFAULT '{}',  -- JSON {node: rest start}: per-node duty-cycle rests
+  observed           INTEGER NOT NULL DEFAULT 0 CHECK (observed IN (0, 1))   -- this sample was complete (quiet credit needs two)
+);
+
+-- node_holds: independent holds of a node, keyed (node, cause, subject), so one never overwrites or shortens another
+-- (life_common.hold_node). cause infra: the node answered infra; timeout: subject = the program that timed out (only
+-- that program waits); orphan: subject = a call id a killed tick or STOP may have left running; job: subject = a
+-- benchmark job id or label that is unknown or lost, until = 0 (no expiry: the listing or the operator releases it).
+CREATE TABLE IF NOT EXISTS node_holds (
+  node    TEXT NOT NULL CHECK (node IN ('node-a', 'node-b', 'node-d', 'node-f', 'node-i')),
+  cause   TEXT NOT NULL CHECK (cause IN ('infra', 'timeout', 'orphan', 'job')),
+  subject TEXT NOT NULL DEFAULT '',
+  until   INTEGER NOT NULL CHECK (typeof(until) = 'integer' AND until >= 0 AND (until > 0 OR cause = 'job')),
+  reason  TEXT NOT NULL DEFAULT '' CHECK (length(reason) <= 400),
+  PRIMARY KEY (node, cause, subject)
+);
+
+-- call_intents: written in the same transaction as a slot action's budget charge, BEFORE its process starts, and
+-- deleted when its result is recorded. A row a killed tick or STOP left behind holds its node ORPHAN_HOLD_SECONDS
+-- (division steps have no item, so items alone cannot say a call may still run).
+CREATE TABLE IF NOT EXISTS call_intents (
+  call_id    TEXT NOT NULL PRIMARY KEY,
+  node       TEXT NOT NULL CHECK (node IN ('node-a', 'node-b', 'node-d', 'node-f', 'node-i')),
+  cell_id    TEXT NOT NULL REFERENCES cells (cell_id),
+  item_id    TEXT REFERENCES items (item_id),   -- NULL for a division step
+  program    TEXT NOT NULL,
+  started_at INTEGER NOT NULL
+);
+
+-- workspace_guard: a sandboxed run (watched test, confirmation, gate) in a workspace is recorded here, with the
+-- git_meta_sha256 taken before it, in its own committed transaction BEFORE the run, and removed after the after-hash
+-- matched. A row a killed tick left behind means the run's end was never checked: the next tick deletes that
+-- workspace (it is re-created) and trusted git never runs in it.
+CREATE TABLE IF NOT EXISTS workspace_guard (
+  workspace TEXT NOT NULL PRIMARY KEY,
+  sha256    TEXT NOT NULL CHECK (length(sha256) = 64),
+  at        INTEGER NOT NULL
+);
+
+-- budget: per UTC day counters (charged before the work starts; never refunded).
+CREATE TABLE IF NOT EXISTS budget (
+  day            TEXT NOT NULL PRIMARY KEY CHECK (length(day) = 10 AND day GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'),   -- YYYY-MM-DD (UTC)
+  program_runs   INTEGER NOT NULL DEFAULT 0 CHECK (typeof(program_runs) = 'integer' AND program_runs >= 0),
+  model_calls    INTEGER NOT NULL DEFAULT 0 CHECK (typeof(model_calls) = 'integer' AND model_calls >= 0),
+  agent_runs     INTEGER NOT NULL DEFAULT 0 CHECK (typeof(agent_runs) = 'integer' AND agent_runs >= 0),
+  bench_jobs     INTEGER NOT NULL DEFAULT 0 CHECK (typeof(bench_jobs) = 'integer' AND bench_jobs >= 0),
+  births         INTEGER NOT NULL DEFAULT 0 CHECK (typeof(births) = 'integer' AND births >= 0),
+  self_questions INTEGER NOT NULL DEFAULT 0 CHECK (typeof(self_questions) = 'integer' AND self_questions >= 0)
+);
+
+-- metrics: per organ per UTC day.
+CREATE TABLE IF NOT EXISTS metrics (
+  organ           TEXT NOT NULL CHECK (organ IN ('command', 'learning', 'digest', 'codebase', 'immune', 'selfdev',
+                                                 'compute', 'database')),
+  day             TEXT NOT NULL CHECK (length(day) = 10 AND day GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'),
+  items_done      INTEGER NOT NULL DEFAULT 0 CHECK (typeof(items_done) = 'integer' AND items_done >= 0),
+  items_failed    INTEGER NOT NULL DEFAULT 0 CHECK (typeof(items_failed) = 'integer' AND items_failed >= 0),
+  items_abstained INTEGER NOT NULL DEFAULT 0 CHECK (typeof(items_abstained) = 'integer' AND items_abstained >= 0),
+  program_runs    INTEGER NOT NULL DEFAULT 0 CHECK (typeof(program_runs) = 'integer' AND program_runs >= 0),
+  agent_runs      INTEGER NOT NULL DEFAULT 0 CHECK (typeof(agent_runs) = 'integer' AND agent_runs >= 0),
+  PRIMARY KEY (organ, day)
+);
+
+-- notices: what the operator must see. (kind, subject) is the condition key: while one is open a repeat only counts.
+-- notice_id = sha256(kind, subject, at, 8 random hex)[:12]. Acknowledging never clears the condition itself.
+-- kind is one of life_common.NOTICE_KINDS (code refuses any other).
+CREATE TABLE IF NOT EXISTS notices (
+  notice_id TEXT NOT NULL PRIMARY KEY CHECK (length(notice_id) = 12),
+  kind      TEXT NOT NULL CHECK (length(kind) BETWEEN 1 AND 40 AND kind NOT GLOB '*[^a-z_]*'),
+  subject   TEXT NOT NULL CHECK (length(subject) <= 120),   -- life_common.notice_subject: the full condition key
+  text      TEXT NOT NULL CHECK (length(text) <= 600),
+  state     TEXT NOT NULL CHECK (state IN ('open', 'acked')),
+  at        INTEGER NOT NULL CHECK (typeof(at) = 'integer'),
+  last_at   INTEGER NOT NULL CHECK (typeof(last_at) = 'integer'),
+  count     INTEGER NOT NULL DEFAULT 1 CHECK (typeof(count) = 'integer' AND count >= 1)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS notices_open ON notices (kind, subject) WHERE state = 'open';

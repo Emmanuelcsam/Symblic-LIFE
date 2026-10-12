@@ -1,0 +1,16 @@
+# LIFE required canaries. bin/life-tick.py runs every line once an hour, and at every tick while no round has ever passed
+# or the last round failed (before it polls runs)
+# (argv split by shlex, no shell, cwd STATE, 60 s per line, 600 s per round; a line not reached counts as failed).
+# {release_dir} = the active release folder, {kit} = this kit. Any failure holds all new work and opens a
+# canary_failed notice until a later round passes (life-ctl.py canaries runs one now). Calls no model.
+# VALIDATE.sh requires exactly these ten lines: bin/symblic check on each of the nine programs, then the registry.
+/home/operator/host-checkout/bin/symblic check {release_dir}/genome/classify-command.sym
+/home/operator/host-checkout/bin/symblic check {release_dir}/genome/triage-error.sym
+/home/operator/host-checkout/bin/symblic check {release_dir}/genome/extract-source.sym
+/home/operator/host-checkout/bin/symblic check {release_dir}/genome/distill-lesson.sym
+/home/operator/host-checkout/bin/symblic check {release_dir}/genome/propose-experiment.sym
+/home/operator/host-checkout/bin/symblic check {release_dir}/genome/rank-experiment.sym
+/home/operator/host-checkout/bin/symblic check {release_dir}/genome/review-patch.sym
+/home/operator/host-checkout/bin/symblic check {release_dir}/genome/reproduce.sym
+/home/operator/host-checkout/bin/symblic check {release_dir}/genome/assign-item.sym
+/usr/bin/python3 -B {kit}/bin/life-check.py registry

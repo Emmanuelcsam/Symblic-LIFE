@@ -1,0 +1,18 @@
+program LIFE source fact extractor.
+use profile=verified, context=none, determine=false, solve=false.
+note Worker of a digest cell, extract stage. One fetched source text snapshot in, one quote-checked claim or an abstention out. The kernel checks that the quote occurs verbatim in the text (quotes(): whole words, NFC, runs of white space as one); code checks it again against the stored snapshot before a knowledge row is written. quote_verified means only that: the claim's truth is not established. Worst case 2 + 3 + 4 = 9 calls.
+given source_id: Text.
+given source_url: Text.
+given source_text: Text.
+ask supported: Bool "Does this text state at least one specific factual claim that can be quoted from it?" from source_text with effort=low, retries=1
+if supported then
+  ask claim: Text up to 40 words "State one specific factual claim this text supports, in your own words." from source_text with effort=medium, retries=2
+  ensure len(claim) >= 20 and len(claim) <= 300 else retry because "a claim is between twenty and three hundred characters".
+  ask quote: Text "Copy, word for word, the shortest span of the text that states the claim. Copy it exactly; never shorten, join or paraphrase." from source_text, claim with effort=low, retries=3
+  ensure quotes(source_text, quote) else retry because "the quote must be copied exactly from the text".
+  ensure len(quote) >= 12 and len(quote) <= 400 else retry because "the quote is between twelve and four hundred characters".
+  let fact = {source: source_id, url: source_url, supported: true, claim: claim, quote: quote}.
+else
+  let fact = {source: source_id, url: source_url, supported: false, claim: "", quote: ""}.
+end.
+return fact.

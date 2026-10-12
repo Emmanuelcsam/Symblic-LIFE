@@ -1,0 +1,13 @@
+program LIFE experiment proposer.
+use profile=verified, context=none, determine=false, solve=false.
+note Worker of a compute cell, propose stage. One seed (a lesson or an operator command) and the operator's benchmark catalogue in, one typed experiment out. The model never writes a command and never sets the pass rule: it picks a catalogue id and a parameter; code checks the id exists and the parameter FULLY matches that benchmark's param_rx (no word is picked out of a longer answer; a mismatch is a failed answer that escalates), and the operator's template fixes which direction is better and the minimum gain. Worst case 2 + 2 + 2 = 6 calls.
+given seed_text: Text.
+given catalogue: Text.
+ask benchmark_id: Text up to 6 words "Which benchmark id from this catalogue best tests the idea? Answer with the id only. Idea: {seed_text} Catalogue: {catalogue}" from seed_text, catalogue with effort=medium, retries=1
+ensure len(benchmark_id) >= 2 and len(benchmark_id) <= 40 else retry because "a benchmark id is between two and forty characters".
+ask param: Text up to 4 words "Which parameter value should the candidate run use? Answer with one value that fully matches the allowed parameter pattern of that benchmark in the catalogue, and nothing else. Idea: {seed_text} Catalogue: {catalogue}" from seed_text, catalogue, benchmark_id with effort=medium, retries=1
+ensure len(param) >= 1 and len(param) <= 64 else retry because "a parameter is between one and sixty-four characters".
+ask hypothesis: Text up to 40 words "State the hypothesis this measurement tests, comparing the candidate parameter with the benchmark's baseline named in the catalogue." from seed_text, catalogue, benchmark_id, param with effort=low, retries=1
+ensure len(hypothesis) >= 20 and len(hypothesis) <= 300 else retry because "a hypothesis is between twenty and three hundred characters".
+let experiment = {benchmark_id: trim(benchmark_id), param: trim(param), hypothesis: hypothesis}.
+return experiment.

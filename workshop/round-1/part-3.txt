@@ -1,0 +1,373 @@
+[LIFE critique packet, part 3 of 5]
+
+
+
+===== FILE: README.md =====
+# LIFE v1 — how to bring the cluster to life (and the kill switch)
+
+This folder is a **script kit**, not a running system. Nothing here has been started. The operator
+starts it, once, when they choose. Read this file, then `LIFE.md` (the complete master script).
+
+LIFE turns the cluster into a perpetually living, self-improving organism built entirely from the
+existing Symblic autogen engine (`bin/symblic-task`), the formal language (`bin/symblic`) run on
+lightweight local models, and `bin/local-research`. The host only orchestrates; models run on the
+worker nodes. Models propose; code decides every acceptance and every reproduction.
+
+## What it is made of
+
+- **Ten organs**, each its own perpetual (or, for the database, bounded) autogen run:
+  `organs/<organ>.lines.txt` (the statement) + `policies/<organ>.json` (the policy).
+- **Six genome programs** the lightweight models run as typed decisions with kernel checks:
+  `genome/*.sym`.
+- **Reproduction by code**: `spawn/PROTOCOL.md` + `bin/life-spawn-tick.py` (the orchestrator).
+- **Databases**: `db/schema.sql` (knowledge, lineage, metrics, commands, experiments).
+- **Checks**: `checks/*.sh`. **Observability**: `bin/life-status.py`.
+
+## Start it (operator, on the host)
+
+1. **Validate the kit (safe, no model, no agent, no network):**
+   ```
+   docs/life/VALIDATE.sh      # prints PASS/FAIL per file; must end ALL PASS
+   ```
+2. **Warn before any restart** — LIFE starts no server changes, but confirm the dashboard is up
+   and `DASH_URL=http://127.0.0.1:8080` resolves to this machine.
+3. **Seed the organism:**
+   ```
+   docs/life/bin/life-seed.sh     # creates workspace life, starts the 10 organ runs
+   ```
+   It asks you to type `START`. It creates `/home/operator/symblicos/projects/life` (git-backed),
+   the per-organ folders, copies `db/schema.sql`, and starts each organ as its own run on its
+   node. It calls only `bin/symblic-task` — no model is called by a start.
+4. **Watch it live:**
+   ```
+   docs/life/bin/life-status.py
+   bin/symblic-task autogen list
+   bin/symblic-task autogen get life-learning --tasks
+   ```
+5. **Turn on reproduction (optional, later):** install a systemd *user* timer that runs
+   `bin/life-spawn-tick.py` every few minutes. The unit text is in `LIFE.md` §9. Until you install
+   it, cells never divide — the ten seed organs simply run and rest. The tick is pure code: it
+   validates queued spawn records (lint + normalize + budget + depth + dedup) and starts the valid
+   ones. Nothing restarts itself; an older/stuck run needs `bin/symblic-task autogen resume`.
+
+## KILL SWITCH
+
+- **Freeze reproduction instantly:** create the stop file.
+  ```
+  touch /home/operator/symblicos/projects/life/STOP
+  ```
+  `bin/life-spawn-tick.py` exits 3 and births nothing while `STOP` exists. Running lanes finish
+  their current generation and then rest (they are perpetual; they wait `interval_seconds`).
+- **Stop a single organ:** `bin/symblic-task autogen cancel life-<organ>`.
+- **Stop everything:**
+  ```
+  for r in $(bin/symblic-task autogen list | awk '/life-/{print $1}'); do bin/symblic-task autogen cancel "$r"; done
+  ```
+- **Cool the hardware:** `curl` is not used by LIFE; use the dashboard high-power mode **cool** control
+  (operator-only) to pin every worker node to its cool thermal mode. LIFE's metabolism organ never turns cool off.
+- Remove `STOP` to allow reproduction again. Cancelled runs do not restart themselves; re-seed or
+  `autogen resume` the ones you want back.
+
+## Safety summary
+
+No credentials or private-store values are ever written by LIFE. Guest internet is untouched
+(off). No SSH bypass, no worker node tunnel. Codebase patches reach the live checkout only through the
+existing Work→Apply path and only for the change classes the master script permits; restart-gated
+changes are queued as a request for you, never applied by a cell. The heat rule is enforced by the
+metabolism organ and the orchestrator's heat gate.
+===== END README.md =====
+
+===== FILE: organs/codebase.lines.txt =====
+Read the findings in the folder /home/operator/symblicos/projects/life/organ-codebase/findings, pick one small finding whose change class the master script permits, write a proposed patch and its focused test into the folder /home/operator/symblicos/projects/life/organ-codebase/patches, run the focused test, and verify this batch by writing the finding id and the test result to the file verify.txt.
+===== END organs/codebase.lines.txt =====
+
+===== FILE: organs/command.lines.txt =====
+Read every file in the folder /home/operator/symblicos/projects/life/organ-command/inbox, classify each new operator command into one organ and urgency by running the command classifier, append one JSON line per command to the file /home/operator/symblicos/projects/life/organ-command/routed.jsonl, and verify this batch by writing the count of routed commands to the file verify.txt.
+===== END organs/command.lines.txt =====
+
+===== FILE: organs/compute.lines.txt =====
+Read the ranked experiments in the file /home/operator/symblicos/projects/life/organ-compute/experiments.jsonl, run the highest-scoring experiment whose measurement command fits one node and fifteen minutes, write its hypothesis, command, measured number and threshold into the folder /home/operator/symblicos/projects/life/organ-compute/results, and verify this batch by writing the experiment id and whether the threshold passed to the file verify.txt.
+===== END organs/compute.lines.txt =====
+
+===== FILE: organs/database.lines.txt =====
+Create the file /home/operator/symblicos/projects/life/organ-database/apply.sh that runs sqlite3 on the database file life.sqlite3 in the folder /home/operator/symblicos/projects/life/db and applies the schema file schema.sql, exiting nonzero on any sqlite error.
+Create the file /home/operator/symblicos/projects/life/db/schema.sql defining the tables knowledge, lineage, metrics, commands and experiments with the exact columns and types named in the master script, using create table if not exists so a rerun is a no-op.
+Create the file /home/operator/symblicos/projects/life/organ-database/migrations/0001_init.sql holding the same create table if not exists statements so the first migration is idempotent and leaves existing rows untouched.
+Create the file /home/operator/symblicos/projects/life/organ-database/check_schema.sh that runs sqlite3 on the database file life.sqlite3 and confirms every expected table and column exists, printing one line per table and exiting nonzero when a table or column is missing.
+Verify the database build by running check_schema.sh in the folder /home/operator/symblicos/projects/life/organ-database and writing its full output and the exit status to the file verify.txt.
+===== END organs/database.lines.txt =====
+
+===== FILE: organs/digest.lines.txt =====
+Read the unprocessed sources in the file /home/operator/symblicos/projects/life/organ-digest/sources.jsonl, extract one checked fact per source by running the source fact extractor so every quote is copied verbatim, append one JSON line per fact to the file /home/operator/symblicos/projects/life/organ-digest/facts.jsonl, and verify this batch by writing the count of new facts to the file verify.txt.
+===== END organs/digest.lines.txt =====
+
+===== FILE: organs/heartbeat.lines.txt =====
+Read the ledgers and verify files produced by every organ under the folder /home/operator/symblicos/projects/life, summarise each organ's last generation, new items and failures, write one status snapshot to the file /home/operator/symblicos/projects/life/organ-heartbeat/status.json, and verify this snapshot by writing the number of organs seen to the file verify.txt.
+===== END organs/heartbeat.lines.txt =====
+
+===== FILE: organs/immune.lines.txt =====
+Read the open patches in the folder /home/operator/symblicos/projects/life/organ-codebase/patches and the canary list in the file /home/operator/symblicos/projects/life/organ-immune/canaries.txt, run each canary check and one adversarial patch review, record each verdict and any quarantine to the file /home/operator/symblicos/projects/life/organ-immune/verdicts.jsonl, and verify this batch by writing the count of rejected or quarantined items to the file verify.txt.
+===== END organs/immune.lines.txt =====
+
+===== FILE: organs/learning.lines.txt =====
+Research the open questions listed in the file /home/operator/symblicos/projects/life/organ-learning/questions.txt, find three sources with a DOI or URL that are not already in the index, append one JSON line per source to the file /home/operator/symblicos/projects/life/organ-learning/sources.jsonl, and verify this batch by writing the three new source keys to the file verify.txt.
+===== END organs/learning.lines.txt =====
+
+===== FILE: organs/metabolism.lines.txt =====
+Read the cluster status and capacity and highpower state from the dashboard loopback api, compute the current continuous all-worker node load minutes and free capacity, write one metabolism row with the readings and whether fan-out is allowed to the file /home/operator/symblicos/projects/life/organ-metabolism/metabolism.jsonl, and verify this batch by writing the fan-out decision to the file verify.txt.
+===== END organs/metabolism.lines.txt =====
+
+===== FILE: organs/selfdev.lines.txt =====
+Read the lessons in the file /home/operator/symblicos/projects/life/organ-selfdev/lessons.jsonl, draft one improvement to a genome program or organ policy under the folder /home/operator/symblicos/projects/life/organ-selfdev/proposals keeping every existing part that still applies, add a check that proves the improvement, and verify this batch by writing the proposal id and its check result to the file verify.txt.
+===== END organs/selfdev.lines.txt =====
+
+===== FILE: policies/codebase.json =====
+{
+  "version": 1,
+  "perpetual": true,
+  "interval_seconds": 1800,
+  "attempt_seconds": 3600,
+  "wall_seconds": 43200,
+  "candidates": 1,
+  "regenerate": 3,
+  "agents_max": 16,
+  "saturation": 4,
+  "strategies": ["fresh", "feedback", "other_engine"],
+  "syntax": true,
+  "require_change": true,
+  "checks": {"0": ["test -s verify.txt"]},
+  "final": []
+}
+===== END policies/codebase.json =====
+
+===== FILE: policies/command.json =====
+{
+  "version": 1,
+  "perpetual": true,
+  "interval_seconds": 120,
+  "attempt_seconds": 600,
+  "wall_seconds": 21600,
+  "candidates": 1,
+  "regenerate": 2,
+  "agents_max": 12,
+  "saturation": 0,
+  "strategies": ["fresh", "feedback", "other_engine"],
+  "syntax": true,
+  "require_change": true,
+  "checks": {"0": ["test -s verify.txt"]},
+  "final": []
+}
+===== END policies/command.json =====
+
+===== FILE: policies/compute.json =====
+{
+  "version": 1,
+  "perpetual": true,
+  "interval_seconds": 3600,
+  "attempt_seconds": 3600,
+  "wall_seconds": 43200,
+  "candidates": 1,
+  "regenerate": 2,
+  "agents_max": 12,
+  "saturation": 4,
+  "strategies": ["fresh", "feedback", "other_engine"],
+  "syntax": true,
+  "require_change": true,
+  "checks": {"0": ["test -s verify.txt"]},
+  "final": []
+}
+===== END policies/compute.json =====
+
+===== FILE: policies/database.json =====
+{
+  "version": 1,
+  "perpetual": false,
+  "until_done": false,
+  "candidates": 1,
+  "regenerate": 2,
+  "depth": 1,
+  "children": 4,
+  "generations": 2,
+  "agents_max": 12,
+  "attempt_seconds": 3600,
+  "wall_seconds": 21600,
+  "strategies": ["fresh", "feedback", "other_engine"],
+  "syntax": true,
+  "require_change": true,
+  "checks": {"4": ["test -s verify.txt"]},
+  "final": ["bash organ-database/check_schema.sh"]
+}
+===== END policies/database.json =====
+
+===== FILE: policies/digest.json =====
+{
+  "version": 1,
+  "perpetual": true,
+  "interval_seconds": 900,
+  "attempt_seconds": 3600,
+  "wall_seconds": 86400,
+  "candidates": 1,
+  "regenerate": 2,
+  "agents_max": 24,
+  "saturation": 3,
+  "strategies": ["fresh", "feedback", "other_engine"],
+  "syntax": true,
+  "require_change": true,
+  "checks": {"0": ["test -s verify.txt"]},
+  "final": []
+}
+===== END policies/digest.json =====
+
+===== FILE: policies/heartbeat.json =====
+{
+  "version": 1,
+  "perpetual": true,
+  "interval_seconds": 300,
+  "attempt_seconds": 600,
+  "wall_seconds": 86400,
+  "candidates": 1,
+  "regenerate": 1,
+  "agents_max": 8,
+  "saturation": 0,
+  "strategies": ["fresh", "feedback"],
+  "syntax": true,
+  "require_change": true,
+  "checks": {"0": ["test -s verify.txt"]},
+  "final": []
+}
+===== END policies/heartbeat.json =====
+
+===== FILE: policies/immune.json =====
+{
+  "version": 1,
+  "perpetual": true,
+  "interval_seconds": 1800,
+  "attempt_seconds": 3600,
+  "wall_seconds": 86400,
+  "candidates": 1,
+  "regenerate": 2,
+  "agents_max": 16,
+  "saturation": 6,
+  "strategies": ["fresh", "feedback", "other_engine"],
+  "syntax": true,
+  "require_change": true,
+  "checks": {"0": ["test -s verify.txt"]},
+  "final": []
+}
+===== END policies/immune.json =====
+
+===== FILE: policies/learning.json =====
+{
+  "version": 1,
+  "perpetual": true,
+  "interval_seconds": 1800,
+  "attempt_seconds": 3600,
+  "wall_seconds": 86400,
+  "candidates": 1,
+  "regenerate": 2,
+  "agents_max": 24,
+  "saturation": 3,
+  "strategies": ["fresh", "feedback", "other_engine"],
+  "syntax": true,
+  "require_change": true,
+  "checks": {"0": ["test -s verify.txt"]},
+  "final": []
+}
+===== END policies/learning.json =====
+
+===== FILE: policies/metabolism.json =====
+{
+  "version": 1,
+  "perpetual": true,
+  "interval_seconds": 300,
+  "attempt_seconds": 600,
+  "wall_seconds": 86400,
+  "candidates": 1,
+  "regenerate": 1,
+  "agents_max": 8,
+  "saturation": 0,
+  "strategies": ["fresh", "feedback"],
+  "syntax": true,
+  "require_change": true,
+  "checks": {"0": ["test -s verify.txt"]},
+  "final": []
+}
+===== END policies/metabolism.json =====
+
+===== FILE: policies/selfdev.json =====
+{
+  "version": 1,
+  "perpetual": true,
+  "interval_seconds": 3600,
+  "attempt_seconds": 3600,
+  "wall_seconds": 86400,
+  "candidates": 1,
+  "regenerate": 2,
+  "agents_max": 12,
+  "saturation": 4,
+  "strategies": ["fresh", "feedback", "other_engine"],
+  "syntax": true,
+  "require_change": true,
+  "checks": {"0": ["test -s verify.txt"]},
+  "final": []
+}
+===== END policies/selfdev.json =====
+
+===== FILE: genome/classify-command.sym =====
+program LIFE command classifier.
+use profile=verified, context=none, determine=false, solve=false.
+note The command inbox cell gives one operator command to a light model, which routes it to exactly one organ and sets an urgency. Code reads the typed answer; the model only labels.
+given command_id: Text.
+given command_text: Text.
+define Organ as one of {
+  codebase: "optimise the dashboard code or fix an error or failing test",
+  learning: "research something from the internet and record sources",
+  database: "create or migrate a database table or column",
+  compute: "propose or benchmark a new way to compute or store data",
+  selfdev: "improve the organism's own scripts, policies or checks",
+  immune: "review, audit, roll back or quarantine something",
+  heartbeat: "report status, metrics or what is happening",
+  none: "the command fits no organ and must be shown to the operator"}.
+ask organ: Organ "Route this operator command to exactly one organ. Command: {command_text}" from command_text by "ollama:qwen3:4b-instruct@node-a" with effort=medium, votes=3, retries=2
+ask urgency: one of {low, normal, high} "How urgent is this command for the cluster? Command: {command_text}" from command_text by "ollama:llama3.2:1b@node-b" with effort=low
+ask one_line: Text up to 18 words "Restate the command as one short imperative line naming what to do." from command_text by "ollama:qwen3:4b-instruct@node-a" with effort=low
+ensure len(one_line) >= 10 and len(one_line) <= 160 else retry because "the restated line is between ten and one hundred sixty characters".
+let route = {command: command_id, organ: organ, urgency: urgency, restated: one_line}.
+return route.
+===== END genome/classify-command.sym =====
+
+===== FILE: genome/extract-source.sym =====
+program LIFE source fact extractor.
+use profile=verified, context=none, determine=false, solve=false.
+note The digest cell turns one fetched source into one checked fact. The kernel checks that the quote is copied verbatim from the source text; the claim and its usefulness are model judgements, not checks.
+given source_id: Text.
+given source_url: Text.
+given source_text: Text.
+ask claim: Text up to 40 words "State one specific factual claim this source supports, in your own words." from source_text by "ollama:qwen3:4b-instruct@node-d" with effort=medium, retries=2
+ensure len(claim) >= 20 and len(claim) <= 300 else retry because "a claim is between twenty and three hundred characters".
+ask quote: Text "Copy, word for word, the shortest span of the source that states the claim." from source_text, claim by "ollama:qwen3:4b-instruct@node-d" with effort=low, retries=3
+ensure quotes(source_text, quote) else retry because "the quote must be copied exactly from the source text".
+ensure len(quote) >= 12 else retry because "the quote is at least twelve characters".
+let fact = {source: source_id, url: source_url, claim: claim, quote: quote}.
+return fact.
+===== END genome/extract-source.sym =====
+
+===== FILE: genome/rank-experiment.sym =====
+program LIFE experiment ranking.
+use profile=verified, context=none, determine=false, solve=false.
+note The compute cell scores one proposed compute-or-storage experiment before any benchmark runs. A low score means the orchestrator does not spend cluster time on it. The number is a model judgement, never a measurement.
+given experiment_id: Text.
+given hypothesis: Text.
+given measurement: Text.
+given threshold: Text.
+ask feasible: Bool "Can this be measured on a laptop-class worker node node in under fifteen minutes with the given command? Hypothesis: {hypothesis} Measurement: {measurement}" from hypothesis, measurement by "ollama:qwen3:4b-instruct@node-i" with effort=medium, retries=2
+ask novelty: one of {none, small, large} "How different is this from the obvious default approach? Hypothesis: {hypothesis}" from hypothesis by "ollama:granite3.3:2b@node-i" with effort=low
+ask risk: one of {low, medium, high} "How likely is this experiment to overheat or overload a node? Measurement: {measurement}" from measurement by "ollama:llama3.2:1b@node-i" with effort=low
+ask score: Int in 0..100 "Give a single integer priority from zero to one hundred for running this experiment. Hypothesis: {hypothesis} Threshold: {threshold}" from hypothesis, threshold, feasible, novelty, risk by "ollama:qwen3:4b-instruct@node-i" with effort=medium, votes=3, vote=median
+ensure score = 0 or feasible else retry because "an experiment that is not feasible scores zero".
+ensure score <= 40 or risk != "high" else retry because "a high-risk experiment cannot score above forty".
+let ranking = {experiment: experiment_id, feasible: feasible, novelty: novelty, risk: risk, score: score}.
+return ranking.
+===== END genome/rank-experiment.sym =====
+
+[This is part 3 of 5 of the LIFE critique packet. Do not critique yet. Reply only with the word RECEIVED.]

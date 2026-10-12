@@ -1,0 +1,225 @@
+sha256 it is refused; only an id absent from the ledger goes on to validation. The text must pass
+`life_common.migration_problems` (the exact grammar is `life_common.MIGRATION_RULES`, written into every database
+workspace as MIGRATION-RULES.txt): at most 16384 bytes; no block comment; statements split by a tokenizer that respects
+quoted literals, EVERY statement ended by a semicolon; 1..24 statements, each exactly one of `CREATE TABLE IF NOT EXISTS
+org_x (...)`, `CREATE [UNIQUE] INDEX IF NOT EXISTS org_x ON org_y (col, ...)`, `ALTER TABLE org_x ADD COLUMN ...`, key
+words in upper case; every column `name TYPE` with a lower-case name (never `sqlite_...`) and TYPE exactly TEXT,
+INTEGER, REAL, BLOB or NUMERIC, followed only by NOT NULL, UNIQUE, PRIMARY KEY, DEFAULT <number | 'text' | NULL> or
+REFERENCES org_x (col) (an ADD COLUMN takes no UNIQUE or PRIMARY KEY); table constraints only PRIMARY KEY (cols) or
+UNIQUE (cols); outside '...' literals: no statement whose first three words include DROP, DELETE, UPDATE, INSERT,
+REPLACE, ATTACH, DETACH, PRAGMA, VACUUM, TRIGGER, VIEW, REINDEX or ANALYZE, no AUTOINCREMENT, WITHOUT ROWID, STRICT,
+CHECK, GENERATED, COLLATE, ON CONFLICT (so no `ON CONFLICT REPLACE` that would delete rows later), CASCADE, RESTRICT
+or DEFERRABLE, no call of load_extension, readfile, writefile, fts*, zipfile, edit or sqlar_*, no quoted identifier;
+every created table or index name and every added column is new, every altered or indexed table exists; a UNIQUE
+index only on a table this file creates (its rows are visible to the agent: rule 7); every REFERENCES names an org_
+table that exists in the snapshot or is created above it, and a column that is its single-column primary key or has a
+single-column UNIQUE constraint or index. Validation: on an in-memory copy WITH the organism's rows when its logical
+size (page_count x page_size) is at most 64 MiB, else on the snapshot schema only (the apply transaction then meets the
+rows), with foreign keys enforced; the copy (in 256-page batches), both applications and the checks share ONE 120 s
+deadline that also stops at STOP; the whole applies twice with the same resulting schema (a "duplicate column" from
+an ADD COLUMN's second pass is the only error ignored), no `sqlite_sequence`, `foreign_key_check` clean, and the
+resulting schema passes `snapshot_problems` (so an accepted migration never poisons a later snapshot). Then the
+durable evidence BEFORE the change: a `migrations` row `applying`; then pre-migration retention and a backup copy
+`organism-before-<id>.sqlite3` (mode 0600); then one organism transaction (foreign keys on) applying every statement
+plus its `schema_migrations` row, under a 120 s progress deadline that also stops at STOP, with STOP checked again
+immediately before COMMIT (STOP first: rolled back, the `applying` row removed, the item waits, nothing counted; a
+failure: rolled back and refused); then the `migrations` row `applied` or `refused`, a commit of the file in the
+workspace and a `migration_applied` notice that names the tables the store adapter fills (all others stay
+operator-filled). The control registry is a different file, so no migration can touch control state.
+
+**Reconciliation** (step 8, every tick), every combination decided (`migration_reconcile`):
+
+| organism ledger | registry row | effect |
+|-----------------|--------------|--------|
+| has id, same sha256 | applied | nothing |
+| has id, same sha256 | applying | the row becomes `applied` (the organism commit happened) |
+| has id (well-formed id and sha256) | none | imported: a row with no item, notice `migration_imported` |
+| has id | another sha256, or refused | HOLD (notice `migration_recovery_required`) |
+| a malformed row | any | HOLD |
+| lacks id | applied | HOLD (a restore from an older backup) |
+| lacks id | applying | nothing: its apply item retries the SAME text (another text refuses) |
+| lacks id | refused | nothing |
+
+A hold stops the database organ (no draft, no apply, no store) until the operator either restores an organism backup
+that matches, or runs `life-ctl.py forget-migration ID --confirm FORGET` (an applied row becomes `refused`,
+"forgotten after a restore"; the text stays in the bundle and the request can be sent again as a new command); the
+next reconciliation then clears the hold.
+
+**The store adapter** (lifecycle, every armed working tick, decision 16): an organism table named `org_*` qualifies only
+when its FULL column inventory (`PRAGMA table_xinfo`, hidden and generated columns included) is `fact_id` plus a subset
+of `source_url`, `claim`, `quote` and `created_at` (`STORE_COLUMNS`), none hidden or generated, `fact_id` declared
+TEXT and the table's single-column primary key or under a single-column UNIQUE constraint or index, the other columns
+TEXT (`created_at` INTEGER or TEXT). Qualifying tables receive the quote-verified knowledge rows in knowledge rowid
+order from a per-table mark (meta `store_marks`), with `INSERT OR IGNORE` and bound parameters (never built SQL
+text); STORE_ROWS_PER_TICK 500 bounds the insert ATTEMPTS of the whole tick across all tables, served round-robin
+(meta `store_next`); each table is one organism transaction under the 120 s deadline that also stops at STOP, with STOP
+checked again before COMMIT. A table whose insert fails is disabled for its current schema (meta `store_disabled`,
+notice `store_failed`), its mark kept; a lock or STOP only retries later; other tables go on. Restoring an organism
+backup (`life-ctl.py restore organism`) clears every mark, so the adapter replays (idempotent by fact_id) instead of
+skipping rows the restored file lost. Notice `store_table` when a table first qualifies. No model writes a row; any
+other table stays operator-filled (GAP 13).
+
+### 7.9 Agent runs (codebase patch, selfdev draft, database draft)
+
+- **Policy** (every LIFE agent run, `policies/<organ>.json`, checked by `agent_policy_problems`):
+  `perpetual false, until_done false, candidates 1, regenerate 2, depth 0, children 2, generations 1,
+  agents_max 4, attempt_seconds 900, wall_seconds 2700, interval_seconds 900, feedback_chars 2000, novelty_limit
+  2, saturation 0, strategies [fresh, feedback], syntax true, require_change true, self_split false, designer false,
+  final [], hidden []` and exactly the organ's checks (`life_common.AGENT_CHECKS`) on statements 0 and 1. So: no
+  engine or node rotation, no internal splitting (`self_split false` and bounded-mode `depth 0` make `decide` never
+  decompose), at most 4 agents per run; how autogen spreads them over the two statements is the platform's.
+  Every run passes `--model <control/agy-model.txt> --effort low` (`AGY_EFFORT`); a start agy refuses for its
+  model's quota or cooldown is infrastructure with notice `agy_quota`. `generations 1` is
+  the platform minimum; a remote handoff request is refused by the platform ("remote handoff unsupported") and
+  counts as a failed attempt. bin/symblic-task has flags for every field except perpetual, until_done, syntax,
+  require_change, designer, final, hidden, interval_seconds and feedback_chars: those equal
+  `symblic_autogen.DEFAULTS` (each pinned by the contract, and compared with the RUNNING server's
+  `/api/symblicos/autogen/catalog` defaults each armed tick: a catalogue without a defaults object is one contract
+  problem). `VALIDATE.sh` feeds `policy_flags()` through bin/symblic-task's own `parse` and `autogen_policy` and
+  requires the normalised sha256 to equal LIFE's.
+- **Statements**: rendered from the active release's template with exactly the organ's fields, each FULLY matching
+  its exact form (`life_common.PLACEHOLDERS`) and free of credential-shaped values; free text passes `lint_safe`
+  (the lint back-reference words "the previous", "the last", "as before", "like above", "earlier" become "the
+  prior", "the final", "as stated", "as stated", "before"); the result must be exactly two statements, each naming
+  the workspace, each at most 1480 characters, linting with ZERO findings (`symblic_autogen.lint` with the
+  workspace as root; VALIDATE renders the largest legal values too). The templates write the workspace as the
+  literal absolute prefix `/home/operator/symblicos/projects/life-<organ>-` followed by `{ws_id}` (= `<depth>-<8hex>`),
+  so even the raw template text names an absolute folder and lints with ZERO findings without a root. A remote agent
+  maps that path into its own checkout (the platform's run note: "Where a statement names the folder {cwd}, use the
+  same relative path inside your checkout", pinned by the contract). A render failure is deterministic: the item goes
+  to the operator (notice `render`), no budget is charged, nothing retries it until the operator requeues it.
+- **Submit** (START_STAGE_SECONDS 600): the workspace is reset first (every organ). `request_id =
+  life-<organ>-<depth>-<hex8>-<item 16hex>-<attempt>` (the full cell identity); expected `run_id =
+  autogen-<first 24 hex of sha256(request_id)>`. `STATE/runs/<request_id>/` gets `statements.txt`, `policy.json` and
+  a versioned `manifest.json` (ids, item, cell, workspace, node, engine, model, effort, base commit, release and the
+  sha256 of both files); a `runs` row (`submitting`, with the release, base commit, model, effort, statements sha256
+  and policy sha256) and the day's agent-run budget are committed BEFORE `bin/symblic-task start --lines SNAPSHOT
+  --root WS --cwd WS --node NODE --engine agy --model MODEL --effort low --id REQUEST_ID --json` plus `policy_flags`.
+  The CLI reads the snapshot file at submit time, so the snapshot is evidence. Exit 0: the next poll confirms the run. Any
+  other exit: LIFE asks the API for the expected run id: a run → kept, confirmed by the next poll; a 404 after the
+  CLI printed an HTTP 4xx refusal (other than 409) → `not_submitted` (`start_refusals + 1` and a new attempt number;
+  failed at 3); anything else (a timeout, a 5xx, no answer) → `submit_unknown`. A run the server does not know
+  (404) while it is `submitting` or `submit_unknown` is RE-SENT with the identical request, rebuilt only from its
+  manifest (a missing or mismatched file refuses the re-send), and only on a fully admitted working tick with no hold:
+  autogen answers the existing run for a known request id with the same statements and policy (`request_digest`,
+  pinned) and creates it once otherwise, so a re-send never makes a twin. After 3 re-sends the run STAYS
+  `submit_unknown`: local uncertainty is never an ending, so its workspace stays busy and its cell starts nothing new;
+  notice `run_unknown` asks the operator to check `bin/symblic-task autogen list` and run `life-ctl.py abandon-run RUN_ID
+  --confirm ABANDON` (the run ends `unknown`, collected, cause owner; its item goes to the operator). No answer at all:
+  the run waits, notice `run_unknown` after 900 s, never a new request id.
+- **Confirmation**: a run is LIFE's only when the server row matches what LIFE submitted: `policy.sha256` (which
+  excludes engines and nodes), the exact statements (`lines`), `base.engine` agy, `base.model` and `base.effort` as
+  passed, `base.node` the node recorded in the run row at submit (never the cell's current node) and `base.cwd` the
+  workspace. A mismatch requests the run's cancel (the row stays `live` with detail `mismatch, cancel
+  requested` until it ends), sends its item to the operator (notice `policy_mismatch`) and keeps the workspace busy
+  until the run is collected.
+- **Placement**: the cell's node only, only for an ACTIVE cell (a dividing cell starts no run), and only when that
+  node is available (section 10), had no LIFE work in the whole previous hour (`duty_allows` with
+  AGENT_RUN_KILL_SECONDS = NODE_BUSY_MAX: one run can never push a node past its duty cycle), and the task-engine
+  catalogue (`bin/symblic-task catalog --json`, read once per tick; a catalogue naming no LIFE node opens notice
+  `catalogue_shape`) reports `ready.agy` true there; otherwise notice `agy_not_ready` and wait. Never another node,
+  never the host. At most 2 LIFE runs in `submitting`, `live` or `submit_unknown` fleet-wide, 1 per cell, 12 a UTC day
+  (the budget is re-read before every start). After every start all governor inputs are read again before anything
+  else is placed. **The workspace rule** (`Tick.workspace_busy`, the ONE exclusion rule): a cell's workspace is busy
+  while it has a run in submitting, live or submit_unknown, or an item queued or running at a `WORKSPACE_STAGES`
+  stage (gate, apply); no watched test, confirmation, agent start, division, apoptosis, move (operator moves included),
+  clone removal or self-test touches a busy workspace. A confirm item is not bound to a workspace: it waits for, and
+  runs in, an idle clone of its cell, and is dispatched like any other item.
+- **Collection** (each in ONE transaction with the copied status; a run a killed tick copied but did not collect is
+  collected at the next tick's recovery), first match wins, the cause read from the structured `runs.cancel_cause`
+  (`stop`, `age`, `mismatch`, `owner`; only the first cause is kept), never from detail text: an item no longer
+  running (handed to the operator meanwhile: a mismatch, an abandon) only has its run collected and its workspace
+  reset. `completed` → the next stage, whatever cancel was requested. Cause `age` (LIFE asked to cancel at 3000 s) →
+  `failed` (the cell's failure streak grows). Cause `stop` → queued again with a new attempt (not counted; it starts
+  only after the operator arms again). `failed`/`stuck`/`cancelled`/`unknown` (and a live run the server no longer knows): when
+  every attempt failure is non-semantic (INFRASTRUCTURE, REFUSAL, CANCELLED, CONFLICT, FETCH_FAILURE, TIMEOUT —
+  VALIDATE proves each is one of `symblic_autogen.FAILURE_CLASSES`), or a cancelled or unknown run has no attempt
+  failure at all, it is infrastructure (a new attempt; operator after 6); otherwise the item fails and the cell's
+  `failures_in_a_row` grows. The workspace is reset after every run that did not complete. After collection every hub
+  checkout the run's attempts used (`nodes[].attempts[].agent_id`, pinned) is discarded through `POST
+  /api/agents/work/discard` (on the host and on the node); a refused discard is listed in `STATE/operator/node-cleanup.txt`
+  with notice `node_cleanup`.
+- **verify.txt**: its bytes are exactly one line plus at most one LF — codebase `finding=<16hex> test=<test_id>`,
+  selfdev `lesson=<16hex> program=<name>`, database `migration=<id>` — checked by `life-check.py verify-line`; the
+  statements say so ("as the only line of the file verify.txt, ending with one newline and nothing else").
+
+## 8. Light models: ladders, the program contract, escalation
+
+**Ladders** (`organs/organs.json`, release-managed; models drawn from those the authoring pass found on the five
+LIFE worker nodes with `bin/local-research --list`; every ladder model must be in `NON_THINKING_MODELS`, so no answer is
+spent on hidden reasoning tokens). The tick re-reads that inventory once a day (`meta.models`, from lines `<node>
+<model> <size> GB`; a listing that names no LIFE node opens notice `inventory_shape`); at plan time it uses the
+cell's rung model or the next rung up that is installed on the node, and with none installed it skips the item
+there with notice `model_absent`. A readable inventory that names some LIFE node but not this one means this node has
+NO known model (it was offline at inventory time): nothing is tried there and the inventory is re-read after 3600 s;
+an empty or unread inventory never blocks (every rung is tried; the infra counters bound what follows). Dispatch and
+child placement use the same rule: an item never goes to a cell whose node has no rung of its program, and a model
+organ's child b goes only to a node with the top rung of every program the organ runs.
+
+| program | rung 0 | rung 1 |
+|---------|--------|--------|
+| classify-command | llama3.2:1b | qwen3:4b-instruct |
+| triage-error | qwen2.5-coder:3b | qwen3:4b-instruct |
+| extract-source | qwen3:4b-instruct | — |
+| distill-lesson | llama3.2:1b | qwen3:4b-instruct |
+| propose-experiment | qwen3:4b-instruct | — |
+| rank-experiment | llama3.2:1b | qwen3:4b-instruct |
+| review-patch | qwen2.5-coder:3b | qwen3:4b-instruct |
+| reproduce | llama3.2:1b | qwen3:4b-instruct |
+| assign-item | qwen2.5:0.5b | llama3.2:1b |
+| local-research | qwen3:4b-instruct | — |
+
+**The program contract.** The tick runs, from cwd STATE with a fixed environment (PATH, HOME, LANG,
+`PYTHONDONTWRITEBYTECODE=1`, `SYMBLIC_THERMAL=1`, `SYMBLIC_CALL_WALL_S=900`, `DASH_URL`, `GIT_CONFIG_NOSYSTEM=1`,
+`GIT_CONFIG_GLOBAL=/dev/null`, `GIT_TERMINAL_PROMPT=0`, nothing inherited; extra keys may never override these):
+
+```
+bin/symblic run STATE/release/<n>/genome/P.sym --by ollama:MODEL@NODE --json --max-calls 12 \
+  --ollama-limits '{"num_predict": 320, "timeout_seconds": 75}' --dir STATE/calls/<call_id> \
+  --input NAME=<JSON-encoded value> ...
+```
+
+inside its own `life-slot-*.scope` (MemoryMax 1G, RuntimeMaxSec 930) and its own process group, ended at 900 s
+(SIGTERM, then SIGKILL to the whole group 30 s later); each model call's wall is 75 s (= 900 / 12, so the worst case
+of 12 calls fits the process; VALIDATE compares); stdout and stderr
+go to temporary files (1 MiB and 64 KiB kept; a process writing more than 16 MiB, checked while it runs and after it
+exits, is ended and is a `failed` outcome). A call named `@NODE` runs on NODE or not at all (`symblic_apply` never
+re-places a named node; `SYMBLIC_THERMAL` only refuses on a hot node). Genome asks carry no `by` (and VALIDATE, the
+gates and `check_release` refuse any placement option in a genome program): an ask-level `by` would win over `--by`
+(`symblic_run.Run._apps`), so the code chooses model and node. Values are JSON-encoded so text stays text. Every
+call goes through the fleet runner (`symblic_apply` → `fleet_runner.launch`), which allows one model process per node
+(`fleet_runner._check_capacity`) and waits up to 1800 s for a busy node. The fleet runner unit bounds only the CLIENT's
+wall time and memory: the model's weights and KV cache live in the node's Ollama service, which the operator left
+uncapped (`fleet_runner`: "worker node Ollama is not capped", pinned). So LIFE bounds a call itself: one action at a time
+per node, `memAvailMiB >= 2048 + the model's size + 819` (0.5b 400, 1b 1300/900, 3b 1900, 4b 2600 MiB; 819 MiB =
+`fleet_runner._kv_bytes` of a 4B model at the 4096-token context every LIFE prompt reaches, KV_BYTES_PER_TOKEN_B
+36000 and OLLAMA_OVERHEAD 256 MiB, both pinned; a prompt is at most PROMPT_CHARS_MAX 9000 characters, so chars/3 + 256
++ 320 stays within 4096), + 4096 MiB while a LIFE agent run is live on the node, and the node's duty-cycle room
+(section 10) before a call. num_predict 320 is a hard
+generation cap, not a promise that every valid answer fits: the asks are short (most at most 40 words; the quote
+ask at most 400 characters, about 100 tokens), and a cut answer fails its type check and follows the escalation
+rule. Each program's worst-case model calls (votes x attempts, an `ensure ... else retry` counting against the ask's
+retries) is written in its `note` and is at most 12; `--max-calls 12` is the hard bound either way, and 12 model
+calls are RESERVED from the day's budget before each program run (research reserves 5), never refunded.
+
+**Outcome classification** (code): a process STOP ended (`stopped`) or one that was never created because admission
+refused (`not_admitted`, a distinct return code, never 127) → the item returns to its queue with no counter, hold,
+calls row or tuning change (a stopped call holds its node as an orphan). Exit 0 with `status done`, exactly one
+returned record, and (classify, triage, extract, review) the record echoing the subject it was asked about, and
+(propose-experiment) the code checks of section 7.7 → `done`. The process timed out → `timeout`: the node is held
+1800 s FOR THAT PROGRAM ONLY (`node_holds` cause timeout), `timeouts + 1`, and at the second timeout at one rung the
+item escalates one rung; with no higher installed rung it goes to the operator (outcome `TIMEOUT_LIMIT`, notice
+`timeout_limit`, the cell's failure streak unchanged; requeue it when the cause is fixed). A JSON report with neither `status` nor
+`error`, or a research result of the wrong shape → `contract` (notice `contract`, treated as infra). No JSON, a
+process that could not start or was not admitted, or an error → `infra` or `failed` by its STRUCTURED kind first: a
+kind in `unavailable`, `capacity`, `timeout` is infra, any other non-empty kind is `failed` whatever its message
+says; only an error with no kind is matched against the infrastructure pattern `no capacity|node offline|offline|
+unavailable|cooldown|paused|stalled|not installed|unreachable|timed? ?out|did not answer in time|is busy|searxng|
+connection` (case-insensitive; `life-tick.INFRA_RX`). `infra`: the item stays queued, the node is held 1800 s for
+every program (`node_holds` cause infra), `infra_runs` grows (operator at 6), nothing counts against the cell.
+
+**Escalation and tuning** (per item, per cell): a `failed` item retries strictly above the EFFECTIVE rung it was
+just tried at (the rung after skipping models not installed), at most 2 rungs above the cell's base. Past the top it
+
+
+[This is part 5 of 26. Do not critique yet. Reply only with the word RECEIVED.]

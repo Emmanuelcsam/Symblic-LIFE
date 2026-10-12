@@ -1,0 +1,20 @@
+program LIFE command classifier.
+use profile=verified, context=none, determine=false, solve=false.
+note Worker of a command cell. One operator command in, one route out. Code reads the typed answer, keeps the original command text as the only authoritative instruction, and dispatches; the model only labels. Stop, freeze and cool are never routed here: the operator uses bin/life-ctl.py for them. Requests about digest or metabolism are routed to learning or heartbeat. A database route creates nothing unless the command text starts with database: (code checks). The tick passes --by ollama:MODEL@NODE and --max-calls 12; worst case here is 6 + 2 + 3 = 11 calls.
+given command_id: Text.
+given command_text: Text.
+define Organ as one of {
+  learning: "research something from the internet, read sources, or learn about a topic",
+  codebase: "fix a failing test or an error in the dashboard code; the command names a test id such as tests.test_x",
+  database: "create a new table, column or index to store some kind of data; such a command starts with the word database and a colon",
+  compute: "propose or measure a new way to compute or store data",
+  selfdev: "improve how the organism's own genome programs ask their questions",
+  immune: "review, audit, roll back or quarantine something",
+  heartbeat: "report status, metrics or what the organism is doing",
+  none: "the command fits no organ and must be shown to the operator"}.
+ask organ: Organ "Route this operator command to exactly one organ. Command: {command_text}" from command_text with effort=medium, votes=3, retries=1
+ask urgency: one of {low, normal, high} "How urgent is this command? Answer high only when the command says it is urgent or time-critical. Command: {command_text}" from command_text with effort=low, retries=1
+ask restated: Text up to 18 words "Restate the command as one short imperative line naming what to do. This is display text only." from command_text with effort=low, retries=2
+ensure len(restated) >= 10 and len(restated) <= 160 else retry because "the restated line is between ten and one hundred sixty characters".
+let route = {command: command_id, organ: organ, urgency: urgency, restated: restated}.
+return route.

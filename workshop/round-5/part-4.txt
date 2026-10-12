@@ -1,0 +1,213 @@
+different fingerprint, allows the next one; each new finding carries the test's next occurrence number in its identity, so it is never mistaken for
+the ended one. LIFE never reads the dashboard's logs or private stores.
+
+**confirm** (operator findings only, the host, CONFIRM_STAGE_SECONDS 600): the named test runs the same way at the
+branch head. Pass → `owner` with notice `already_passing` (LIFE writes no patch); a unittest failure → the real
+output is appended to the finding text, `trace_files` = the traceback's files plus the files of every
+`path.py:Class.function` the command names (at most 3, no `..`), `trace_functions` = the traceback's identities plus
+those named functions, `base_commit` = the head, stage triage; timeout, sandbox or a clone that cannot be refreshed or
+was re-created → infra; a run STOP ended → the item waits, nothing counted; anything else → operator.
+
+**triage**: `triage-error.sym` (must echo the finding id) → a class other than test_only, comment_or_doc or
+local_fix, or `confident` not true, or local_fix with no `trace_files`: `owner` (notice `finding_owner`, which
+prints the command that sends it again with a named function: `fix: TEST path.py:Class.function`). Else the class is
+recorded. The class descriptions the model reads say exactly what the gate allows: test_only = only the test module
+file named by the test id; local_fix = up to three function bodies in files the traceback names, no signature,
+import or module-level change.
+
+**patch** (agent run, section 7.9; only while the gate is proven: `gate_unproven` otherwise): the clone is reset to
+the finding's base commit; `organs/codebase.lines.txt` is rendered with `scope` = "the file <module>" (test_only:
+exactly the file the test id resolves to, without importing, by `resolve_test_module`), "Markdown files under docs/"
+(comment_or_doc) or "the bodies of the functions F1, F2 inside the file(s) a.py, b.py, adding no import or file and
+changing no signature, default, decorator, class line or module-level line" (local_fix: exactly the `trace_files`
+that exist in the clone and their `trace_functions`; a local_fix with no function goes to the operator). The reviewer's
+note after a needs_work is its OWN field (`review_note`, quoted as data in its own clause; `none` when there is none)
+and is never cut: the finding text is cut to 700, 500, 300, 150, then 80 characters until both statements fit 1480
+characters, and a run that still does not fit is a render failure (owner). The previous patch id is kept
+(`previous_patch`). Checks: statement 0 `life-check.py sandboxed /usr/bin/python3 -s -B -m unittest TEST` (in
+autogen's staging checkout, inside the sandbox, in its own scope), statement 1 the verify line.
+
+**gate** (the host, after a completed run, GATE_STAGE_SECONDS 1200, admitted as heavy the host work, only while
+`gate-selftest` proved it for this kit and these platform files): `git add -A`, then the diff of everything
+against the recorded base commit (`git diff --cached --no-renames --no-ext-diff --no-textconv BASE`, so it is
+right whether promotion committed or not), with exactly the root files `verify.txt`, `HANDOFF.md`,
+`AUTOGEN-CHECKPOINT.json`, `AUTOGEN-SPLIT.txt`, `AUTOGEN-TESTS.sh`, `AUTOGEN-INDEX.jsonl` excluded. Refused
+(`failed`) when: git cannot diff; no diff; the diff is larger than 262144 bytes or holds a binary file; any path
+matches `life_common.GATE_DENY_RX` (bin/, scripts/, rules/, symblicos/, .agents/, .claude/, .githooks/, .github/,
+.backups/, secrets_data/ at any depth, docs/life/, docs/agents/, docs/fleet-power.md, docs/symblic/AUTOGEN.md,
+docs/symblic/RECURSION.md, any AGENTS.md or CLAUDE.md, tests/__init__.py, any conftest.py or tests package
+__init__.py, the judge's configuration (sgconfig.yml, pyproject.toml, ruff.toml, .ruff.toml, setup.cfg, tox.ini,
+pytest.ini, requirements-devtest.in/.lock, .pre-commit-config.yaml), any .gitignore or .gitattributes, any .env*
+file at any depth, easy_config.json, security_gate.py,
+register.py, server.py, host_routes.py, host_bridge.py, sw.js, index2.html, restart-host.sh, landlock_sandbox.py,
+every platform file LIFE relies on (symblic_autogen.py, symblic_run.py, symblic_apply.py, fleet_runner.py,
+local_research.py, deep_research.py, cluster_engine.py, cluster_highpower.py, agent_hub.py, symblicos_engine.py;
+VALIDATE proves every CONTRACT file is covered), *.service/.timer/.slice/.socket, dotfile rc files); a file is added
+with a mode other than 100644, changes mode, changes TYPE (a raw `T` line: a file replaced by a symlink or submodule),
+or is a symlink or submodule (raw lines and the diff's own mode lines are both checked; any unreadable raw line
+refuses); test_only touches anything but the ONE
+module file its test id resolves to, removes more assertions than it adds, or adds a skip or expected failure;
+another class touches `tests/` (the judging test stays fixed); comment_or_doc touches anything but `docs/**/*.md`;
+local_fix touches a file outside its `trace_files`, adds a file, or changes anything but function bodies (with every
+function body blanked, the old and new module are the same syntax tree; every definition keeps its identity and its
+header — signature, defaults, decorators, annotations — at EVERY nesting level, so a nested signature change is
+refused too), changes more than 3 function bodies, or changes a definition whose identity (qualified name and
+occurrence, never the bare name: `run` in one class never authorizes `run` in another, a property getter is not its
+setter) is not in `trace_functions` (`local_fix_problems`); the diff holds a credential-shaped LITERAL (the code
+tier of section 11: `token = request.headers.get(...)` is code, `token = "s3cr3t-value"` is not);
+`checks/devcheck-gate.sh CLONE TEST BASE` fails (in a `life-gate-*.scope`, 900 s: step 1 the module resolves to a file
+inside the clone WITHOUT importing anything, else exit 3; step 2, inside the sandbox, the clone's own `./bin/devcheck
+--changed BASE --no-tests` — the base commit's bytes, since bin/, scripts/, rules/ and the judge's configuration cannot
+change; it diffs the working tree, uncommitted changes included; it runs compile, ruff, the project rules, the secret
+scan and page checks but NO test, because bin/devtest needs uv, a HOME package cache and PyPI, none of which exist in
+the sandbox (node is unreadable there too, so inline scripts are only a devcheck note) — must exit 0 AND report at
+least one checked file, else exit 4; step 3, inside the sandbox, the focused test under `/usr/bin/python3` must exit 0
+with `Ran N tests` N >= 1, an `OK` line and fewer skips than tests, else exit 5; 125 = the sandbox is unavailable);
+the gate run changed the clone's git administrative files (the clone is deleted); or the staged diff after the gate
+differs from the one before it. A gate STOP ended, or one that was not admitted, leaves the item queued at gate,
+nothing counted. The focused test runs inside the candidate's own process, so it is a regression check, not an
+adversarial oracle (GAP 19). A pass writes `STATE/bundles/patches/<patch_id>/{patch.diff,meta.json}`
+(`patch_id = first 16 hex of sha256(diff)`; meta records the base, files, classes, the diff's sha256 and the
+previous patch; written in a `.tmp-*` folder, then renamed), then in one transaction a `patches` row (`bundled`) and
+an immune review item; the finding ends `done` but is COUNTED done only when its patch leaves review (so a
+needs_work round never counts it twice); then the clone is reset. A diff that was already bundled before ends the
+finding `owner` (notice `patch_repeat`).
+
+`path_class` (code, from the paths alone): `tests` (tests/), `docs` (docs/**/*.md), `restart_gated` (any
+`.py`, `bin/`, `.service`, `.timer`, `.sh`), `live_static` (.html .js .mjs .css .json .svg .png .webp .ico .txt
+.webmanifest), `other` (anything else), or `mixed`. The operator sees it at apply.
+
+### 7.5 immune — `review` (slot), canaries (code)
+
+`review-patch.sym` with the bounded diff text (at most 6000 bytes; a larger or missing diff goes to the operator
+unreviewed: the patch or proposal state becomes `owner`, notice `review_owner`), `change_class`, `path_class`,
+`checks_passed` and the `objective` computed by code (the finding text, or the lesson quoted as data); its reason
+ask receives the objective, the class, the diff and the verdict. The record must echo the subject id. `accept` →
+patch `ready` + notice `patch_ready`, except a test_only patch, which becomes `owner` + notice `patch_test_only` (a
+model never makes a judging-test change ready; the operator applies it with `--unreviewed`), or proposal `ready` +
+`proposal_ready`; `reject` → `rejected`; `needs_work` → `rejected`, and for a patch whose finding has had fewer than
+2 review rounds, the finding is re-queued at `patch` with a new attempt number, the reviewer's reason as
+`review_note` and the patch id as `previous_patch` (at the second round: notice `finding_owner`). A proposal's
+needs_work is a rejection: its lesson is not re-queued (the operator may send it again as a command). **Canaries**
+(`checks/canaries.txt`, exactly nine `bin/symblic check` lines and `life-check.py registry`, which runs `PRAGMA
+integrity_check` and `foreign_key_check`): hourly, at every tick while none ever passed and after a failed round
+(step 6, before the polls), argv without a shell, 60 s per line, 600 s per round. Any failure holds all new work
+until a later round passes (`life-ctl.py canaries` runs one now). Quarantine is section 9.
+
+### 7.6 selfdev — `draft` (agent run) → `gate` (host); needs SELFDEV_ARMED
+
+A web- or model-derived lesson waits for the operator's approval (section 6). A lesson may never target a protected
+program (`SELFDEV_PROTECTED`: review-patch): the classifier route, distill and the code-written failure lessons
+never create one, and the agent start, the gate, `life-check genome-protected` and `life-ctl adopt` refuse one.
+Before a run, the workspace is reset (`git reset --hard`, `git clean -ffdx`) and its `genome/` AND `genome-base/`
+are both made equal to the active release and committed; the run records that release (`base_release`) and that
+commit (`base_commit`) and its `lesson_id` (the lesson item's 16 hex). `organs/selfdev.lines.txt` asks the agent to
+change only the double-quoted instruction that stands immediately before the word `from` on each ask line, keeping
+exactly the same placeholder names in curly braces and adding none, every other line and genome-base. Checks: `bin/symblic check
+genome/P.sym` and `life-check.py genome-protected genome/P.sym genome-base/P.sym` (both files inside the staging
+checkout; the base travels with the run, so the check compares the proposal with the release it started from),
+and the verify line `lesson=<16hex> program=<name>`. **gate**: the active release must still be `base_release`
+(else `abstained`, "release changed during the draft", no failure); the run must have changed exactly
+`genome/P.sym` (plus the excluded root control files), which must still be a regular file of mode 100644 (read
+without following a link: `life_common.read_in`); then the protected-line rule against the release
+(`life_common.genome_protected_problems`: the files have the same number of lines; every line is byte-identical
+except ask lines whose indentation, name, type — enum descriptions included — and trailing from/with clause are
+identical and whose instruction, the LAST quoted string before ` from `, changed while keeping exactly the same
+`{name}` placeholders; notes are protected; at least one instruction changed), the placement rule (no `by=`,
+`applicator=`, `model=`, `node=` or `engine=` outside quoted strings: `genome_placement_problems`), and `bin/symblic
+check`. A pass bundles `STATE/bundles/proposals/<proposal_id>/` with `proposal_id = first 16 hex of sha256(lesson
+item id + "\n" + sha256(new text))` and queues an immune review. A proposal never takes effect until the operator
+runs `life-ctl.py adopt` (a new release). Acceptance rules, budgets, gates, placement and STOP are not in the
+genome, and the one genome program that decides acceptance (review-patch) is protected, so selfdev cannot weaken
+them; whether a proposal makes a program better is the operator's judgement until recorded fixtures exist (GAP 9).
+
+### 7.7 compute — `propose` (slot) → `rank` (slot) → `bench` (slot; a cluster job)
+
+Needs a valid operator `control/benchmarks.json` (a regular operator file of at most 64 KiB: exactly `{"version": 2,
+"benchmarks": [...]}` with at most 20 entries; else items wait with notice `benchmarks_missing`), validated once per
+tick. Each benchmark (`bench_problems`): exactly `{id ([a-z0-9-]{2,40}, unique), description (10..600 characters),
+cmd (contains {{item}}, <= 2000 characters), param_rx (a valid regular expression of at most 200 characters with
+one of the linear-time shapes of `PARAM_GRAMMAR_RX`: `^(A|B|C)$`, an alternation of literal values, or `^[class]$` /
+`^[class]{m,n}$`, one character class of letters, digits, `._:+` and ranges; anything else, `a*a*...b` included, is
+refused because Python's backtracking engine could stall the tick on it), baseline (matches param_rx and `[A-Za-z0-9._:+][A-Za-z0-9._:+-]{0,63}`:
+never a leading `-`), unit ([A-Za-z/%]{1,12}), timeout (integer 30..300 s per run), better ("lower" or "higher"),
+min_gain_pct (integer 1..90)}`; an invalid entry is skipped (notice `benchmarks_invalid`), duplicate ids or duplicate
+JSON keys invalidate the file. Each run of `cmd` must print at most 4096 bytes in all and, within them, exactly one
+line `LIFE_RESULT <number> <unit>` (number: 1..12 digits, optionally a point and 1..9 digits, no sign, no exponent),
+and exit 0; more output, a second LIFE_RESULT line or a nonzero exit fails the experiment. **The model never writes
+a command and never sets the pass rule.**
+- **propose**: `propose-experiment.sym` with the seed text and the catalogue (whole entries in id order while they fit
+  3000 characters, never a cut entry: each entry's id, description, ALLOWED PARAMETER PATTERN, baseline, unit,
+  per-run timeout, direction and minimum gain; the param ask tells the model to answer one value that fully matches
+  that pattern) → code takes each answer after trimming
+  outer white space ONLY (no word is picked out of a longer answer, no punctuation removed) and requires an
+  existing benchmark id, a parameter FULLY matching its `param_rx` AND `PARAM_RX` and different from the baseline,
+  and a hypothesis of 20..300 characters; a violation is a FAILED answer (it escalates like any failure).
+  `experiment_id = first 16 hex of sha256(sha256 of the template entry + "\n" + param)` (a changed template is a new
+  experiment); a repeated experiment is `abstained`.
+- **rank**: `rank-experiment.sym` (asked whether the benchmark can test the hypothesis within its stated per-run
+  timeout) → measured only when `feasible` is true AND `risk` is `low` AND `score >= 60`; else the item is `done`
+  as ineligible. The model's labels can only decline; the bounds below are code. A rank or bench item whose benchmark
+  left `control/benchmarks.json` fails at once, without a model call.
+- **bench**: only on a node with no LIFE agent run and whose duty cycle and the fleet's window can take the whole
+  job, with ITS template's timeout T (section 10). Code first records the job intent (label
+  `life-<experiment_id>-<attempt>`, the bench budget charged), then `POST /api/cluster/map` with `items = ["0:<baseline>",
+  "1:<param>", "2:<baseline>", "3:<param>", "4:<param>", "5:<baseline>", "6:<baseline>", "7:<param>"]` (runs 0 and 1
+  are discarded warm-ups, one per variant; runs 2..7 follow the ABBA order baseline, candidate, candidate, baseline,
+  baseline, candidate, which reduces linear drift between the variants; the result reports the observed pairs and
+  does not claim that every drift cancelled), `targets = [the cell's node]`, `parallel = 1`, `timeout = 8 x (T + 10) +
+  60`, `label`, and `cmd = sh -c '<wrapper>' life-run {{item}}` (`bench_wrapper`), where the wrapper splits the item at
+  its first colon into k and the value v, prints `LIFE_RUN k`, runs `timeout --kill-after=10 T nice -n 15
+  prlimit --as=4294967296 --fsize=2147483648 --nofile=256 sh -c '<the operator's cmd with {{item}} as "$1">' life-bench
+  "$v"` with stdout and stderr into a temporary file, prints that file's first 4096 bytes, then `LIFE_RC k <the
+  command's exit status>`, `LIFE_TRUNC k` when the output was longer, and `LIFE_END k`, and removes the file (GNU
+  timeout signals the whole process group, so a compound command is bounded too; 8 runs of at most 4096 bytes plus
+  markers stay under the job's kept output, `cluster_engine.OUT_HEAD` 40000; VALIDATE runs the wrapper under sh). The map route passes each item as `"$1"` (never
+  shell text) and keeps the label in `meta.label`. The node takes no other LIFE work while the job runs. A refused
+  submit is infra; a submit with no answer is looked up by its label in the jobs listing.
+  **Polling**: queued or running past `timeout + 300` s → one cancel request; past `timeout + 600` s, or status
+  `unknown`, or not found in a COMPLETE listing past `timeout + 300` s (a listing capped at 5 pages, or one without a
+  total, proves nothing) → the item goes to the operator (notice `job_unknown` or `job_lost`) and the node is held
+  (`node_holds` cause `job`, no expiry) until the listing shows the job ended or the operator runs `life-ctl.py
+  release-hold NODE`; two jobs carrying one LIFE label → notice `job_ambiguous`, neither is assumed to be LIFE's, the
+  node held; `cancelled`, or `failed` with no `LIFE_RESULT` at all → infra (the experiment back to `ranked`, the
+  payload's job fields cleared); `failed` with measurements → the experiment fails (a failed run invalidates the set);
+  `done` → scored. **Scoring** (exact fractions, `fractions.Fraction` of the decimal strings): the node output must
+  hold exactly the blocks `LIFE_RUN k ... LIFE_RC k <status> [LIFE_TRUNC k] LIFE_END k` for k = 0..7, each once, every
+  status 0 and no LIFE_TRUNC (the status is the wrapper's record of the command's own exit, never something the
+  command printed); every block 2..7 exactly one `LIFE_RESULT` line in the template's unit, every value above 0; pair
+  k = the k-th baseline and the k-th candidate of the ABBA order; gain_k =
+  (baseline − candidate) / baseline × 100 when lower is better, else (candidate − baseline) / baseline × 100; passed
+  when every gain is above 0 AND the median gain is at least `min_gain_pct`, compared exactly (display rounding to
+  two decimals never decides). Results keep every measurement as written and every gain as an exact `n/d` fraction.
+  A passed experiment opens an `experiment_passed` notice: adopting a new way to compute or store is the operator's
+  decision (the template descriptions say what a timing does not measure, such as compression ratio or
+  durability). LIFE never enables high-power mode; nothing here changes power settings.
+
+### 7.8 database — `draft` (agent run) → `apply` (host); the store adapter (code)
+
+A web- or model-derived request waits for the operator's approval (section 6); an operator request exists only for a
+command that starts with `database:` (section 7.1). Before a run the workspace is reset (`git reset --hard`, `git
+clean -ffdx`); its `schema-snapshot.sql` is made equal to the organism's CREATE statements in creation order
+(`snapshot_sql`: sqlite_master by rowid, so a table always precedes its indexes; SQLite's internal `sqlite_*`
+objects excluded) and its `MIGRATION-RULES.txt` to `life_common.MIGRATION_RULES` (the exact grammar below, for the
+agent to read), both committed; the snapshot's sha256 is rendered into check 0, so an edited snapshot fails the
+check. `migration_id = <4-digit number>_<slug>`: number = 1 + the highest number ever allocated (the meta
+high-water mark `migration_high`, the `migrations` table whatever its state, every database item's payload and the
+organism's own `schema_migrations`, the bundle file names, and the append-only allocation journal
+`STATE/migration-numbers.txt`, fsynced BEFORE the number is used anywhere and outside both databases, so no restore
+can lower it; the tick is the only writer, under the lock); allocated once per request at its first start and kept
+through every retry; refused or abandoned numbers are never reused; slug = the request's lowercase ASCII words joined by
+`_`, cut to 30 characters, `table` when empty; after 9999 the organ holds with notice `migration_numbers`.
+The agent writes `migrations/<id>.sql` and nothing else. Check 0: `life-check.py migration migrations/<id>.sql
+schema-snapshot.sql <sha256>`.
+
+**apply** (APPLY_STAGE_SECONDS 360), in this order: the run must have changed exactly that file, still a regular
+file of mode 100644 (read without following a link); organism.sqlite3's physical footprint (file + -wal + -shm) over
+512 MiB holds (notice `storage`); the text is written to `STATE/bundles/migrations/<id>.sql` (fsynced) BEFORE any
+decision, so a refused text survives, with `<id>.refused.txt` holding the full problem list; an `applying` registry
+row of this id with another sha256 refuses (the operator decides); then the ledger: an id already in
+`schema_migrations` with the same sha256 is a crash after the organism commit, recovered as applied; with another
+
+
+[This is part 4 of 26. Do not critique yet. Reply only with the word RECEIVED.]

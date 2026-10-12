@@ -1,0 +1,406 @@
+[LIFE round-3 critique packet, part 10 of 14]
+
+    return data
+
+
+def sandboxed(cmd):
+    timeout = SANDBOX_TIMEOUT
+    if cmd[:1] == ['--timeout']:
+        if len(cmd) < 3 or not cmd[1].isdigit() or not 1 <= int(cmd[1]) <= 900:
+            return fail('--timeout takes 1..900 seconds')
+        timeout, cmd = int(cmd[1]), cmd[2:]
+    home = tempfile.mkdtemp(prefix='life-check-')
+    try:
+        env, rx = L.devcheck_tools()
+        argv = L.sandbox_argv(os.getcwd(), home, cmd, rx=rx, env_extra=env)
+        try:
+            return subprocess.run(argv, timeout=timeout, start_new_session=True).returncode
+        except subprocess.TimeoutExpired:
+            print(f'life-check: the sandboxed command passed {timeout} s', file=sys.stderr)
+            return 1
+    finally:
+        shutil.rmtree(home, ignore_errors=True)
+
+
+def main(argv):
+    if not argv:
+        print(__doc__)
+        return 2
+    cmd, args = argv[0], argv[1:]
+    try:
+        if cmd == 'sandboxed' and args:
+            return sandboxed(args)
+        if cmd == 'verify-line' and len(args) >= 3 and args[0] in L.VERIFY_LINES:
+            problems = L.verify_line_problems(args[0], read_bytes(args[1], 400), ' '.join(args[2:]))
+        elif cmd == 'migration' and len(args) == 3:
+            snapshot = read_bytes(args[1], L.SNAPSHOT_MAX_BYTES)
+            if L.sha(snapshot.decode('utf-8')) != args[2]:
+                return fail('schema-snapshot.sql differs from the snapshot LIFE wrote (never edit it)')
+            problems = L.snapshot_problems(snapshot.decode('utf-8'))
+            problems += L.migration_problems(read_bytes(args[0], L.MIGRATION_MAX_BYTES).decode('utf-8'),
+                                             snapshot.decode('utf-8')) if not problems else []
+        elif cmd == 'genome-protected' and len(args) == 2:
+            if not all(a.startswith(('genome/', 'genome-base/')) and a.endswith('.sym') for a in args):
+                return fail('the files must be genome/<program>.sym and genome-base/<program>.sym')
+            problems = L.genome_protected_problems(read_bytes(args[1], 65536).decode('utf-8'),
+                                                   read_bytes(args[0], 65536).decode('utf-8'))
+        elif cmd == 'registry' and not args:
+            conn = L.connect(readonly=True)
+            rows = [r[0] for r in conn.execute('PRAGMA integrity_check')]
+            fks = conn.execute('PRAGMA foreign_key_check').fetchall()
+            problems = ([] if rows == ['ok'] else ['integrity_check: ' + '; '.join(rows)[:300]]) + \
+                       ([f'foreign_key_check: {len(fks)} dangling reference(s)'] if fks else [])
+        else:
+            print(__doc__)
+            return 2
+    except (OSError, ValueError, UnicodeDecodeError) as exc:
+        return fail(str(exc)[:300])
+    except Exception as exc:  # noqa: BLE001 - any other fault is a failed check, never a pass
+        return fail(f'{type(exc).__name__}: {str(exc)[:300]}')
+    if problems:
+        return fail('; '.join(problems)[:600])
+    print('life-check: pass')
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))
+
+===== FILE: bin/life-status.py =====
+#!/usr/bin/env python3
+"""LIFE status for the operator. Read-only: opens the registry with mode=ro inside ONE read transaction (one consistent
+snapshot), writes nothing, calls nothing.
+
+    life-status.py           control, governor, budgets, live cells, live runs, open notices
+    life-status.py --json    the same as one JSON object
+
+Exit 0 when the registry was read; 1 UNKNOWN (not seeded or unreadable: the state cannot be established).
+Every string from the registry, identifiers included, is printed through life_common.one_line (control
+characters removed, length capped).
+"""
+import json
+import os
+import sqlite3
+import sys
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import life_common as L  # noqa: E402
+
+
+def age(t):
+    if not t:
+        return 'never'
+    s = max(0, L.now() - int(t))
+    return f'{s}s ago' if s < 120 else f'{s // 60}m ago' if s < 7200 else f'{s // 3600}h ago'
+
+
+def clean(row, limit=300):
+    return {k: (L.one_line(v, limit) if isinstance(v, str) else v) for k, v in dict(row).items()}
+
+
+def main(argv):
+    try:
+        conn = L.connect(readonly=True)
+        conn.execute('BEGIN')
+        gov = conn.execute('SELECT * FROM governor WHERE id=1').fetchone()
+        rel = conn.execute('SELECT release FROM releases WHERE active=1').fetchone()
+        budget = conn.execute('SELECT * FROM budget WHERE day=?', (L.utc_day(),)).fetchone()
+        cells = conn.execute("SELECT * FROM cells WHERE state != 'retired' ORDER BY organ, cell_id").fetchall()
+        queued = {r[0]: r[1] for r in conn.execute("SELECT cell_id, COUNT(*) FROM items WHERE state='queued' GROUP BY cell_id")}
+        runs = conn.execute("SELECT * FROM runs WHERE state IN ('submitting','live','submit_unknown') ORDER BY submitted_at").fetchall()
+        notes = conn.execute("SELECT * FROM notices WHERE state='open' ORDER BY at").fetchall()
+        unassigned = conn.execute("SELECT COUNT(*) FROM items WHERE state='queued' AND cell_id IS NULL").fetchone()[0]
+        meta = {r['key']: r['value'] for r in conn.execute("SELECT key, value FROM meta WHERE key IN ('tick_no','fault_hold','canary_failed')")}
+        conn.execute('COMMIT')
+    except (sqlite3.Error, OSError) as exc:
+        print(f'LIFE status UNKNOWN: {L.one_line(str(exc), 200)}')
+        return 1
+    ctl = L.control_state()
+    data = {'at': L.now(), 'control': ctl, 'release': rel[0] if rel else None, 'tick_no': meta.get('tick_no'),
+            'fault_hold': L.one_line(meta.get('fault_hold'), 200), 'canary_failed': L.one_line(meta.get('canary_failed'), 300),
+            'governor': clean(gov) if gov else None, 'budget': dict(budget) if budget else None,
+            'cells': [dict(clean(c, 120), queued=queued.get(c['cell_id'], 0)) for c in cells], 'unassigned': unassigned,
+            'runs': [clean(r) for r in runs], 'notices': [clean(n) for n in notes]}
+    if '--json' in argv:
+        print(json.dumps(data, indent=1, sort_keys=True, default=str))
+        return 0
+    state = ('STOP' if ctl['stop'] else 'frozen' if ctl['freeze'] else 'armed' if ctl['armed'] and ctl['kit_ok']
+             else 'armed, KIT CHANGED (observe only)' if ctl['armed'] else 'disarmed (observe only)')
+    print(f'LIFE {time.strftime("%Y-%m-%d %H:%M:%S")}  release {data["release"]}  tick {L.one_line(data["tick_no"], 12)}  {state}'
+          f'  selfdev {"armed" if ctl["selfdev"] else "off"}')
+    if data['fault_hold'] or data['canary_failed']:
+        print(f'  HOLD: {data["fault_hold"] or ""} {data["canary_failed"] or ""}')
+    g = data['governor']
+    if g:
+        print(f'  governor {g["state"]} (sampled {age(g["at"])}): {g["continuous_seconds"]}s loaded, {g["quiet_seconds"]}s quiet, '
+              f'hot {L.one_line(g["hot"], 80)}, resting {L.one_line(g["node_rest"], 80)}, reasons {L.one_line(g["reasons"], 200)}')
+    if budget:
+        print(f'  today: program runs {budget["program_runs"]}/{L.PROGRAM_RUNS_PER_DAY}, model calls {budget["model_calls"]}/'
+              f'{L.MODEL_CALLS_PER_DAY}, agent runs {budget["agent_runs"]}/{L.AGENT_RUNS_PER_DAY}, bench jobs '
+              f'{budget["bench_jobs"]}/{L.BENCH_JOBS_PER_DAY}, births {budget["births"]}/{L.BIRTHS_PER_DAY}')
+    print(f'  cells ({len(cells)} live, {unassigned} unassigned item(s)):')
+    for c in data['cells']:
+        print(f'    {c["cell_id"]:24} {c["state"]:11} {c["node"]:7} queued {c["queued"]:4} done {c["items_done"]:5} '
+              f'fail-run {c["failures_in_a_row"]}  {L.one_line(c["focus"], 60)}')
+    for r in data['runs']:
+        print(f'  run {r["run_id"]} {r["state"]} {r["organ"]} on {r["node"]} submitted {age(r["submitted_at"])}')
+    for n in data['notices']:
+        print(f'  notice {n["notice_id"]} x{n["count"]} {n["kind"]}: {n["subject"]}: {n["text"]}')
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))
+
+===== FILE: bin/life-fetch.py =====
+#!/usr/bin/env python3
+"""LIFE source fetch: one URL through the platform's safe path, printed as ONE JSON object. No model.
+
+    life-fetch.py URL
+
+local_research.read_page(URL, SOURCE_TEXT_CHARS) -> deep_research.safe_fetch (http(s) only, every resolved address
+global, every redirect re-validated, robots honoured, a byte cap). Its continuation marker is stripped, so the text
+is at most SOURCE_TEXT_CHARS characters. Prints {"ok": true, "text": ...} or {"ok": false, "kind": "refused" |
+"error", "detail": ...}: refused = the safe path said no (RuntimeError/ResearchError: robots, address, size, type) or
+an unknown fault; error = a transient network fault (OSError, URLError, timeout), which LIFE retries as infra.
+Run by bin/life-tick.py with the dashboard's .venv Python (bs4/pypdf), -I -B, a fixed environment, 90 s.
+"""
+import json
+import os
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+import life_common as L  # noqa: E402
+
+MARKER = '\n[…page continues…]'
+
+
+def main(argv):
+    if len(argv) != 1 or not argv[0].startswith(('http://', 'https://')):
+        print(json.dumps({'ok': False, 'kind': 'refused', 'detail': 'usage: life-fetch.py http(s)://URL'}))
+        return 0
+    sys.path.insert(0, L.REPO)
+    try:
+        import local_research as R
+        text = R.read_page(argv[0], L.SOURCE_TEXT_CHARS)
+        if text.endswith(MARKER):
+            text = text[:-len(MARKER)]
+        print(json.dumps({'ok': True, 'text': text[:L.SOURCE_TEXT_CHARS]}))
+    except (OSError, TimeoutError) as exc:           # URLError and socket timeouts are OSError subclasses
+        print(json.dumps({'ok': False, 'kind': 'error', 'detail': f'{type(exc).__name__}: {str(exc)[:200]}'}))
+    except Exception as exc:  # noqa: BLE001 - RuntimeError/ResearchError refusals and anything unknown: never retried
+        print(json.dumps({'ok': False, 'kind': 'refused', 'detail': f'{type(exc).__name__}: {str(exc)[:200]}'}))
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))
+
+===== FILE: bin/life-research.py =====
+#!/usr/bin/env python3
+"""LIFE research run: one question, one light model, one worker node, printed as ONE JSON object. Calls a model only when
+bin/life-tick.py runs it (a node slot); importing it does nothing.
+
+    life-research.py --model MODEL --node NODE --question TEXT
+
+Wraps local_research.research (search through SearXNG on the host, page reads through the safe-fetch path, every
+generation through fleet_runner.launch on NODE) with LIFE's bounds: RESEARCH_TOOLS tool uses and
+RESEARCH_STEP_TIMEOUT seconds per generation (local_research.STEP_TIMEOUT is read at call time). It writes no report
+into the live checkout (bin/local-research would write local_research_data/). On SIGTERM it cancels every fleet-runner run
+it started (fleet_runner.cancel) before exiting, so a killed research run never keeps a worker node's only Ollama slot.
+Prints {"model", "node", "answer", "sources": [{"url", "title"}], "steps", "error"}.
+"""
+import argparse
+import json
+import os
+import signal
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+import life_common as L  # noqa: E402
+
+STARTED = []
+
+
+def main(argv):
+    p = argparse.ArgumentParser(prog='life-research.py')
+    p.add_argument('--model', required=True)
+    p.add_argument('--node', required=True, choices=L.NODES)
+    p.add_argument('--question', required=True)
+    a = p.parse_args(argv)
+    sys.path.insert(0, L.REPO)
+    import fleet_runner as ba
+    import local_research as lr
+    launch = ba.launch
+
+    def tracked_launch(req, *args, **kwargs):
+        row = launch(req, *args, **kwargs)
+        if isinstance(row, dict) and row.get('id'):
+            STARTED.append(row['id'])
+        return row
+
+    def on_term(signum, _frame):
+        for rid in STARTED:
+            try:
+                ba.cancel({'id': rid})
+            except Exception:  # noqa: BLE001 - best effort; the fleet runner's unit RuntimeMaxSec bounds it anyway
+                pass
+        os._exit(128 + signum)
+
+    ba.launch = tracked_launch
+    lr.STEP_TIMEOUT = L.RESEARCH_STEP_TIMEOUT
+    signal.signal(signal.SIGTERM, on_term)
+    signal.signal(signal.SIGINT, on_term)
+    out = {'model': a.model, 'node': a.node, 'answer': '', 'sources': [], 'steps': 0, 'error': ''}
+    try:
+        res = lr.research(L.one_line(a.question, 600), a.model, a.node, L.RESEARCH_TOOLS)
+        if isinstance(res, dict):
+            out['answer'] = str(res.get('answer') or '')[:8000]
+            out['sources'] = [{'url': str(s.get('url') or '')[:2000], 'title': str(s.get('title') or '')[:200]}
+                              for s in res.get('sources') or [] if isinstance(s, dict)][:20]
+            out['steps'] = len(res.get('steps') or []) if isinstance(res.get('steps'), list) else 0
+            out['error'] = str(res.get('error') or '')[:300]
+    except Exception as exc:  # noqa: BLE001 - reported as the research error (LIFE classifies it)
+        out['error'] = f'{type(exc).__name__}: {str(exc)[:300]}'
+    print(json.dumps(out))
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))
+
+===== FILE: bin/life_common.py =====
+"""LIFE v2.1 shared contract: paths, limits, identities, validators, the process runner and the loopback adapter.
+
+Imported by bin/life-tick.py, bin/life-ctl.py, bin/life-status.py, bin/life-check.py, bin/life-research.py and
+bin/life-fetch.py. Inert on import: importing this module reads nothing, writes nothing and starts nothing.
+Every number here is the single definition LIFE.md section 13 tabulates; change it here and in LIFE.md together
+(VALIDATE.sh compares the embedded copy). REPO and KIT are fixed. STATE, PROJECTS, DASH and the three platform
+executables can be moved ONLY by configure(), an in-process call made by the admission tests (LIFE.md GAP 8):
+no environment variable, flag or file can move them, so a running organism never splits control between roots.
+"""
+import hashlib
+import json
+import os
+import re
+import secrets
+import signal
+import sqlite3
+import subprocess
+import tempfile
+import threading
+import time
+import unicodedata
+import urllib.error
+import urllib.request
+
+# ------------------------------------------------------------------------------------------- paths
+REPO = '/home/operator/host-checkout'
+KIT = REPO + '/docs/life'
+SYS_PY = '/usr/bin/python3'                     # the ONE interpreter for everything LIFE runs on the host
+REPO_PY = REPO + '/.venv/bin/python'            # only bin/life-fetch.py and bin/life-research.py (bs4/pypdf)
+SANDBOX_LAUNCHER = REPO + '/landlock_sandbox.py'  # the repository's Landlock launcher (symblicos/autogen.py uses it)
+STATE = '/home/operator/.local/state/life'
+PROJECTS = '/home/operator/symblicos/projects'
+DASH = 'http://127.0.0.1:8080'                  # loopback only; never a worker node tunnel
+TASK = REPO + '/bin/symblic-task'
+SYMBLIC = REPO + '/bin/symblic'
+RESEARCH = REPO + '/bin/local-research'         # used only for --list (the model inventory); research runs
+RESEARCH_WRAPPER = KIT + '/bin/life-research.py'  # go through this wrapper (SIGTERM cancels its fleet-runner run)
+FETCHER = KIT + '/bin/life-fetch.py'
+
+
+def _derive():
+    """Recompute every path derived from STATE. Called at import and by configure()."""
+    g = globals()
+    s = g['STATE']
+    g.update(
+        REGISTRY=s + '/life.sqlite3', ORGANISM=s + '/organism.sqlite3', CONTROL=s + '/control',
+        INBOX=s + '/inbox', INBOX_TMP=s + '/inbox-tmp', INBOX_DONE=s + '/inbox-done', INBOX_REFUSED=s + '/inbox-refused',
+        RELEASES=s + '/release', CALLS=s + '/calls', BUNDLES=s + '/bundles', TEXTS=s + '/text', RUNS_DIR=s + '/runs',
+        LOGS=s + '/logs', BACKUPS=s + '/backups', APPLIED=s + '/applied', OWNER=s + '/operator',
+        REPORTS=s + '/operator/reports', RETIRED=s + '/retired', LOCK_FILE=s + '/tick.lock')
+    c = g['CONTROL']
+    g.update(STOP_FILE=c + '/STOP', FREEZE_FILE=c + '/FREEZE', ARMED_FILE=c + '/ARMED', SELFDEV_FILE=c + '/SELFDEV_ARMED',
+             NO_SELF_QUESTIONS_FILE=c + '/NO_SELF_QUESTIONS', HISTORY_OK_FILE=c + '/CODEBASE_HISTORY_OK',
+             WATCH_FILE=c + '/watch.txt', BENCH_FILE=c + '/benchmarks.json', AGENDA_FILE=c + '/agenda.json')
+    g['STATE_DIRS'] = (s, c, g['INBOX'], g['INBOX_TMP'], g['INBOX_DONE'], g['INBOX_REFUSED'], g['RELEASES'], g['CALLS'],
+                       g['BUNDLES'], g['BUNDLES'] + '/patches', g['BUNDLES'] + '/proposals', g['BUNDLES'] + '/migrations',
+                       g['TEXTS'], g['RUNS_DIR'], g['LOGS'], g['BACKUPS'], g['APPLIED'], g['OWNER'], g['REPORTS'],
+                       g['RETIRED'])
+
+
+
+# every name _derive() sets, declared here so readers and linters see them; _derive() fills them from STATE
+REGISTRY = ORGANISM = CONTROL = INBOX = INBOX_TMP = INBOX_DONE = INBOX_REFUSED = RELEASES = CALLS = BUNDLES = None
+TEXTS = RUNS_DIR = LOGS = BACKUPS = APPLIED = OWNER = REPORTS = RETIRED = LOCK_FILE = STATE_DIRS = None
+STOP_FILE = FREEZE_FILE = ARMED_FILE = SELFDEV_FILE = NO_SELF_QUESTIONS_FILE = HISTORY_OK_FILE = None
+WATCH_FILE = BENCH_FILE = AGENDA_FILE = None
+_derive()
+
+
+def configure(*, state=None, projects=None, dash=None, task=None, symblic=None, research=None):
+    """Admission tests only: move STATE/PROJECTS/DASH and the three platform executables to fakes, in-process.
+    The production entry points never call it."""
+    g = globals()
+    for name, value in (('STATE', state), ('PROJECTS', projects), ('DASH', dash), ('TASK', task), ('SYMBLIC', symblic),
+                        ('RESEARCH_WRAPPER', research)):
+        if value is not None:
+            g[name] = value
+    _derive()
+
+
+# ------------------------------------------------------------------------------------------- organism
+ORGANS = ('command', 'learning', 'digest', 'codebase', 'immune', 'selfdev', 'compute', 'database')
+AGENT_ORGANS = ('codebase', 'selfdev', 'database')
+MODEL_ORGANS = tuple(o for o in ORGANS if o not in AGENT_ORGANS)
+NODES = ('node-a', 'node-b', 'node-d', 'node-f', 'node-i')   # node-c/e unlisted in BRIEF; node-h = protected service stack
+PROGRAMS = ('classify-command', 'triage-error', 'extract-source', 'distill-lesson', 'propose-experiment',
+            'rank-experiment', 'review-patch', 'reproduce', 'assign-item')
+ROUTES = ('learning', 'codebase', 'database', 'compute', 'selfdev', 'immune', 'heartbeat', 'none')
+STAGES = {                                       # each organ's item stage machine (LIFE.md section 7)
+    'command': ('classify',),
+    'learning': ('research',),
+    'digest': ('fetch', 'extract', 'distill'),
+    'codebase': ('confirm', 'triage', 'patch', 'gate'),
+    'immune': ('review',),
+    'selfdev': ('draft', 'gate'),
+    'compute': ('propose', 'rank', 'bench'),
+    'database': ('draft', 'apply'),
+}
+SLOT_STAGES = (('command', 'classify'), ('learning', 'research'), ('digest', 'extract'), ('digest', 'distill'),
+               ('codebase', 'triage'), ('immune', 'review'), ('compute', 'propose'), ('compute', 'rank'),
+               ('compute', 'bench'))
+AGENT_STAGES = (('codebase', 'patch'), ('selfdev', 'draft'), ('database', 'draft'))
+HOST_STAGES = (('digest', 'fetch'), ('codebase', 'confirm'), ('codebase', 'gate'), ('selfdev', 'gate'),
+                  ('database', 'apply'))
+MODEL_MIB = {'qwen2.5:0.5b': 400, 'llama3.2:1b': 1300, 'gemma3:1b': 900, 'qwen2.5-coder:3b': 1900,
+             'qwen3:4b-instruct': 2600}
+ENGINE = 'agy'                                   # the only CLI engine LIFE starts (strategies fresh,feedback)
+
+# ------------------------------------------------------------------------------------------- limits
+# tick timing (seconds)
+TICK_SECONDS = 300            # timer: OnUnitInactiveSec=300 (from the end of the previous tick)
+TICK_DEADLINE = 1200          # no new the host-stage work, division commit or agent start begins after this
+TICK_HARD = 2700              # every process a tick starts must be able to end (timeout + KILL_GRACE + 60) by this
+UNIT_TIMEOUT = 3000           # units/life-tick.service TimeoutStartSec (VALIDATE compares)
+KILL_GRACE = 30               # SIGTERM to a process group, then SIGKILL this many seconds later
+STOP_POLL = 1                 # the STOP watcher thread polls control/STOP this often during the whole tick
+# program and research runs
+CALL_TIMEOUT = 900            # one bin/symblic run process (its process group gets SIGTERM, then SIGKILL)
+CALL_MAX_MODEL_CALLS = 12     # --max-calls for every genome program run
+OLLAMA_LIMITS = {'num_predict': 320, 'timeout_seconds': 240}   # per model call (every genome answer is <= 40 words)
+RESEARCH_TIMEOUT = 1500       # one bin/life-research.py process
+RESEARCH_TOOLS = 4            # tool uses per research run (searches plus page reads)
+RESEARCH_STEP_TIMEOUT = 300   # one research generation (overrides local_research.STEP_TIMEOUT in the wrapper)
+ASSIGN_PER_SLOT = 4           # assign-item.sym runs one division may make in one node slot
+ASSIGN_TIMEOUT = CALL_TIMEOUT // ASSIGN_PER_SLOT   # 225 s each
+ASSIGN_MAX = 16               # snapshot items a division sends to assign-item at most
+SAMPLE_LABELS = 12            # queued item labels shown to reproduce.sym
+SAMPLE_CHARS = 1600           # the joined labels are cut to this many characters
+
+
+[This is part 10 of 14. Reply only with the word RECEIVED.]

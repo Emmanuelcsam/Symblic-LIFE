@@ -1,0 +1,251 @@
+[LIFE round-3 critique packet, part 2 of 14]
+
+11. **the host stages** — fetch up to 4 source texts; at most one operator-finding confirmation, one codebase
+    gate, one selfdev gate and one database apply; then start agent runs (section 7.9). Every one first
+    re-reads STOP, ARMED, the kit hash and FREEZE.
+12. **lifecycle** — workable-backlog and idle counters; quarantine and its one automatic release;
+    apoptosis; divisions older than 3 h abort; one missing workspace re-created; one retired codebase
+    clone removed; cells on long-offline nodes moved; derived questions; a division start (section 9).
+13. **dispatch** again.
+14. **node slots** — the installed-model inventory is re-read once a day (`bin/local-research --list`, no
+    model); telemetry older than 120 s is read again; for each available LIFE worker node, plan at most
+    ONE action (a division step, a benchmark start, or one program run), charge its budget, then run all
+    program runs in parallel threads (one per worker node; the threads touch no registry connection) and record
+    the results in the main thread (section 8).
+15. **status** — `STATE/operator/status.json`, written on every exit after step 2 (also faults).
+
+At the start of every tick, model-stage items left `running` by a killed or crashed tick return to their
+queue (their processes are gone); agent-run and benchmark items stay `running` until their run or job
+is reconciled. Exit codes: 0 done (also observe-only, held, or the lock was busy), 1 a tick fault
+(logged, a `tick_fault` notice with the count; three in a row set the fault hold until
+`life-ctl.py clear-fault`), 3 STOP handled, 5 integrity or contract hold or a wrong schema, 6 not seeded.
+One item's fault never stops a tick or poisons later ones: `Tick.guard` logs it, returns the item to its
+queue and fails it after 3 such faults (`items.faults`).
+
+## 5. Control: ARMED, FREEZE, STOP, reboot, operator commands
+
+| switch | meaning | set by |
+|--------|---------|--------|
+| ARMED | `control/ARMED` holds `{"boot_id": <this boot>, "kit_sha256": <hash of the kit's bin, checks, db, units>}`; a different boot means observe-only; a different kit hash is an integrity hold | `life-ctl.py arm --confirm ARM-UNTESTED` / `disarm` |
+| FREEZE | nothing new starts; running agent runs and benchmark jobs are polled and collected; fetches, confirmations, gates, applies, findings, program runs, agent starts and divisions are new work and wait | `freeze` / `thaw` |
+| SELFDEV_ARMED | selfdev agent runs may start | `selfdev-arm` / `selfdev-disarm` |
+| STOP | end every LIFE process, cancel every LIFE run and benchmark job, start nothing | `stop` / `unstop` |
+| NO_SELF_QUESTIONS | learning makes no derived questions | the operator (empty file) |
+| CODEBASE_HISTORY_OK | codebase agent runs may start (GAP 11) | the operator (empty file) |
+
+**Reboot**: ARMED names the old boot, so the first tick after a reboot only observes. Runs that were live
+are reconciled through the API before anything new starts (a run LIFE cannot confirm stays
+`submit_unknown`, with a notice after 900 s; it is never resubmitted under another id while it may exist).
+Nothing restarts itself; the operator re-arms.
+
+**STOP**, exactly:
+1. `life-ctl.py stop` writes `control/STOP`. From that instant every admission re-reads it, so nothing new
+   starts (there remains only the instant between that check and a process start; the watcher then ends it).
+2. A running tick's watcher sees STOP within 1 s and sends SIGTERM to every LIFE process group; any still
+   alive 30 s later get SIGKILL. A `bin/symblic run` process cancels its fleet-runner runs on SIGTERM
+   (`symblic_run` sets its stop event; `symblic_apply` calls `fleet_runner.cancel`); `bin/life-research.py`
+   cancels every fleet-runner run it started. A fleet-runner run that a SIGKILL orphans still ends at its own unit
+   `RuntimeMaxSec` (its call timeout plus grace).
+3. `life-ctl.py stop` itself, without waiting for the lock, asks `bin/symblic-task autogen cancel RUN_ID`
+   (60 s each) for every run in `submitting`, `live` or `submit_unknown`, and `POST /api/cluster/job/cancel`
+   (30 s each) for every running benchmark job, printing each result.
+4. The registry rows are updated by `stop_everything` (in life-ctl when the lock is free, else by the tick
+   at its next STOP check): a run or job whose cancel was confirmed is `cancelled` and its item returns
+   to the queue with a new attempt number (so a later run uses a new request id); an unconfirmed one stays
+   `running` until a poll settles it; model-stage items return to the queue; a `stopped` notice names
+   everything unresolved.
+5. `unstop` removes STOP; nothing that was cancelled restarts by itself.
+
+If the registry cannot be read at all, `life-ctl.py stop` says so and the operator cancels by hand with
+`bin/symblic-task autogen list` (LIFE request ids start with `life-`).
+
+**Operator commands** go only through `life-ctl.py` (section 15), the inbox or the agenda. Stop, freeze,
+cool and power are never routed through a model: the command classifier cannot express them.
+
+## 6. Work items
+
+An item is one unit of work: an `items` row with `item_id = <organ>:<first 16 hex of sha256(kind + "\n"
++ the identity parts joined by "\n")>` (`life_common.item_id(organ, kind, *parts)`; a part holding a
+newline is refused, so two identities never serialize alike). The same identity is never queued twice:
+`new_item` returns the existing id instead (and the caller says so, e.g. notice `command_merged`).
+
+| kind | organ | identity parts | payload keys by stage (closed JSON, at most 16384 characters) | taint |
+|------|-------|----------------|---------------------------------------------------------------|-------|
+| command | command | command_id | classify: `command_id` | operator |
+| question | learning | norm_text(question); derived: fact_id, "derived" | research: `question` (<= 600), `command_id` ("" when derived), `found` | operator / web |
+| source | digest | source_key | fetch: `source_key, url`; extract: + `text_path, text_sha256`; distill: + `fact_id, claim, quote` | web |
+| finding | codebase | watch: test_id, base commit, normalised first error line; operator: test_id, "owner", command_id | confirm (operator only): `test_id, finding_text, base_commit "", source, command_text`; triage: `test_id, finding_text (<= 600), base_commit, source, wall_s, trace_files`; patch/gate: + `change_class`, `review_note` after a needs_work | code / operator |
+| patch | immune | patch_id | review: `subject "patch", patch_id` | the finding's taint, at least code |
+| proposal | immune | proposal_id | review: `subject "proposal", proposal_id` | the lesson's taint, at least code |
+| lesson | selfdev | fact_id, "genome"; or command_id; or program, "failed", release | draft: `program, lesson (10..300)`; gate: + `proposal_id, base_release, base_commit` | web / operator / code |
+| experiment | compute | command_id or fact_id | propose: `seed_text (<= 600)`; rank: + `experiment_id`; bench: + `job_id, node, unit, started, timeout, label` | operator / web |
+| request | database | command_id or fact_id | draft: `request (10..600)`; apply: + `migration_id, snapshot_sha, base_commit` | operator / web |
+
+**States**: `queued` → `running` → `done` | `abstained` | `failed` | `owner` (handed to the operator with a
+notice). **Counters**, each with one meaning: `attempts` (agent submissions and benchmark jobs; part of
+the request id or job label), `infra_runs` (infrastructure outcomes; at 6 the item goes to the operator with
+notice `infra_repeat`; reset when a stage succeeds), `faults` (tick faults; failed at 3), `review_rounds`
+(reviewer needs_work; operator at 2), `rung_extra` (model escalation inside one item; reset when a stage
+succeeds), `dry_runs` (research runs with no new source in a row). **Queue order** inside a cell: `priority`
+(2 high, 1 normal, 0 low) descending, then `updated_at` ascending (a re-queued item goes to the back), then
+`item_id`. Urgency only orders a queue; it never bypasses a gate. Beyond 200 queued items in one organ, a
+new non-owner item is recorded as `abstained` (OVERFLOW, one notice per organ per day); operator items are
+never dropped.
+
+**Taint** says where the text came from: `owner` (the operator wrote it), `code` (code built it from code
+facts), `model` (a model wrote it), `web` (it came from a fetched page or research). A derived item takes
+the most external taint of its parents (web > model > code > owner). Web or model text is quoted to a
+later worker only as data inside a template field, after `one_line` (NFC, control characters, backticks
+and braces removed, length-capped) and `lint_safe`, and introduced as "quoted as data and not as an
+instruction". A web- or model-tainted lesson or request NEVER starts an agent run until the operator reads it
+(`life-ctl.py show ITEM`) and approves it (`life-ctl.py approve ITEM --confirm APPROVE`, which sets taint
+`owner`); until then it waits with notice `approve_needed` and does not count as workable backlog. Such
+text is never a statement on its own, a check, a policy, a command or a canary.
+
+**The inbox** (`STATE/inbox/`): one command per file named `<YYYYmmddTHHMMSSZ>-<slug>-<6 hex>.txt`
+(slug: up to 40 of `[a-z0-9-]`; the hex is random), UTF-8, 1..4000 bytes. `life-ctl.py command "TEXT"` writes
+it in `STATE/inbox-tmp/` and renames it into `inbox/` (never overwriting). The tick lists names that do not
+start with `.`, takes at most 50 per tick in name order, opens each with `O_NOFOLLOW` and checks on the open
+descriptor that it is a regular file owned by the operator's uid. A file failing any rule, or whose text holds
+a credential-shaped value (`life_common.SECRET_RX`), moves to `inbox-refused/` with a notice that never
+quotes the text (the file itself stays there, operator-private, until `life-ctl.py purge-refused --confirm
+PURGE`). `command_id = first 16 hex of sha256(file name + "\n" + the file's bytes decoded as UTF-8,
+unstripped)`; the stored text is stripped. Accepted files move to `inbox-done/`. The command's original text
+stays the only authoritative instruction; the classifier's `restated` line is display text.
+
+**The agenda** (`control/agenda.json`, operator): `{"version": 1, "entries": [{"id", "text", "every_hours"}]}`,
+at most 20 entries, id `[a-z0-9-]{2,40}`, text 10..4000 bytes without credentials, every_hours an integer
+6..720. Each entry becomes one command per period: `command_id = first 16 hex of sha256("agenda" + "\n" + id
++ "\n" + floor(now / (every_hours x 3600)))`, file `agenda:<id>`. An invalid file or entry is ignored with
+notice `agenda_invalid`. With no agenda, no watch list and no commands, LIFE is armed and idle apart from
+derived questions (section 7.2); it invents no other objectives.
+
+## 7. The organs, stage by stage
+
+Each organ's items move through a fixed stage list (`life_common.STAGES`). A **slot** stage uses its
+cell's worker node for one program run in step 14; an **the host** stage is code in step 11; an **agent** stage is
+an autogen run (section 7.9).
+
+### 7.1 command — `classify` (slot)
+
+`classify-command.sym` with `command_id`, `command_text` → `{command, organ, urgency, restated}` (`command`
+must equal the command id). Dispatch by code (an organ outside the route list is `none`; an urgency outside
+low/normal/high is normal):
+
+| route | effect |
+|-------|--------|
+| learning | a question item (text <= 600 characters; longer: notice `command_too_long`) |
+| codebase | a finding item at stage `confirm` for the FIRST test id `tests.<module>[...]` in the text; none: notice `command_needs_test` |
+| database | a request item (text >= 10 characters) |
+| compute | an experiment item |
+| selfdev | a lesson item when the text names exactly ONE genome program as a whole word; else notice `command_needs_program` |
+| heartbeat | notice `command_heartbeat` whose text is the answer: governor state, live cells, queued items, live runs, open notices |
+| immune, none | notice `command_<route>` for the operator (no lifecycle action follows from a model label) |
+
+The item's priority is the urgency (low 0, normal 1, high 2). The command becomes `dispatched` when it
+created an item, else `owner`. A classification that fails at every rung marks the command `failed` with
+notice `command_failed`. When every item that descends from a dispatched command (following `origin` links,
+at most 500) has ended, the tick writes `STATE/operator/reports/<command_id>.md` (the command, its route, every
+item and outcome, research answers marked as unverified model text, sources, quote-verified claims with
+their URLs, and any patches, proposals, experiments and migrations), sets the command `done` (`failed` when
+every item failed) and opens notice `command_done`; `life-ctl.py report COMMAND_ID` prints it.
+
+### 7.2 learning — `research` (slot)
+
+`bin/life-research.py --model M --node NODE --question Q` (process timeout 1500 s; `RESEARCH_TOOLS` 4 tool
+uses; each generation at most `RESEARCH_STEP_TIMEOUT` 300 s; the model searches through SearXNG at
+127.0.0.1:18888 on the host and reads pages through code-run tools; it never touches the network itself;
+SIGTERM cancels its fleet-runner runs). It prints one JSON object `{model, node, answer, sources [{url, title}],
+steps, error}`. The answer is kept (credential-shaped spans redacted, at most 4000 characters, table
+`answers`, model text). From `sources`, in order, code takes URLs that start with `http(s)://`, are at most
+2000 characters, hold no credential-shaped value or user:password part, and are not repeated in this answer;
+`source_key = symblic_autogen.items_key(url)`, or `"sha256:" + 56 hex` of the lowercased URL without fragment
+when that key is longer than 196 characters. At most `min(3, 9 - found)` sources count per run. A source new
+to `sources` (the ONE dedup authority for every learning cell) becomes a `sources` row and a digest item; a
+source already known is not fetched again but still counts for this question (`question_sources`). The
+question then: 0 sources counted → `dry_runs + 1`; at 3 dry runs in a row, or 9 sources counted in total, it
+is `done`; otherwise it returns to the back of the queue. An error string matching the infrastructure
+pattern (no capacity, offline, SearXNG down, did not answer in time, ...) or a timeout is `infra`.
+
+**Derived questions** (learning asks its own): at most 2 per UTC day, only while the learning organ has
+fewer than 3 queued questions and `control/NO_SELF_QUESTIONS` is absent, the tick takes the newest knowledge
+row without one and queues `"What evidence supports or contradicts: " + claim` (identity `(fact_id,
+"derived")`, taint web, priority 0). It is a search query for the research wrapper, never a statement.
+
+### 7.3 digest — `fetch` (host) → `extract` (slot) → `distill` (slot)
+
+- **fetch**: `bin/life-fetch.py URL` (`.venv` Python, `-I -B`, timeout 90 s) runs
+  `local_research.read_page(url, 6000)` → `deep_research.safe_fetch` (http(s) only, every resolved address
+  global, every redirect re-validated, robots honoured, its byte cap) and strips the `[…page continues…]`
+  marker. Outcome table: text of at least 200 characters with no credential-shaped value → stored once at
+  `STATE/text/<first 16 hex of sha256(source_key)>.txt` with its sha256, stage extract (the snapshot never
+  changes); shorter → `abstained` (EMPTY); credential-shaped text → `abstained`, nothing stored; refused by
+  the safe path (RuntimeError, ResearchError) or an unknown fault → `abstained`; a transient network fault or
+  a timeout → `infra` (re-queued, operator after 6).
+- **extract**: `extract-source.sym` → `supported` not true: `abstained` (NO_SUPPORTED_CLAIM). Else code
+  re-checks the snapshot hash, then that the quote, NFC-normalised with whitespace runs as one space, occurs
+  in the equally normalised snapshot as whole words (not inside a longer word), 12..400 characters, claim
+  20..300, neither holding a credential-shaped value; it inserts a `knowledge` row with `fact_id = first 16
+  hex of sha256(source_key + "\n" + quote)`, `quote_verified = 1` (the quote is in the text; the claim's
+  truth is NOT established; `claim_status = unreviewed`).
+- **distill**: `distill-lesson.sym` → target `genome` (with a program) → a selfdev lesson item; `compute` →
+  an experiment item; `database` → a request item; `none` (or a lesson starting "no lesson") → nothing. All
+  taint web (lessons and requests then wait for the operator's approval before any agent run).
+
+### 7.4 codebase — `confirm` (the host, operator findings) → `triage` (slot) → `patch` (agent run) → `gate` (host)
+
+**Watched tests.** `control/watch.txt`: at most 20 distinct valid test ids `tests.<module>[.<Class>[.<test>]]`
+(comment lines start with `#`; invalid and duplicate lines are ignored). Each armed tick runs at most one due
+test (due = its next time has come; the least recently run first, then the id), in the first active codebase
+cell's clone that has no live run and no queued or running gate item, just reset to `origin/<branch recorded at
+seed>`:
+
+`systemd-run --user --scope (work.slice, MemoryMax 4G, CPUQuota 200 %, nice 19)` →
+Landlock sandbox → `/usr/bin/python3 -s -B -m unittest TEST`, killed at 120 s; the clone is reset afterwards.
+
+| outcome | when | effect |
+|---------|------|--------|
+| pass | exit 0 | next run in 6 h; failure count 0 |
+| timeout | killed at 120 s | notice `watch_timeout`; next run in 6 h; not a finding |
+| sandbox | exit 125 | notice `sandbox` (Landlock refused); not a finding |
+| slow | failed after more than 90 s | notice `watch_too_slow` (autogen checks stop at 120 s); next run in 48 h; never patched |
+| error | nonzero exit without a `FAILED (` line | notice `watch_error` (environment, sandbox or scope error); next run in 6 h; not a finding |
+| fail | nonzero exit with `FAILED (` | a finding (stage triage) with the last 40 output lines, credential-shaped spans redacted, `lint_safe`, as `finding_text`, the .py files the traceback names (not under `tests/`, not protected; at most 3) as `trace_files`, and the test's wall time; next run after 6 h, 12 h, 24 h, then every 48 h while it keeps failing |
+
+One open finding per watched test. When a test's previous finding ended `owner` or `failed`, the same
+normalised first error line makes no new finding while that finding's notice is open (acknowledging it, or
+a different error, allows the next one). LIFE never reads the dashboard's logs or private stores.
+
+**confirm** (operator findings only, the host): the named test runs the same way at the branch head. Pass →
+`owner` with notice `already_passing` (LIFE writes no patch); a unittest failure → the real output is appended
+to the finding text, `trace_files` = the traceback's files plus the `.py` paths the command names (at most 3),
+`base_commit` = the head, stage triage; timeout or sandbox → infra; anything else → operator.
+
+**triage**: `triage-error.sym` (must echo the finding id) → a class other than test_only, comment_or_doc or
+local_fix, or `confident` not true, or local_fix with no `trace_files`: `owner` (notice `finding_owner`). Else the
+class is recorded.
+
+**patch** (agent run, section 7.9): the clone is reset to the finding's base commit; `organs/codebase.lines.txt`
+is rendered with `scope` = "files under tests/" (test_only), "Markdown files under docs/" (comment_or_doc) or
+"the files a.py, b.py" (local_fix: exactly the `trace_files` that exist in the clone); the reviewer's note, after a
+needs_work, is appended as "Reviewer asked: ...". Checks: statement 0 `life-check.py sandboxed /usr/bin/python3 -s -B
+-m unittest TEST` (in autogen's staging checkout, inside the sandbox), statement 1 the verify line.
+
+**gate** (the host, after a completed run): `git add -A`, then the diff of everything against the recorded
+base commit (`git diff --cached --no-renames BASE`, so it is right whether promotion committed or not), with
+exactly the root files `verify.txt`, `HANDOFF.md`, `AUTOGEN-CHECKPOINT.json`, `AUTOGEN-SPLIT.txt`, `AUTOGEN-TESTS.sh`,
+`AUTOGEN-INDEX.jsonl` excluded. Refused (`failed`) when: git cannot diff; no diff; the diff is larger than
+262144 bytes or holds a binary file; any path matches `life_common.GATE_DENY_RX` (bin/, scripts/, rules/,
+.agents/, .claude/, .githooks/, .github/, .backups/, secrets_data/, docs/life/, tests/__init__.py, any
+conftest.py or tests package __init__.py, sgconfig.yml, pyproject.toml, .gitignore, .gitattributes, .env*,
+easy_config.json, security_gate.py, register.py, server.py, host_routes.py, host_bridge.py, sw.js, index2.html,
+restart-host.sh, landlock_sandbox.py, *.service/.timer/.slice/.socket, dotfile rc files); a file is added
+with a mode other than 100644, changes mode, or is a symlink or submodule; test_only touches anything outside
+`tests/`, removes more assertions than it adds, or adds a skip or expected failure; another class touches
+`tests/` (the judging test stays fixed); comment_or_doc touches anything but `docs/**/*.md`; local_fix touches a
+file outside its `trace_files`; the diff holds a credential-shaped value; `checks/devcheck-gate.sh CLONE TEST BASE`
+fails (in a work.slice scope, 900 s: the module resolves to a file inside the clone WITHOUT importing
+anything; then, inside the sandbox, the clone's own `./bin/devcheck --changed BASE` — the base commit's bytes,
+
+
+[This is part 2 of 14. Reply only with the word RECEIVED.]

@@ -1,0 +1,271 @@
+expect(L.has_secret('PASSWORD: "two words here"'), 'a quoted password value is refused')
+expect(L.has_secret('https://user:pw@example.org/x'), 'URL userinfo is refused')
+for kw in ('token', 'password', 'api_key', 'secret'):
+    for code_ in (f"{kw} = request.headers.get('X-Token')", f'{kw} = getpass.getpass()', f"{kw} = os.environ['API_KEY']",
+                  f'def check_{kw}({kw}=None):', f'{kw}: ceramic foams absorb water'):
+        expect(not L.has_secret_code(code_), f'code is not a credential: {code_}')
+    expect(L.has_secret_code(f'{kw}=abcd1234efgh5678ij'), f'{kw}= with 18 letters and digits is a credential in code')
+    expect(L.has_secret_code(f'{kw} = "s3cr3t-value"'), f'a quoted {kw} literal is a credential in code')
+expect(not L.has_secret('akia' + 'a' * 16) and not L.has_secret('begin the private key exchange'), 'token prefixes are case-sensitive')
+expect(L.has_secret('AKIA' + 'A' * 16) and L.has_secret('Bearer ' + 'a' * 20), 'upper-case prefixes and bearer still match')
+# verify lines
+expect(not L.verify_line_problems('database', b'migration=0001_org_x\n', 'migration=0001_org_x'), 'exact verify line passes')
+expect(L.verify_line_problems('database', b' migration=0001_org_x\n', 'migration=0001_org_x'), 'a leading space fails')
+expect(L.verify_line_problems('database', b'migration=0001_org_x\n\n', 'migration=0001_org_x'), 'an extra line fails')
+expect(not L.verify_line_problems('selfdev', b'lesson=0123456789abcdef program=reproduce\n', 'lesson=0123456789abcdef program=reproduce'),
+       'the selfdev verify line names the lesson')
+# the gate
+expect(L.patch_problems(['bin/devcheck'], 'local_fix', '+x\n', ('bin/devcheck',)), 'a patch to bin/ is refused')
+expect(L.patch_problems(['scripts/devcheck.py'], 'local_fix', '+x\n', ('scripts/devcheck.py',)), 'a patch to scripts/ is refused')
+expect(L.patch_problems(['tests/test_x.py'], 'test_only', '-    self.assertEqual(a, b)\n+    pass\n', ('tests/test_x.py',)), 'removing an assertion is refused')
+expect(L.patch_problems(['tests/test_x.py'], 'test_only', '+    @unittest.skip("x")\n', ('tests/test_x.py',)), 'adding a skip is refused')
+expect(L.patch_problems(['tests/test_y.py'], 'test_only', '+    x = 1\n', ('tests/test_x.py',)), 'test_only touches only its own module')
+expect(L.patch_problems(['other.py'], 'local_fix', '+x\n', ('named.py',)), 'a local_fix outside the named files is refused')
+expect(not L.patch_problems(['named.py'], 'local_fix', '+x = 1\n', ('named.py',)), 'a local_fix inside the named files passes')
+expect(L.patch_problems(['README.md'], 'comment_or_doc', '+x\n'), 'a root README is not docs/**/*.md')
+expect(L.patch_problems(['docs/agents/CONTRACTS.md'], 'comment_or_doc', '+x\n'), 'agent instructions are protected')
+expect(all(L.GATE_DENY_RX.match(p_) for p_ in ('config/.env', 'app/secrets_data/x', 'ruff.toml', '.ruff.toml', 'conftest.py',
+                                                'requirements-devtest.lock', 'sub/.gitattributes')), 'judge configuration and private paths anywhere')
+expect(L.patch_problems(['docs/x.md'], 'comment_or_doc', 'deleted file mode 100644\nnew file mode 120000\n+x\n'), 'a symlink in a diff is refused')
+expect(L.patch_problems(['docs/x.md'], 'comment_or_doc', 'old mode 100644\nnew mode 100755\n'), 'a mode change is refused')
+expect(not L.patch_problems(['docs/a/b.md'], 'comment_or_doc', '+x\n'), 'docs at any depth pass')
+expect(all(L.GATE_DENY_RX.match(f) for f, _rx, _w in L.CONTRACT), 'every CONTRACT file is protected from patches')
+expect(not L.local_fix_problems('def f(x):\n    return x\n', 'def f(x):\n    return x + 1\n', ['f']), 'a body fix passes')
+expect(L.local_fix_problems('def f(x):\n    return x\n', 'def f(x, y):\n    return x\n', ['f']), 'a signature change is refused')
+expect(L.local_fix_problems('def f(x):\n    return x\ndef g():\n    pass\n', 'def f(x):\n    return x\ndef g():\n    return 1\n', ['f']),
+       'a function the traceback does not name is refused')
+expect(L.local_fix_problems('def f():\n    def inner(x):\n        return x\n    return inner(1)\n',
+                            'def f():\n    def inner(x, y=0):\n        return x\n    return inner(1)\n', ['f', 'f.inner']),
+       'a nested signature change is refused')
+prop_old = 'class C:\n    @property\n    def x(self):\n        return 1\n    @x.setter\n    def x(self, v):\n        pass\n'
+prop_new = 'class C:\n    @property\n    def x(self):\n        return 2\n    @x.setter\n    def x(self, v):\n        pass\n'
+expect(L.local_fix_problems(prop_old, prop_new, ['C.x#2']), 'a getter is not authorized by its setter (duplicate names stay distinct)')
+expect(not L.local_fix_problems(prop_old, prop_new, ['C.x']), 'the first definition of C.x is C.x')
+two = 'class A:\n    def run(self):\n        return 1\nclass B:\n    def run(self):\n        return 2\n'
+expect(L.function_at(two, 5) == 'B.run' and L.function_at(two, 2) == 'A.run', 'a traceback line resolves to its own class')
+expect(L.local_fix_problems(two, two.replace('return 1', 'return 3'), ['B.run']), 'run in B never authorizes run in A')
+expect(L.path_class(['docs/a.md']) == 'docs' and L.path_class(['x.yaml']) == 'other' and L.path_class(['a.js']) == 'live_static'
+       and L.path_class(['a.py', 'b.js']) == 'mixed', 'path classes')
+expect(L.traceback_files('File "/w/c/server_x.py", line 3\nFile "/w/c/tests/t.py"', '/w/c') == ['server_x.py'], 'traceback files')
+expect(L.traceback_files('File "/w/c/ok/../../outside.py", line 3, in f', '/w/c') == [], 'a .. path is never a traceback file')
+expect(L.failure_fingerprint('Traceback\nAssertionError: 3 != 4') == ('AssertionError', '# != #'), 'failure fingerprint')
+expect(L.failure_fingerprint('no exception here') is None, 'no fingerprint without an exception line')
+expect(not L.env_error(1, 'FAIL: test_sandbox_rules\nAssertionError: Landlock sandbox not applied', '/nonexistent'),
+       'a failing test that mentions sandbox or Landlock is a finding')
+expect(not L.env_error(1, "ImportError: cannot import name 'gone' from 'server_x'", '/nonexistent'), 'an ImportError the code caused is a finding')
+expect(L.env_error(1, "ModuleNotFoundError: No module named 'numpy'", '/nonexistent'), 'a missing third-party module is the environment')
+expect(L.env_error(125, '', '/x') and L.env_error(1, 'PermissionError: [Errno 13] Permission denied: /home/operator/.cache', '/w/c'),
+       'a sandbox refusal or a denied path outside the clone is the environment')
+# identities
+expect(L.parse_cell('learning.10.0123abcd')[1] == 10, 'depth 10 parses')
+for bad in ('learning.01.0123abcd', 'learning.11.0123abcd', 'learning.1.0123abcg', ' learning.1.0123abcd'):
+    try:
+        L.parse_cell(bad); expect(False, f'{bad!r} must not parse')
+    except ValueError:
+        checks += 1
+expect(L.valid_test_id('tests.test_x.Case.test_y') and not L.valid_test_id('tests.' + 'a' * 65) and not L.valid_test_id('tests.' + '.'.join(['a'] * 6)),
+       'test id bounds')
+expect(not L.payload_problems('finding', 'patch', {'test_id': 'tests.test_x', 'finding_text': 'f', 'base_commit': 'a' * 40,
+                                                   'source': 'watch', 'wall_s': 1, 'trace_files': ['x.py'],
+                                                   'trace_functions': {'x.py': ['C.f']}, 'change_class': 'test_only'}), 'a valid payload')
+expect(L.payload_problems('question', 'research', {'question': {}, 'command_id': [], 'found': True}), 'payload values are typed')
+expect(L.payload_problems('question', 'research', {'question': 'q', 'command_id': '', 'found': 10}), 'found is 0..9')
+expect(L.payload_problems('finding', 'patch', {'test_id': 't'}), 'a payload missing keys is refused')
+expect(L.payload_problems('request', 'draft', {'request': 'x' * 10, 'extra': 1}), 'an unknown payload key is refused')
+expect(L.payload_problems('request', 'draft', {'request': 'x' * (L.PAYLOAD_MAX + 1)}), 'an oversize payload is refused')
+expect(L.lint_safe('as before, the last test failed earlier', 200) == 'as stated, the final test failed before', 'lint rewrites')
+long_a, long_b = 'tests.' + 'a' * 150 + 'x', 'tests.' + 'a' * 150 + 'y'
+expect(L.notice_subject(long_a) != L.notice_subject(long_b) and len(L.notice_subject(long_a)) == 120, 'notice keys never merge')
+expect(L.plain_line('a {b} `c`', 20) == 'a {b} `c`', 'operative text keeps braces and backticks')
+try:
+    L.scope_argv(['true'], runtime=0); expect(False, 'a scope without a runtime must be refused')
+except ValueError:
+    checks += 1
+# the unit and every bound
+unit = open(kit + '/units/life-tick.service', encoding='utf-8').read()
+expect(f'TimeoutStartSec={L.UNIT_TIMEOUT}' in unit and L.TICK_HARD + 300 == L.UNIT_TIMEOUT, 'unit timeout = UNIT_TIMEOUT = TICK_HARD + 300')
+expect('SuccessExitStatus=1 3 4 5 6' in unit and 'Restart=no' in unit and f'TasksMax={L.TICK_TASKS_MAX}' in unit
+       and 'ExecStart=/usr/bin/python3 -I -B ' in unit and 'ExecStopPost=-/usr/bin/systemctl --user stop life-*.scope' in unit, 'unit file')
+for name in ('RESEARCH_TIMEOUT', 'CALL_TIMEOUT', 'GATE_STAGE_SECONDS', 'WATCH_STAGE_SECONDS', 'CONFIRM_STAGE_SECONDS', 'CLONE_TIMEOUT',
+             'START_STAGE_SECONDS', 'APPLY_STAGE_SECONDS', 'SELFDEV_GATE_STAGE_SECONDS', 'CANARY_ROUND_SECONDS', 'FETCH_TIMEOUT'):
+    expect(getattr(L, name) + L.KILL_GRACE + L.START_MARGIN <= L.TICK_HARD, f'{name} can start in some tick')
+expect(L.GATE_DEVCHECK_TIMEOUT + L.GATE_TEST_TIMEOUT + 60 <= L.GATE_TIMEOUT, 'the gate script fits GATE_TIMEOUT')
+expect(L.RESEARCH_TIMEOUT >= L.RESEARCH_GENERATIONS * (L.RESEARCH_STEP_TIMEOUT + L.RESEARCH_STEP_POLL_EXTRA)
+       + L.RESEARCH_TOOLS * L.RESEARCH_TOOL_SECONDS, 'the research timeout covers its derived worst case')
+expect(L.BENCH_RUNS * (L.BENCH_TIMEOUT_MAX + L.BENCH_RUN_SLACK) + L.BENCH_JOB_EXTRA <= 3600, 'a benchmark job fits CMD_TIMEOUT_MAX')
+expect(L.BENCH_RUNS * (L.BENCH_OUT_BYTES + 64) <= 40000, 'a benchmark job output fits OUT_HEAD')
+expect(len(L.BENCH_ORDER) == 2 * L.BENCH_PAIRS and L.BENCH_ORDER.count('baseline') == L.BENCH_PAIRS, 'ABBA order')
+expect(L.MODEL_CALLS_PER_DAY >= L.PROGRAM_RUNS_PER_DAY * L.CALL_MAX_MODEL_CALLS, 'the model-call budget covers every reserved run')
+expect(L.CALL_MAX_MODEL_CALLS * L.OLLAMA_LIMITS['timeout_seconds'] <= L.CALL_TIMEOUT, 'every model call of a program fits its process wall')
+expect(L.PROMPT_CHARS_MAX // 3 + 256 + L.OLLAMA_LIMITS['num_predict'] <= L.KV_CTX_TOKENS
+       and L.SOURCE_TEXT_CHARS + 3000 <= L.PROMPT_CHARS_MAX and L.DIFF_REVIEW_BYTES + 3000 <= L.PROMPT_CHARS_MAX,
+       'every LIFE prompt reaches only the KV_CTX_TOKENS bucket the memory rule assumes')
+expect(L.DIVISION_MAX_TICKS == L.DIVISION_STEP_EVERY * (1 + L.FOCI_RETRIES + math.ceil(L.ASSIGN_MAX / L.ASSIGN_PER_SLOT)) + 3 + 12,
+       'the division tick bound is derived')
+expect(L.AGENT_RUN_KILL_SECONDS <= L.NODE_BUSY_MAX and L.AGENT_WALL_SECONDS < L.AGENT_RUN_KILL_SECONDS
+       and L.AGENT_POLICY_FIXED['wall_seconds'] == L.AGENT_WALL_SECONDS, 'one agent run fits one node duty window')
+expect(L.PREMIGRATION_KEEP_BYTES + (1 + L.BACKUP_KEEP) * L.ORGANISM_MAX_BYTES < L.STATE_MAX_BYTES, 'storage parts fit the storage bound')
+sql_text = open(kit + '/db/life.sql', encoding='utf-8').read()
+expect(f'depth BETWEEN 0 AND {L.MAX_DEPTH}' in sql_text and L.CELL_RX.pattern.count('|10)') == 1
+       and f'length(subject) <= 120' in sql_text and 'length(payload) <= 16384' in sql_text and L.PAYLOAD_MAX == 16384,
+       'protocol limits (depth, subject, payload) are equal in code, SQL and regexes')
+gate_text = open(kit + '/checks/devcheck-gate.sh', encoding='utf-8').read()
+expect('./bin/devcheck --changed "$base" --no-tests' in gate_text, 'the gate runs devcheck without bin/devtest (--no-tests)')
+src = open(kit + '/bin/life-tick.py', encoding='utf-8').read()
+ns = re.search(r"NON_SEMANTIC = \(([^)]*)\)", src).group(1)
+expect(set(re.findall(r"'([A-Z_]+)'", ns)) <= set(A.FAILURE_CLASSES), 'every NON_SEMANTIC label is an autogen failure class')
+code = src + open(kit + '/bin/life_common.py', encoding='utf-8').read() + open(kit + '/bin/life-ctl.py', encoding='utf-8').read()
+kinds = set(re.findall(r"L?\.?notice\((?:self\.)?conn, '([a-z_]+)'", code)) | set(re.findall(r"notice\(conn, '([a-z_]+)'", code))
+kinds |= {'command_' + r for r in ('immune', 'none')}
+expect(kinds <= set(L.NOTICE_KINDS), 'undeclared notice kinds: ' + ', '.join(sorted(kinds - set(L.NOTICE_KINDS))))
+metas = set(re.findall(r"set_meta\((?:conn, )?'([a-z_0-9]+)'", code))
+expect(metas <= set(L.META_KEYS), 'undeclared meta keys: ' + ', '.join(sorted(metas - set(L.META_KEYS))))
+for name in ('io', 'memory'):
+    lines = open(f'/proc/pressure/{name}', encoding='ascii').read().splitlines()
+    expect(sum(1 for ln in lines if ln.startswith('full ' if name == 'io' else 'some ')) == 1, f'/proc/pressure/{name} readable')
+expect(L.limits_rows() and all(m for _n, _v, m in L.limits_rows()), 'every limits line has a meaning')
+print(f'{checks} rule cases')
+PYEOF
+then pass rules "protected lines, placement, migrations, secrets, verify, gate, local_fix, paths, ids, payloads, unit, bounds, kinds"; else bad rules "a rule case failed"; fi
+
+echo "== 12 numbers =="
+num=0
+for f in "$KIT"/bin/*.py; do
+  [ "$(basename "$f")" = life_common.py ] && continue
+  if grep -nE 'timeout=[0-9]|\b(3600|86400|1200|2700|900)\b|time_left\(\) < [0-9]|read\([0-9]{3,}\)' "$f" | grep -v '^[0-9]*:\s*#'; then
+    bad numbers "$(basename "$f") holds timing literals (move them into life_common.py)"; num=1; fi
+done
+if $PY -c 'import sys; sys.path.insert(0, sys.argv[1] + "/bin"); import life_common as L; t = open(sys.argv[1] + "/checks/devcheck-gate.sh").read(); sys.exit(0 if f"sandboxed --timeout {L.GATE_DEVCHECK_TIMEOUT} " in t and f"sandboxed --timeout {L.GATE_TEST_TIMEOUT} " in t else 1)' "$KIT"; then :; else
+  bad numbers "checks/devcheck-gate.sh timeouts differ from GATE_DEVCHECK_TIMEOUT/GATE_TEST_TIMEOUT"; num=1; fi
+[ "$num" = 0 ] && pass numbers "no timing literal outside life_common.py; gate timeouts equal"
+
+echo "== 13 generated tables =="
+if $PY - "$KIT" <<'PYEOF'
+import sys
+kit = sys.argv[1]
+sys.path.insert(0, kit + '/bin')
+import life_common as L
+text = open(kit + '/LIFE.md', encoding='utf-8').read().split('\n## Appendices', 1)[0]
+bad = [name for name, table in (('section 13 numbers', L.limits_table()), ('section 14 notice kinds', L.notices_table()),
+                                ('section 17 contract', L.contract_table())) if '\n' + table + '\n' not in text]
+if bad:
+    print('; '.join(bad))
+sys.exit(1 if bad else 0)
+PYEOF
+then pass generated "sections 13, 14 and 17 equal the tables life_common generates"; else bad generated "regenerate LIFE.md tables"; fi
+
+echo
+if [ "$fail" = 0 ]; then echo "STATIC PASS"; else echo "SOME FAILED"; fi
+exit "$fail"
+
+===== FILE: bin/life-seed.sh =====
+#!/usr/bin/env bash
+# LIFE seed (the operator runs this ONCE, on the host):  life-seed.sh [--branch NAME]   (NAME: default main)
+# It asks for START, then runs life-ctl.py seed, which: checks the platform contract and that the live checkout has the
+# branch NAME, runs VALIDATE.sh, creates /home/operator/.local/state/life (mode 0700) with the registry (schema 4), the
+# organism database and release 1, creates the three agent workspaces under /home/operator/symblicos/projects
+# (life-codebase-0-00000000 = a single-branch clone of branch NAME of host-checkout's committed history with
+# .backups/ outside its sparse checkout; life-selfdev-0-00000000 and life-database-0-00000000 = symblic-task workspaces),
+# and registers the 8 seed cells. NAME is the branch the codebase organ tracks for its whole life (life-ctl apply refuses
+# a live checkout on another branch). It starts NO run and calls NO model: nothing happens until the operator installs the
+# timer and runs life-ctl.py arm. A seed that stopped halfway is finished by running it again with the same NAME (every
+# step is idempotent; a changed kit refuses); a finished seed is never changed and seeding is never a recovery step.
+set -euo pipefail
+KIT="/home/operator/host-checkout/docs/life"
+echo "LIFE seed: creates /home/operator/.local/state/life and three workspaces; starts nothing."
+read -r -p "Type START to continue: " answer
+[ "$answer" = "START" ] || { echo "aborted"; exit 1; }
+exec /usr/bin/python3 -I -B "$KIT/bin/life-ctl.py" seed --confirm START "$@"
+
+===== FILE: bin/life-check.py =====
+#!/usr/bin/env python3
+"""LIFE acceptance checks that autogen runs as policy checks (and the canaries run), all code, no model.
+
+    life-check.py verify-line ORGAN FILE EXPECTED_WORDS...   FILE's bytes are exactly the expected line (+ one LF)
+    life-check.py migration FILE SNAPSHOT SHA256             SNAPSHOT exists with this sha256 and only CREATE
+                                                             statements; FILE is an additive org_ migration on top
+    life-check.py genome-protected NEW BASE                  only ask instructions differ between BASE and NEW
+    life-check.py registry                                   PRAGMA integrity_check and foreign_key_check (read-only)
+    life-check.py sandboxed [--timeout N] CMD [ARG...]       run CMD in its own life-check-*.scope (MemoryMax 4G,
+                                                             TasksMax, RuntimeMaxSec) in the Landlock sandbox (cwd = this
+                                                             folder, an empty temporary HOME, no STATE, no TCP), under
+                                                             timeout --kill-after=10 N and prlimit --as 4 GiB --fsize
+                                                             2 GiB, killed at N s (default SANDBOX_CHECK_TIMEOUT 110,
+                                                             inside autogen's 120 s)
+
+Exit 0 pass, 1 fail (the reason on stderr; for sandboxed: CMD failed, timed out or was killed, or the scope could not
+be created), 2 usage, 125 the sandbox is unavailable, the host is short of memory or under pressure
+(life_common.host_problems), or a devcheck tool resolves outside the allowed tool roots. `sandboxed` starts CMD in
+its own process group inside its own transient scope (autogen runs checks inside the dashboard process: the scope
+keeps candidate code out of the dashboard's cgroup and inside LIFE's STOP), and on its timeout, on SIGTERM and on
+SIGINT SIGKILLs that whole group and stops the scope before it exits, so nothing CMD started outlives it; /dev/shm
+entries the run left are removed. A scope that cannot be created fails the check; CMD never runs unscoped. Autogen runs
+these in its staging checkout on the host (cwd = the checkout), with CHECK_TIMEOUT 120 s (symblicos/autogen.py). Every
+file argument must be a regular file inside the current folder, opened component by component without following any
+symlink (no .., no absolute path). Nothing here writes a file outside a private temporary folder.
+"""
+import sys
+sys.dont_write_bytecode = True                  # no .pyc is ever written under bin/ (kit_sha256 hashes __pycache__)
+import os  # noqa: E402
+import shutil  # noqa: E402
+import signal  # noqa: E402
+import subprocess  # noqa: E402
+import tempfile  # noqa: E402
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import life_common as L  # noqa: E402
+
+
+def fail(msg):
+    print(f'life-check: {msg}', file=sys.stderr)
+    return 1
+
+
+def read_inside(path, limit):
+    """The bytes of a regular file inside the current folder (life_common.read_in: component by component with
+    O_NOFOLLOW, checked on the open descriptor, at most `limit` bytes)."""
+    return L.read_in(os.getcwd(), path, limit)
+
+
+def sandboxed(cmd):
+    timeout = L.SANDBOX_CHECK_TIMEOUT
+    if cmd[:1] == ['--timeout']:
+        if len(cmd) < 3 or not cmd[1].isdigit() or not 1 <= int(cmd[1]) <= L.SANDBOX_TIMEOUT_MAX:
+            return fail(f'--timeout takes 1..{L.SANDBOX_TIMEOUT_MAX} seconds')
+        timeout, cmd = int(cmd[1]), cmd[2:]
+    problems = L.host_problems()
+    if problems:
+        print('life-check: the host cannot take candidate code now: ' + '; '.join(problems), file=sys.stderr)
+        return 125
+    env, rx, refused = L.devcheck_tools()
+    if refused:
+        print('life-check: tool root not allow-listed: ' + ', '.join(refused), file=sys.stderr)
+        return 125
+    home = tempfile.mkdtemp(prefix='life-check-')
+    shm0 = L.shm_entries()
+    child = None
+    unit = f'life-check-{os.getpid()}-{os.urandom(4).hex()}'
+
+    def kill_group():
+        if child is not None:
+            try:
+                os.killpg(child.pid, signal.SIGKILL)
+            except OSError:
+                pass
+        subprocess.run(['systemctl', '--user', 'stop', unit + '.scope'], env=L.scope_env(), stdin=subprocess.DEVNULL,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=L.CANCEL_TIMEOUT, check=False)
+
+    def on_signal(signum, _frame):
+        kill_group()
+        shutil.rmtree(home, ignore_errors=True)
+        L.shm_cleanup(shm0)
+        os._exit(128 + signum)
+    signal.signal(signal.SIGTERM, on_signal)
+    signal.signal(signal.SIGINT, on_signal)
+    try:
+        inner = ['/usr/bin/timeout', '--kill-after=10', str(timeout), '/usr/bin/prlimit', f'--as={L.BENCH_AS_BYTES}',
+                 f'--fsize={L.BENCH_FSIZE_BYTES}', *cmd]
+        argv = ['systemd-run', '--user', '--scope', '--quiet', '--collect', f'--unit={unit}', '--slice=work.slice',
+
+
+[This is part 16 of 26. Do not critique yet. Reply only with the word RECEIVED.]

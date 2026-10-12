@@ -1,0 +1,243 @@
+[LIFE round-4 critique packet, part 7 of 21]
+
+| `disarm`, `freeze`, `thaw`, `selfdev-arm`, `selfdev-disarm`, `unstop` | no | — | the switch file (unstop leaves LIFE disarmed) |
+| `stop` | no | the registry cannot be read (prints how to cancel by hand) | section 5; removes ARMED |
+| `clear-fault` | yes | — | fault hold and fault count cleared |
+| `command "TEXT"` | no | not 1..4000 bytes of text, credential-shaped | one inbox file (no-replace) |
+| `notices`, `show ITEM`, `report COMMAND` | no | unknown id | prints (report without control characters) |
+| `ack NOTICE` | yes | not open | acknowledged |
+| `approve ITEM --confirm APPROVE` | yes | not a queued web/model lesson or request | approved = 1, approved_sha = its operative text's sha256; taint unchanged |
+| `apply PATCH --confirm APPLY [--unreviewed] [--moved-base]` | yes | STOP present; not ready (operator state needs --unreviewed); an apply record exists; the live checkout is on another branch (unless --moved-base); diff hash differs; a protected path; a touched live file differs from the patch base (unless --moved-base); `git apply --check` fails | before-bytes and journal, `git apply` (no staging, no commit), after-hashes; prints the restart-gated / live-static warning and "run bin/devcheck before you commit" |
+| `recover-apply PATCH --confirm RECOVER` | yes | no record; the record is not intent or reverting; a touched file holds neither its before- nor its patched bytes | every touched file back to its before-bytes; the patch keeps its state |
+| `revert PATCH --confirm REVERT` | yes | no record; the record is not done or reverting; a touched file holds neither its before- nor its after-bytes | before-bytes restored (journal reverting, then reverted) |
+| `adopt PROPOSAL --confirm ADOPT [--unreviewed]` | yes | STOP present; not ready; a protected program; the active release is not the proposal's base (then `stale`); the bundle differs from the reviewed text; the protected-line or placement rule; the new release fails `check_release` | a new active release |
+| `new-release --confirm RELEASE` | yes | STOP present; `check_release` fails | the kit's genome/organs/policies as a new active release |
+| `release-cell CELL` | yes | not quarantined | active, failure streak 0, rungs kept |
+| `retire CELL [--force]` | yes | last active cell or a live run, without --force | its open division aborts; a live run's cancel is requested (its row stays live until a tick sees it end); retired; queued items (not gate/apply) return to the organ |
+| `revive ORGAN NODE` | yes | the organ has a live cell; the node is full | a new depth-0 cell with the seed focus (event `revived`) |
+| `requeue ITEM --confirm REQUEUE` | yes | the item did not end owner or failed | queued again with infra_runs, faults, start_refusals, timeouts and rung_extra 0, without a cell; a gate or apply item goes back to its agent stage |
+| `move CELL NODE` | yes | not active/quarantined, same node, node full, the node not online in the latest sample | the cell's node changes (agy readiness is not checked: the cell waits there like any cell on an unavailable node) |
+| `release-hold NODE` | yes | — | the node's hold is removed (an unknown or lost job included) |
+| `canaries` | yes | STOP present | a canary round now; hold set or cleared |
+| `gate-selftest TEST_ID` | yes | STOP present; the seed codebase cell's workspace is busy; the test does not resolve | the sandbox probe, then the gate twice on the seed clone: a harmless comment must PASS with at least one file checked, a line that does not parse must fail at devcheck (exit 4); PASS only when all three hold |
+| `restore registry\|organism FILE --confirm RESTORE` | yes (held throughout) | STOP absent; the tick unit running; FILE not a backup of that database in STATE/backups | section 12 |
+| `forget-migration ID --confirm FORGET` | yes | not an applied migration | refused, "forgotten after a restore" (section 7.8) |
+| `purge-refused --confirm PURGE` | no | — | deletes refused inbox files |
+| `contract` | no | — | prints the contract problems or "contract holds" |
+
+`check_release` = organs.json schema, `bin/symblic check` and the placement rule on every program, and every agent
+template rendered with `organs/fixtures.json` (two statements, zero lint findings, the fixed policy, flags). A
+release is built in `STATE/release/.tmp-*`, validated, renamed into place, then activated in one registry
+transaction (the old one deactivated in the same transaction). Registry-changing commands take the tick's lock,
+waiting up to CTL_LOCK_WAIT 3000 s (a tick may hold it up to 2700 s) and printing a line every 60 s. Exit codes:
+0 done, 1 refused (the reason is printed), 2 usage (unknown arguments fail before any change).
+
+## 16. Validation
+
+`VALIDATE.sh` runs only static checks (no model, agent, network or task): (1) inventory and executable bits;
+(2) `bin/symblic check` and the placement rule on the nine programs; (3) the organs.json closed schema; (4) each raw
+agent template linted with zero findings and no root, each template rendered with `organs/fixtures.json` into
+exactly two statements with zero lint findings, its policy equal to the fixed policy with the organ's exact checks
+and accepted by `normalize`, `policy_flags()` round-tripped through bin/symblic-task's own parser to the same
+sha256, and the largest legal values still rendering within 1400 characters; (5) `bash -n`, `ast.parse` and JSON
+parsing on every file; (6) both schemas applied twice in memory with 23 bad rows refused; (7) the exact canary
+list; (8) the example benchmarks through the tick's own rules; (9) this document's appendices against the files,
+byte for byte, with no duplicate or extra block; (10) the platform contract; (11) 87 pure-function cases (protected
+lines, placement, migrations and snapshots, the credential screen, verify lines, the gate's path and local_fix
+rules, path classes, cell and test ids, payload schemas, failure fingerprints, lint rewrites, the unit file, every
+stage budget fitting a tick, the research and benchmark bounds, every CONTRACT file protected, every notice kind and
+meta key declared, the pressure files); (12) no timing literal in any program but `life_common.py`, and the gate
+script's timeouts equal to `GATE_DEVCHECK_TIMEOUT` and `GATE_TEST_TIMEOUT`; (13) sections 13, 14 and 17 of this
+document equal to the tables `life_common` generates. It ends **STATIC PASS**. It is not an admission test (GAP 8).
+
+## 17. Platform facts LIFE relies on (verified 2026-10-11; re-checked every tick by `contract_problems`)
+
+Each row below is one `life_common.CONTRACT` entry: a regular expression that must match the named file. A
+regex pins the reviewed text, not behaviour; behaviour is what the admission tests (GAP 8) would check. Every
+file named here is also on the gate deny list.
+
+| file | fact |
+|------|------|
+| `symblicos/autogen.py` | run id derivation |
+| `symblicos/autogen.py` | a repeated start with the same request id and the same statements and policy returns the existing run |
+| `symblicos/autogen.py` | agy admitted for autogen |
+| `symblicos/autogen.py` | terminal run states |
+| `symblicos/autogen.py` | cwd must be a git workspace |
+| `symblicos/autogen.py` | policy checks time out at 120 s |
+| `symblicos/autogen.py` | a run row carries its base, policy (with sha256) and lines |
+| `symblicos/autogen.py` | the run base names its engine, node and cwd |
+| `symblicos/autogen.py` | autogen cancel only REQUESTS the end of a run (and answers ok for an ended one) |
+| `symblicos/autogen.py` | the Landlock check sandbox exists |
+| `symblicos_engine.py` | the autogen catalogue answers version and defaults |
+| `symblic_autogen.py` | autogen policy version 1 |
+| `symblic_autogen.py` | agents_max limits |
+| `symblic_autogen.py` | normalize signature |
+| `symblic_autogen.py` | the policy sha256 excludes engines and nodes |
+| `symblic_autogen.py` | defaults of the flagless fields (perpetual, final, hidden, syntax, require_change) |
+| `symblic_autogen.py` | defaults of the flagless fields (until_done, designer) |
+| `symblic_autogen.py` | defaults of the flagless fields (interval_seconds, feedback_chars) |
+| `symblic_autogen.py` | attempt failure labels |
+| `symblic_autogen.py` | lint back-reference words |
+| `bin/symblic-task` | start flags |
+| `bin/symblic-task` | autogen get |
+| `bin/symblic-task` | autogen cancel |
+| `bin/symblic-task` | an HTTP error from start exits REFUSED (1) and prints HTTP <code> |
+| `bin/symblic-task` | catalog --json prints the catalogue object (nodes[].id, online, ready) |
+| `bin/symblic-task` | workspace NAME creates a symblicos workspace |
+| `bin/symblic-task` | remote agents map the host workspace path into their own checkout |
+| `bin/symblic` | symblic run --max-calls |
+| `bin/symblic` | symblic run --ollama-limits |
+| `bin/symblic` | symblic run --input NAME=VALUE (JSON or text) |
+| `bin/symblic` | symblic run --dir |
+| `bin/symblic` | symblic run --json |
+| `symblic_run.py` | ask-level by wins over --by |
+| `symblic_run.py` | symblic run stops its calls on SIGTERM |
+| `symblic_run.py` | the run report carries status and error |
+| `symblic_run.py` | the run report counts calls |
+| `symblic_run.py` | a finished run reports status done |
+| `symblic_run.py` | a return output carries kind and value |
+| `symblic_apply.py` | thermal thresholds |
+| `symblic_apply.py` | a call named @NODE is never re-placed (thermal only refuses) |
+| `symblic_apply.py` | SYMBLIC_CALL_WALL_S sets the call wall |
+| `symblic_apply.py` | a stopped call cancels its fleet-runner run |
+| `fleet_runner.py` | one model process per node |
+| `fleet_runner.py` | the fleet runner run cancel |
+| `local_research.py` | read_page |
+| `local_research.py` | read_page continuation marker |
+| `local_research.py` | the research URL deny rule |
+| `local_research.py` | HTML to text |
+| `local_research.py` | PDF to text |
+| `local_research.py` | research generations read STEP_TIMEOUT at call time |
+| `local_research.py` | a generation is polled STEP_TIMEOUT + 120 s |
+| `local_research.py` | research generations go through fleet_runner.launch |
+| `local_research.py` | research signature (stop is checked before every generation) |
+| `local_research.py` | research makes at most max_tools + 2 generations |
+| `local_research.py` | research returns answer, sources and steps |
+| `bin/local-research` | local-research --list (model inventory) |
+| `bin/local-research` | the inventory line is <node> <model> <size> |
+| `deep_research.py` | safe_fetch: at most 5 hops |
+| `deep_research.py` | safe_fetch returns the HTTP status |
+| `deep_research.py` | safe_fetch: a byte cap |
+| `deep_research.py` | safe_fetch: refuses past its redirect limit |
+| `landlock_sandbox.py` | sandbox path flags |
+| `landlock_sandbox.py` | sandbox --require/--no-unix |
+| `landlock_sandbox.py` | sandbox --net-connect |
+| `landlock_sandbox.py` | a kernel without network rules is refused |
+| `landlock_sandbox.py` | the sandbox does not block UDP (GAP 15) |
+| `bin/devcheck` | devcheck --changed BASE |
+| `scripts/devcheck.py` | devcheck --changed BASE diffs the working tree (uncommitted changes included) against BASE |
+| `scripts/devcheck.py` | devcheck prints how many files it checks |
+| `cluster_engine.py` | cluster map route |
+| `cluster_engine.py` | a map job timeout is at most 3600 s |
+| `cluster_engine.py` | a job keeps the first 40000 bytes of each node output |
+| `cluster_engine.py` | map passes {{item}} as "$1" |
+| `cluster_engine.py` | map stores the label in meta.label |
+| `cluster_engine.py` | map is a job |
+| `cluster_engine.py` | a job keeps each node output under out[node].out |
+| `cluster_engine.py` | jobs listing pages of 200 |
+| `cluster_engine.py` | the jobs listing gives total |
+| `cluster_engine.py` | status ts is the answer time |
+| `cluster_engine.py` | status rows carry online as a boolean |
+| `cluster_engine.py` | vitals.memavail is in bytes |
+| `cluster_engine.py` | vitals.cpu and vitals.temp are numbers |
+| `cluster_engine.py` | node-h hosts the protected service stack |
+| `host_routes.py` | job cancel route |
+| `host_routes.py` | job cancel answers success (a request, not an end) |
+| `host_routes.py` | job statuses |
+| `cluster_highpower.py` | highpower state route |
+| `cluster_highpower.py` | highpower view: restUntil and cool |
+| `cluster_highpower.py` | restUntil is 0 when no rest is pending |
+| `cluster_highpower.py` | highpower phase values |
+| `agent_hub.py` | catalog ready per engine |
+| `agent_hub.py` | agy runs remotely |
+| `agent_hub.py` | a worker node agent checkout is a full worktree of the branch |
+| `restart-host.sh` | the operator restart script life-ctl apply names exists |
+
+Also relied on and checked elsewhere: the running server's autogen defaults (`/api/symblicos/autogen/catalog`,
+each armed tick); `/proc/pressure/io` has one `full` line and `/proc/pressure/memory` one `some` line (VALIDATE
+check 11); the bytes of `PLATFORM_PINS` are recorded at arm and compared every tick; `sqlite3` CLI is absent on
+The host (`command -v sqlite3` rc 1), so LIFE uses Python's module; `fleet_runner` runs each model call as a systemd
+unit with MemoryMax, CPUQuota and RuntimeMaxSec (`fleet_runner.unit_argv`, read 2026-10-11); systemd 255 accepts
+RuntimeMaxSec on scopes and glob patterns in `systemctl stop` (man systemd.scope, man systemctl, read 2026-10-11).
+
+**Recovery from a contract hold** (the notice says "Recovery: LIFE.md section 17"): read the platform change. If
+LIFE's assumption still holds, update the matching `CONTRACT` row in `bin/life_common.py` and regenerate this
+section together, run `VALIDATE.sh` (must end STATIC PASS), re-arm (the kit hash changed), and run `life-ctl.py
+contract` (must print `contract holds`); the hold clears at the next tick. If the fact changed by accident, revert
+the platform change. **Recovery from an integrity hold**: restore the kit or the release from git or a backup
+(never edit `STATE/release/<n>` by hand), or run `life-ctl.py new-release --confirm RELEASE`; after a kit, platform
+pin or DECISIONS change, read it, run `VALIDATE.sh` and `life-ctl.py arm` again.
+
+## 18. GAPS — what is not done, and the rule meanwhile
+
+1. **No platform hook for code-admitted runs inside autogen.** Reproduction is the tick's registry transaction
+   instead; smallest platform change: none needed for v2.2.
+2. **Autogen cannot run a light model as a statement worker** (the `local` engine takes spec sheets only). Model
+   organs therefore run genome programs from the tick, not autogen lanes.
+3. **Remote handoff is refused.** Agent runs use `generations 1` and short statements.
+4. **No attempt-level admission lease in autogen.** The governor stops LIFE starting runs; a running agent run is
+   bounded by `attempt_seconds 900`, `wall_seconds 3600` and LIFE's cancel request at 4500 s, not by the rest rule or
+   the per-node duty-cycle reservation.
+5. **high-power mode cannot be requested safely by code.** LIFE never touches power; passed experiments are notices.
+6. **Installed models drift.** The inventory is re-read daily; a missing model skips its rung, and infra counters
+   bound the rest. Model weights are named by tag, not digest (the inventory prints names and sizes only).
+7. **Benchmark commands run on the worker node host through the cluster control plane**, not a sandbox and not a job-wide
+   cgroup: only operator-written templates run, under timeout, nice, per-process prlimit and a per-run output cap, with
+   model-chosen parameters that must match the template's `param_rx` and a safe character set. A job-wide cgroup
+   (MemoryMax, TasksMax) on the worker node is a map-route change.
+8. **No admission tests yet.** `VALIDATE.sh` proves the static contract only. `life_common.configure(state=,
+   projects=, dash=, task=, symblic=, research=, inventory=, fetcher=, sandbox=, gate=)` is the in-process seam for
+   them (no environment variable or flag reaches it). The tests to write, each with a temporary STATE, a fake
+   loopback API built from the section 17 anchors, and fake `bin/symblic`, `bin/symblic-task`,
+   `bin/life-research.py` and `bin/life-fetch.py`, and each stating its initial rows, the injected failure, the
+   expected rows, files and notices, and the side effects that must NOT happen:
+   - test_stop_mid_tick (STOP during a slot: every process group and scope ended within 31 s; runs stay live with
+     `cancel requested`; ARMED gone; no new process after STOP);
+   - test_stop_with_broken_release and test_stop_with_wrong_schema (STOP handled before both);
+   - test_stop_full_disk (the registry cannot be written: every cancel is still asked);
+   - test_cancel_is_a_request (a cancel answered ok for a completed run: the run still reaches its gate);
+   - test_leader_exit_descendants (a leader exits, its child ignores SIGTERM: the group is SIGKILLed);
+   - test_sandboxed_group_on_sigterm (life-check sandboxed killed: no sandboxed descendant survives);
+   - test_crash_between_submit_and_record and test_timed_out_start (submit_unknown, an identical re-send, exactly one
+     run); test_refused_submit_that_exists; test_run_identity_mismatch;
+   - test_duplicate_tick; test_division_abort; test_agent_division_workspaces (one clone per tick, commit after
+     both); test_division_commit_rechecks; test_division_release_change; test_quarantine_and_auto_release;
+   - test_budget_hold (reservations); test_storage_hold (no intake); test_policy_mismatch; test_gate_refusals
+     (every refusal of section 7.4, one fixture each); test_local_fix_bodies; test_test_only_owner;
+     test_git_meta_change (a test that writes .git/config: the clone is deleted, no trusted git runs in it);
+     test_selfdev_gate; test_selfdev_protected; test_migration_crash_recovery (crash after the organism commit, after
+     the applying row); test_snapshot_index_order; test_migration_with_rows (a UNIQUE index over duplicates refused);
+     test_ledger_reconcile; test_store_adapter;
+   - test_inbox_rules (FIFO, symlink, whitespace only, collision); test_agenda_periods; test_recurring_question;
+     test_reboot_disarms; test_kit_change_holds; test_platform_pin_change_holds; test_decisions_change_holds;
+   - test_governor_own_load; test_governor_unobserved; test_node_rest; test_duty_reservation; test_slot_refill;
+     test_bench_abba_scoring (exact fractions at the threshold); test_bench_job_unknown_hold; test_fetch_statuses;
+     test_research_generation_cap; test_report_rotation.
+   Admission requires every listed assertion, not only a test process exiting 0. Until they exist and pass, `arm`
+   needs `--confirm ARM-UNTESTED`. They were not written in this workflow, which may only lint, check, normalize and
+   syntax-check.
+9. **Genome programs have no recorded fixtures.** Call folders are kept 14 days; `bin/symblic replay` over them could
+   test the code paths model-free and compare a proposal with its base on held-out inputs. Until then adoption is
+   the operator's judgement.
+10. **worker node-side agent confinement is the hub's and is not attested to LIFE.** LIFE gives an agent nothing beyond
+    its run: no SSH, no tunnel, no credentials, and STATE never travels.
+11. **The repository's committed history carries private data** (a private database under `.backups/`,
+    tracked in HEAD). LIFE's own clones keep `.backups/` out of their working
+    tree (sparse checkout; the objects are still in the clone's `.git`, readable by sandboxed candidate code, which
+    runs only after an agent run that this same decision admits) and the gate refuses `.backups/` paths. But an agent
+    checkout on a worker node is a full `git worktree` of the branch (`agent_hub.provision_remote`, pinned): the tracked
+    `.backups/` files, a private database among them, are present as plain files in the agent's working
+    folder, and the full history is in the worker node's bare mirror `~/agents-repos/<workspace>.git`. Codebase agent runs
+    therefore wait until the operator either removes those files from the history or creates
+    `control/CODEBASE_HISTORY_OK` to accept that.
+12. **No autonomous performance patches.** A `perf_fix` change class accepted only when a benchmark template over
+    repository code improves and the gate passes is a later decision (section 2): it would need the clone's
+    candidate code to be benchmarked on a worker node outside any sandbox (GAP 7), which v2.2 does not do.
+13. **Rows only from the store adapter.** The database organ grows schema; rows arrive only for tables shaped for
+    knowledge (section 7.8). A typed adapter per other table, approved by the operator, is a later decision.
+14. **worker node-side mirrors and worktrees are not counted or removed by LIFE.** Each codebase workspace costs a branch
+    push to a bare mirror on its worker node plus a worktree per run (`~/agents-repos/`); operator cleanup on each worker node:
+    `git -C ~/agents-repos/<name>.git worktree prune` and removing mirrors of retired workspaces.
+
+
+[This is part 7 of 21. Reply only with the word RECEIVED.]
